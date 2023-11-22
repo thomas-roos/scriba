@@ -10,7 +10,13 @@ use lazy_static::lazy_static;
 use dirs::home_dir;
 
 lazy_static! {
-    static ref BASE_PATH: PathBuf = home_dir().expect("error home dir").join("scriba_recordings");
+    static ref BASE_PATH: PathBuf = {
+        let path = home_dir().expect("error home dir").join("scriba_recordings");
+        if !path.exists() {
+            std::fs::create_dir_all(&path).expect("Failed to create directory");
+        }
+        path
+    };
 }
 
 // Main recording function
