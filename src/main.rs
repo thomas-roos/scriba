@@ -17,8 +17,6 @@ enum Command {
         audio_output: PathBuf,
         #[structopt(short = "s", long = "skip_transcription", help = "Skip transcription after recording")]
         skip_transcription: bool,
-        #[structopt(parse(from_os_str), help = "Specify the output transcript file path (optional)")]
-        transcript_output: Option<PathBuf>, // Use Option<PathBuf> to make it optional
     },
     Transcribe {
         #[structopt(parse(from_os_str), help = "Specify the input recording file path")]
@@ -51,7 +49,6 @@ async fn main() {
         Command::Record {
             audio_output,
             skip_transcription,
-            transcript_output,
         } => {
             // Start the recording task
             let record_result = record(audio_output.clone()).await;

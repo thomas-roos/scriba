@@ -19,7 +19,7 @@ pub async fn transcribe_file(
     api_key: &str,
 ) -> Result<(), anyhow::Error> {
     // Read the content of the WAV file
-    let audio_file_path = BASE_PATH.join(input_path);
+    let audio_file_path = BASE_PATH.join(input_path).join("recording.wav");
     let audio_file = std::fs::read(&audio_file_path)
         .context("Unable to read the input file")?;
 
@@ -45,7 +45,7 @@ pub async fn transcribe_file(
         let text = response.text().await.context("Failed to read response body")?;
 
         // Save the transcript to the specified or default file
-        let transcript_file_path = BASE_PATH.join(output_path);
+        let transcript_file_path = BASE_PATH.join(output_path).join("transcript.txt");
         let transcript_file = File::create(&transcript_file_path)?;
         let mut transcript_writer = BufWriter::new(transcript_file);
         transcript_writer.write_all(text.as_bytes())?;

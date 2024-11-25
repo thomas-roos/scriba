@@ -35,7 +35,7 @@ pub async fn record(output_path: PathBuf) -> Result<(), anyhow::Error> {
     println!("Default input config: {:?}", config);
 
     // The WAV file we're recording to.
-    let file_path = BASE_PATH.join(output_path);
+    let file_path = BASE_PATH.join(output_path).join("recording.wav");
     let spec = wav_spec_from_config(&config);
     let writer = hound::WavWriter::create(&file_path, spec)?;
     let writer = Arc::new(Mutex::new(Some(writer)));
