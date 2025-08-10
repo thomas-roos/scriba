@@ -6,3 +6,6 @@
 
 # Ignore target release
 /target
+
+# Ignore LLMs
+/.claude

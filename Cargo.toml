@@ -2,6 +2,12 @@
 name = "scriba"
 version = "0.1.0"
 edition = "2021"
+description = "A simple CLI tool for recording and transcribing audio using OpenAI's Whisper API"
+authors = ["Giovanni Alberto Falcione"]
+license = "MIT"
+repository = "https://github.com/giovannialberto/scriba"
+keywords = ["audio", "transcription", "cli", "whisper", "openai"]
+categories = ["command-line-utilities", "multimedia::audio"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -16,3 +22,4 @@ hound = "3.5"
 anyhow = "1.0"
 dirs = "5.0.1"
 lazy_static = "1.4.0"
+chrono = { version = "0.4", features = ["serde"] }

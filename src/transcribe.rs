@@ -3,10 +3,9 @@ use anyhow::Context;
 use reqwest::Client;
 use reqwest::multipart::{Form, Part};
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use lazy_static::lazy_static;
 use dirs::home_dir;
-use std::io::Write;
 
 lazy_static! {
     static ref BASE_PATH: PathBuf = home_dir().expect("error home dir").join("scriba_recordings");
@@ -36,7 +35,6 @@ pub async fn transcribe_file(
         .post("https://api.openai.com/v1/audio/transcriptions")
         .multipart(form)
         .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "multipart/form-data")
         .send()
         .await
         .context("Failed to send request")?;
@@ -46,6 +44,12 @@ pub async fn transcribe_file(
 
         // Save the transcript to the specified or default file
         let transcript_file_path = BASE_PATH.join(output_path).join("transcript.txt");
+        
+        // Ensure the directory exists
+        if let Some(parent) = transcript_file_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        
         let transcript_file = File::create(&transcript_file_path)?;
         let mut transcript_writer = BufWriter::new(transcript_file);
         transcript_writer.write_all(text.as_bytes())?;
