@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use structopt::StructOpt;
 use scriba::record::record;
 use scriba::transcribe::transcribe_file;
+use scriba::tui::TuiRecordingLibrary;
 use anyhow::{Context, Result};
 use chrono::Local;
 use std::io::{self, Write};
@@ -79,8 +80,9 @@ fn print_main_menu() {
     println!("├────────────────────────────────────────────────────────┤");
     println!("│  [1] Record Audio + Auto-Transcribe                    │");
     println!("│  [2] Record Audio Only                                 │");
-    println!("│  [3] Transcribe Existing File                          │");
-    println!("│  [4] Exit                                              │");
+    println!("│  [3] Browse Recording Library                          │");
+    println!("│  [4] Transcribe Existing File                          │");
+    println!("│  [5] Exit                                              │");
     println!("└────────────────────────────────────────────────────────┘");
     println!();
 }
@@ -111,7 +113,7 @@ async fn interactive_mode() -> Result<()> {
     loop {
         print_main_menu();
         
-        let choice = get_user_input("Select option (1-4)")?;
+        let choice = get_user_input("Select option (1-5)")?;
         
         match choice.as_str() {
             "1" => {
@@ -166,6 +168,22 @@ async fn interactive_mode() -> Result<()> {
                 }
             }
             "3" => {
+                println!("\n╭─ RECORDING LIBRARY ────────────────────────────────────╮");
+                println!("│ Loading your recordings with enhanced interface...     │");
+                println!("╰────────────────────────────────────────────────────────╯\n");
+                
+                match TuiRecordingLibrary::new() {
+                    Ok(mut tui_library) => {
+                        if let Err(err) = tui_library.run().await {
+                            eprintln!("❌ TUI Library error: {err}");
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("❌ Failed to open TUI library: {err}");
+                    }
+                }
+            }
+            "4" => {
                 println!("\n╭─ TRANSCRIBE EXISTING FILE ─────────────────────────────╮");
                 let input_path = get_user_input("Path to audio file")?;
                 let name = get_optional_input("Transcript name (optional)")?;
@@ -194,16 +212,16 @@ async fn interactive_mode() -> Result<()> {
                     }
                 }
             }
-            "4" => {
+            "5" => {
                 println!("\n🎵 Thanks for using SCRIBA! Goodbye! 🎵\n");
                 break;
             }
             _ => {
-                println!("❌ Invalid choice. Please select 1-4.\n");
+                println!("❌ Invalid choice. Please select 1-5.\n");
             }
         }
         
-        if choice != "4" {
+        if choice != "5" {
             println!("\n{}", "─".repeat(60));
             get_user_input("Press Enter to continue")?;
             println!();
@@ -285,3 +303,4 @@ async fn main() -> Result<()> {
     
     Ok(())
 }
+

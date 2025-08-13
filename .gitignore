@@ -1,11 +1,48 @@
-# Ignore .env files
+# Environment files
 .env
+.env.local
+.env.production
 
-# Ignore the recordings folder
+# Scriba recordings and database
 /recordings
+scriba_recordings/
+scriba.db
+scriba.db-*
 
-# Ignore target release
+# Rust build artifacts
 /target
+Cargo.lock
 
-# Ignore LLMs
+# Debug files
+debug.log
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Audio test files (for development)
+test_*.wav
+test_*.mp3
+sample_*.wav
+sample_*.mp3
+
+# Claude/LLM artifacts
 /.claude
