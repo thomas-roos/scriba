@@ -1,20 +1,25 @@
-# Scriba
+# Scriba v0.2.0
 
-A simple CLI tool for recording audio and transcribing it using OpenAI's Whisper API.
+A modern CLI tool for recording audio and transcribing it using OpenAI's Whisper API, featuring an interactive TUI library for managing your recordings.
 
 ## Features
 
-- **Record Audio**: Capture audio directly from your microphone
-- **Transcribe Audio**: Convert audio files to text using OpenAI's Whisper API
-- **Combined Workflow**: Record and automatically transcribe in one command
-- **Automatic File Naming**: Smart timestamp-based naming with optional descriptions
-- **Flexible API Key**: Pass API key via command line or environment variable
-- **Organized Storage**: All recordings stored in `~/scriba_recordings/`
+- **🎙️ Audio Recording**: Capture audio directly from your microphone
+- **📝 AI Transcription**: Convert audio to text using OpenAI's Whisper API
+- **🔄 Combined Workflow**: Record and automatically transcribe in one command
+- **📚 Recording Library**: Interactive TUI browser for managing recordings
+- **🗃️ Database Storage**: SQLite database for organized recording metadata
+- **🔍 Full-Text Search**: Search through your transcripts
+- **📊 Statistics**: View recording statistics and usage metrics
+- **▶️ Audio Playback**: Play recordings directly from the library
+- **🗑️ Safe Deletion**: Delete recordings with confirmation prompts
+- **📁 Smart Organization**: All recordings stored in `~/scriba_recordings/`
 
 ## Prerequisites
 
 - Rust (1.70.0 or later)
 - OpenAI API key
+- Audio system (microphone for recording, speakers for playback)
 
 ## Installation
 
@@ -33,137 +38,166 @@ A simple CLI tool for recording audio and transcribing it using OpenAI's Whisper
 
 ## Configuration
 
-### Option 1: Environment Variable (Optional)
-
-Create a `.env` file in the project root and add your OpenAI API key:
-
+### Option 1: Environment Variable
+Create a `.env` file in the project root:
 ```env
 OPENAI_API_KEY=your_api_key_here
 ```
 
-### Option 2: Command Line Parameter (Recommended)
-
+### Option 2: Command Line Parameter
 Pass your API key directly when running commands:
-
 ```bash
 scriba record --api-key your_api_key_here
 ```
 
-You can get an API key from [OpenAI's platform](https://platform.openai.com/api-keys).
+Get an API key from [OpenAI's platform](https://platform.openai.com/api-keys).
 
 ## Usage
 
-### Record Audio
+### Interactive Mode (Default)
 
-#### Basic Recording (Auto-generated filename)
+Simply run `scriba` without arguments to enter interactive mode:
+
 ```bash
-# Simple recording with automatic naming
+scriba
+```
+
+This launches the main menu with options:
+1. **Record Audio + Auto-Transcribe** - Record and transcribe in one step
+2. **Record Audio Only** - Record without transcription
+3. **Browse Recording Library** - Interactive TUI for managing recordings
+4. **Transcribe Existing File** - Transcribe an audio file
+5. **Exit**
+
+### Recording Library (TUI)
+
+The interactive library provides:
+- **Navigation**: Use arrow keys to browse recordings
+- **View Transcripts**: Press `Enter` to read transcripts in full
+- **Play Audio**: Press `P` to play recordings
+- **Delete**: Press `D` to delete with confirmation
+- **Search**: Press `/` to search through transcripts
+- **Statistics**: Press `S` to view usage stats
+- **Help**: Press `H` for help
+
+### Command Line Interface
+
+#### Record Audio
+```bash
+# Basic recording with auto-transcription
 scriba record
 
-# Records to: ~/scriba_recordings/2025-08-10_14-30-25_recording/
-# Creates: recording.wav and transcript.txt (if not skipped)
-```
-
-#### Recording with Custom Name
-```bash
-# Recording with descriptive name
+# Custom name
 scriba record --name "meeting-notes"
 
-# Records to: ~/scriba_recordings/2025-08-10_14-30-25_meeting-notes/
-# Creates: recording.wav and transcript.txt
-```
-
-#### Skip Automatic Transcription
-```bash
-# Record only, no transcription
+# Skip transcription
 scriba record --skip-transcription
-scriba record --name "interview" --skip-transcription
-```
 
-#### With API Key Parameter
-```bash
-# Pass API key directly (no .env file needed)
+# With API key
 scriba record --api-key "your_api_key_here"
-scriba record --name "meeting" --api-key "your_api_key_here"
 ```
 
-### Transcribe Audio
-
-#### Transcribe Existing File
+#### Transcribe Audio
 ```bash
-# Transcribe with auto-generated name
+# Basic transcription
 scriba transcribe path/to/audio.wav
 
-# Transcribe with custom name
-scriba transcribe path/to/audio.wav --name "interview-transcript"
+# With custom name
+scriba transcribe audio.wav --name "interview-transcript"
 
-# With API key parameter
+# With API key
 scriba transcribe audio.wav --api-key "your_api_key_here"
 ```
 
 ### File Organization
 
-All files are organized in `~/scriba_recordings/` with automatic naming:
+All recordings are organized in `~/scriba_recordings/`:
 
 ```
 ~/scriba_recordings/
+├── scriba.db                              # SQLite database
 ├── 2025-08-10_14-30-25_meeting-notes/
 │   ├── recording.wav
 │   └── transcript.txt
 ├── 2025-08-10_15-45-12_recording/
 │   ├── recording.wav
 │   └── transcript.txt
-└── 2025-08-10_16-20-30_interview-transcript.txt
+└── 2025-08-10_16-20-30_interview/
+    ├── recording.wav
+    └── transcript.txt
 ```
 
-### Examples
+## Library Features
 
-```bash
-# Quick start - just record and transcribe
-scriba record --api-key "sk-..."
+### Search & Browse
+- Full-text search through all transcripts
+- Filter recordings by transcription status
+- Paginated results for large libraries
 
-# Record a meeting with custom name
-scriba record --name "team-standup" --api-key "sk-..."
+### Playback
+- Cross-platform audio playback
+- Automatic player detection (afplay, mpv, ffplay)
+- External playback with status updates
 
-# Record without transcription
-scriba record --name "music-practice" --skip-transcription
+### Statistics
+- Total recordings and duration
+- Storage usage tracking
+- Transcription progress metrics
+- Word count statistics
 
-# Transcribe an existing file
-scriba transcribe old-recording.wav --name "notes" --api-key "sk-..."
-```
+### Management
+- Safe deletion with confirmation
+- Database integrity checks
+- Automatic corruption recovery
 
 ## Development
 
 ### Building
-
 ```bash
 cargo build
 ```
 
 ### Running in Development
-
 ```bash
-cargo run -- record test.wav
-cargo run -- transcribe test.wav transcript.txt
+cargo run
+cargo run -- record --name "test"
+cargo run -- transcribe test.wav
 ```
 
 ### Running Tests
-
 ```bash
 cargo test
 ```
 
 ## Supported Audio Formats
 
-The tool supports various audio formats that are compatible with OpenAI's Whisper API, including:
-- WAV
-- MP3
-- MP4
-- MPEG
-- MPGA
-- M4A
-- WEBM
+Recording: WAV (primary)
+Transcription: WAV, MP3, MP4, MPEG, MPGA, M4A, WEBM, FLAC, OGG, OPUS, AIFF, CAF
+
+## Database
+
+Scriba uses SQLite for:
+- Recording metadata storage
+- Transcript content and full-text search
+- Usage statistics
+- Automatic schema management
+- Foreign key constraints for data integrity
 
 ## License
 
 This project is licensed under the MIT License.
+
+## Version History
+
+**v0.2.0** - Recording Library & Database
+- Interactive TUI library for managing recordings
+- SQLite database with full-text search
+- Audio playback functionality
+- Statistics and usage tracking
+- Safe deletion with confirmation prompts
+- Improved CLI interface
+
+**v0.1.x** - Basic Recording & Transcription
+- Command-line audio recording
+- OpenAI Whisper API integration
+- Basic file organization

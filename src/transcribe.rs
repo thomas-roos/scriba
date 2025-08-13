@@ -11,6 +11,8 @@ use tokio::time::sleep;
 use std::io::stdout;
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
+use crate::database::{Database, Transcript};
+use chrono::Utc;
 
 lazy_static! {
     static ref BASE_PATH: PathBuf = home_dir().expect("error home dir").join("scriba_recordings");
@@ -203,6 +205,49 @@ pub async fn transcribe_file(
         show_transcription_typing_effect(transcription_text).await;
 
         println!("\n📁 Transcript saved to: ~/scriba_recordings/{}/transcript.txt", output_path.display());
+
+        // Save transcript to database
+        let mut db = Database::new().context("Failed to connect to database")?;
+        
+        // Find the recording by directory name
+        let directory_name = output_path.to_string_lossy().to_string();
+        match db.get_recording_by_directory(&directory_name) {
+            Ok(Some(recording)) => {
+                if let Some(recording_id) = recording.id {
+                    // Create transcript record
+                    let transcript = Transcript {
+                        id: None,
+                        recording_id,
+                        content: transcription_text.to_string(),
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                        word_count: None, // Will be calculated by database
+                        character_count: None, // Will be calculated by database
+                        language_detected: None,
+                        confidence_scores: None,
+                        segments: None,
+                        entities: None,
+                        topics: None,
+                    };
+                    
+                    match db.insert_transcript(&transcript) {
+                        Ok(transcript_id) => {
+                            // Update recording status
+                            if let Err(e) = db.update_recording_transcript_status(recording_id, "completed", true) {
+                                eprintln!("⚠️ Warning: Failed to update recording status: {}", e);
+                            } else {
+                                println!("📊 Transcript saved to database with ID: {}", transcript_id);
+                            }
+                        },
+                        Err(e) => eprintln!("⚠️ Warning: Failed to save transcript to database: {}", e),
+                    }
+                } else {
+                    eprintln!("⚠️ Warning: Recording found but has no ID");
+                }
+            },
+            Ok(None) => eprintln!("⚠️ Warning: No recording found in database for directory: {}", directory_name),
+            Err(e) => eprintln!("⚠️ Warning: Failed to query recording from database: {}", e),
+        }
 
         Ok(())
     } else {

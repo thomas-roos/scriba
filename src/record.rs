@@ -3,12 +3,13 @@ use anyhow::Context;
 use std::sync::{Arc, Mutex};
 use std::fs::File;
 use cpal::traits::{HostTrait, DeviceTrait, StreamTrait};
-use cpal::{FromSample, Sample};
 use std::io::{BufWriter, Write};
 use tokio::signal;
 use lazy_static::lazy_static;
 use dirs::home_dir;
 use std::time::{Duration, Instant};
+use crate::database::{Database, Recording};
+use chrono::Utc;
 
 lazy_static! {
     static ref BASE_PATH: PathBuf = {
@@ -91,9 +92,13 @@ pub async fn record(output_path: PathBuf) -> Result<(), anyhow::Error> {
         .default_input_config()
         .expect("Failed to get default input config");
     println!("Default input config: {:?}", config);
+    
+    // Save config values for database insertion (before they're consumed)
+    let sample_rate = config.sample_rate().0 as i64;
+    let channels = config.channels() as i64;
 
     // The WAV file we're recording to.
-    let file_path = BASE_PATH.join(output_path).join("recording.wav");
+    let file_path = BASE_PATH.join(&output_path).join("recording.wav");
     
     // Ensure the recording directory exists
     if let Some(parent) = file_path.parent() {
@@ -162,6 +167,51 @@ pub async fn record(output_path: PathBuf) -> Result<(), anyhow::Error> {
     println!("Recording {} complete!", file_path.display());
     
     writer.lock().unwrap().take().unwrap().finalize()?;
+
+    // Save recording metadata to database
+    let mut db = Database::new().context("Failed to connect to database")?;
+    
+    // Get file size and duration info
+    let file_metadata = std::fs::metadata(&file_path)?;
+    let file_size_bytes = file_metadata.len() as i64;
+    
+    // Calculate duration from WAV file
+    let duration_seconds = calculate_wav_duration(&file_path, sample_rate, channels)?;
+    
+    // Create recording record
+    let recording = Recording {
+        id: None,
+        directory_name: output_path.to_string_lossy().to_string(),
+        display_name: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        duration_seconds: Some(duration_seconds),
+        file_size_bytes: Some(file_size_bytes),
+        audio_format: "wav".to_string(),
+        sample_rate,
+        channels,
+        has_transcript: false,
+        transcript_status: "pending".to_string(),
+        language_code: "auto".to_string(),
+        model_used: "whisper-1".to_string(),
+        tags: None,
+        summary: None,
+        key_points: None,
+        action_items: None,
+        speakers: None,
+        sentiment_score: None,
+        search_index: None,
+        categories: None,
+        confidence_score: None,
+        audio_path: "recording.wav".to_string(),
+        transcript_path: None,
+    };
+    
+    match db.insert_recording(&recording) {
+        Ok(id) => println!("📊 Recording saved to database with ID: {}", id),
+        Err(e) => eprintln!("⚠️ Warning: Failed to save recording to database: {}", e),
+    }
+    
     Ok(())
 }
 
@@ -253,4 +303,21 @@ fn write_input_data_with_monitoring_i8(input: &[i8], writer: &WavWriterHandle, l
             }
         }
     }
+}
+
+fn calculate_wav_duration(file_path: &std::path::Path, _sample_rate: i64, _channels: i64) -> Result<i64, anyhow::Error> {
+    // Use hound to properly read the WAV file header and get accurate info
+    let reader = hound::WavReader::open(file_path)
+        .context("Failed to open WAV file for duration calculation")?;
+    
+    let spec = reader.spec();
+    let sample_rate = spec.sample_rate as i64;
+    
+    // Get the total number of samples
+    let duration_samples = reader.duration() as i64;
+    
+    // Calculate duration in seconds
+    let duration_seconds = duration_samples / sample_rate;
+    
+    Ok(duration_seconds)
 }

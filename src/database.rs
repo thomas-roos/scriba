@@ -1,9 +1,9 @@
-use rusqlite::{Connection, Result as SqliteResult, params};
+use rusqlite::{Connection, params};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use dirs::home_dir;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Recording {
@@ -76,7 +76,17 @@ impl Database {
             .context("Failed to open database connection")?;
         
         let mut db = Database { conn };
-        db.initialize()?;
+        
+        if let Err(_e) = db.initialize() {
+            drop(db);
+            Self::reset_database()?;
+            let conn = Connection::open(&db_path)
+                .context("Failed to open database connection after reset")?;
+            let mut db = Database { conn };
+            db.initialize().context("Failed to initialize fresh database")?;
+            return Ok(db);
+        }
+        
         Ok(db)
     }
     
@@ -86,10 +96,26 @@ impl Database {
     }
     
     fn initialize(&mut self) -> Result<()> {
-        // Read and execute schema
+        // Enable foreign key constraints (essential)
+        self.conn.execute("PRAGMA foreign_keys = ON", [])
+            .context("Failed to enable foreign key constraints")?;
+        
+        // Try to enable WAL mode for better concurrency, but don't fail if not supported
+        if let Err(_) = self.conn.execute("PRAGMA journal_mode = WAL", []) {
+            // Fallback to DELETE mode (default) if WAL is not supported
+        }
+        
+        self.conn.execute("PRAGMA busy_timeout = 5000", []).ok();
+        
         let schema = include_str!("../schema.sql");
         self.conn.execute_batch(schema)
             .context("Failed to initialize database schema")?;
+            
+        let fk_on: i64 = self.conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap_or(0);
+        if fk_on != 1 {
+            return Err(anyhow!("Foreign keys are not enabled on this SQLite connection"));
+        }
         Ok(())
     }
     
@@ -106,7 +132,7 @@ impl Database {
             )
         "#;
         
-        let result = self.conn.execute(sql, params![
+        let _result = self.conn.execute(sql, params![
             recording.directory_name,
             recording.display_name,
             recording.created_at,
@@ -218,8 +244,115 @@ impl Database {
     }
     
     pub fn delete_recording(&mut self, id: i64) -> Result<()> {
-        let sql = "DELETE FROM recordings WHERE id = ?1";
-        self.conn.execute(sql, params![id])?;
+        let check_sql = "SELECT COUNT(*) FROM recordings WHERE id = ?1";
+        let count: i64 = self
+            .conn
+            .query_row(check_sql, params![id], |row| row.get(0))
+            .context("Failed to check if recording exists")?;
+        if count == 0 {
+            return Err(anyhow!("No recording found with id {}", id));
+        }
+
+        match self.try_parent_delete_with_cascade(id) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if let Err(_rebuild_err) = self.rebuild_transcripts_fts() {
+                    return Err(e);
+                }
+                match self.try_parent_delete_with_cascade(id) {
+                    Ok(()) => return Ok(()),
+                    Err(e2) => {
+                        return Err(e2);
+                    }
+                }
+            }
+        }
+    }
+
+    fn try_parent_delete_with_cascade(&mut self, id: i64) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction()
+            .context("Failed to start transaction")?;
+
+        tx.execute("PRAGMA foreign_keys = ON", [])?;
+
+        let _rows_affected = tx
+            .execute("DELETE FROM recordings WHERE id = ?1", params![id])
+            .context("Failed to delete recording")?;
+
+        {
+            let mut stmt = tx.prepare("PRAGMA foreign_key_check")?;
+            let violations: Vec<String> = stmt
+                .query_map([], |row| {
+                    let table: String = row.get(0)?;
+                    let rowid: i64 = row.get(1)?;
+                    let parent: String = row.get(2)?;
+                    let fkid: i64 = row.get(3)?;
+                    Ok(format!(
+                        "FK violation: table={}, rowid={}, parent={}, fkid={}",
+                        table, rowid, parent, fkid
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if !violations.is_empty() {
+                return Err(anyhow!("Foreign key violations detected after delete"));
+            }
+        }
+
+        tx.commit().context("Failed to commit transaction")?;
+        Ok(())
+    }
+
+    fn rebuild_transcripts_fts(&mut self) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction()
+            .context("Failed to start rebuild transaction")?;
+
+        tx.execute_batch(
+            r#"
+            DROP TRIGGER IF EXISTS transcripts_fts_insert;
+            DROP TRIGGER IF EXISTS transcripts_fts_delete;
+            DROP TRIGGER IF EXISTS transcripts_fts_update;
+            DROP TABLE IF EXISTS transcripts_fts;
+
+            CREATE VIRTUAL TABLE transcripts_fts USING fts5(
+                content,
+                recording_id UNINDEXED,
+                content='transcripts',
+                content_rowid='id'
+            );
+
+            CREATE TRIGGER transcripts_fts_insert AFTER INSERT ON transcripts BEGIN
+                INSERT INTO transcripts_fts(rowid, content, recording_id)
+                VALUES (new.id, new.content, new.recording_id);
+            END;
+
+            CREATE TRIGGER transcripts_fts_delete AFTER DELETE ON transcripts BEGIN
+                INSERT INTO transcripts_fts(transcripts_fts, rowid, content, recording_id)
+                VALUES('delete', old.id, old.content, old.recording_id);
+            END;
+
+            CREATE TRIGGER transcripts_fts_update AFTER UPDATE ON transcripts BEGIN
+                INSERT INTO transcripts_fts(transcripts_fts, rowid, content, recording_id)
+                VALUES('delete', old.id, old.content, old.recording_id);
+                INSERT INTO transcripts_fts(rowid, content, recording_id)
+                VALUES (new.id, new.content, new.recording_id);
+            END;
+            "#,
+        )
+        .context("Failed to recreate transcripts_fts and triggers")?;
+
+        let _inserted = tx
+            .execute(
+                "INSERT INTO transcripts_fts(rowid, content, recording_id)
+                 SELECT id, content, recording_id FROM transcripts",
+                [],
+            )
+            .context("Failed to repopulate transcripts_fts from transcripts")?;
+
+        tx.commit().context("Failed to commit rebuild transaction")?;
         Ok(())
     }
     
@@ -375,6 +508,44 @@ impl Database {
         })?;
         
         Ok(row)
+    }
+    
+    // Database maintenance and diagnostics
+    pub fn check_integrity(&self) -> Result<bool> {
+        let mut stmt = self.conn.prepare("PRAGMA integrity_check")?;
+        let result = stmt.query_row([], |row| {
+            let check_result: String = row.get(0)?;
+            Ok(check_result == "ok")
+        })?;
+        Ok(result)
+    }
+    
+    pub fn vacuum(&mut self) -> Result<()> {
+        self.conn.execute("VACUUM", [])?;
+        Ok(())
+    }
+    
+    // Reset the database completely - useful for corruption recovery
+    pub fn reset_database() -> Result<()> {
+        let db_path = Self::get_database_path()?;
+        
+        if db_path.exists() {
+            std::fs::remove_file(&db_path)
+                .context("Failed to remove corrupted database file")?;
+        }
+        
+        let wal_path = db_path.with_extension("db-wal");
+        let shm_path = db_path.with_extension("db-shm");
+        
+        if wal_path.exists() {
+            std::fs::remove_file(&wal_path).ok();
+        }
+        
+        if shm_path.exists() {
+            std::fs::remove_file(&shm_path).ok();
+        }
+        
+        Ok(())
     }
 }
 

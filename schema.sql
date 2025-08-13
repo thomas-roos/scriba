@@ -1,7 +1,7 @@
 -- SCRIBA v0.2.0 Database Schema
 -- Designed for future AI-powered knowledge base capabilities
 
-CREATE TABLE recordings (
+CREATE TABLE IF NOT EXISTS recordings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     directory_name TEXT NOT NULL UNIQUE,  -- e.g., "2025-08-10_14-30-25_meeting-notes"
     display_name TEXT,                     -- User-friendly name
@@ -35,7 +35,7 @@ CREATE TABLE recordings (
     transcript_path TEXT                 -- Path to transcript file
 );
 
-CREATE TABLE transcripts (
+CREATE TABLE IF NOT EXISTS transcripts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     recording_id INTEGER NOT NULL,
     content TEXT NOT NULL,               -- Full transcript text
@@ -59,7 +59,7 @@ CREATE TABLE transcripts (
 );
 
 -- Table for AI-powered search and knowledge base
-CREATE TABLE knowledge_items (
+CREATE TABLE IF NOT EXISTS knowledge_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     recording_id INTEGER NOT NULL,
     transcript_id INTEGER,
@@ -84,7 +84,7 @@ CREATE TABLE knowledge_items (
 );
 
 -- Table for tagging and categorization
-CREATE TABLE tags (
+CREATE TABLE IF NOT EXISTS tags (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
     color TEXT DEFAULT '#6366f1',       -- Hex color for UI
@@ -92,7 +92,7 @@ CREATE TABLE tags (
     usage_count INTEGER DEFAULT 0       -- How many recordings use this tag
 );
 
-CREATE TABLE recording_tags (
+CREATE TABLE IF NOT EXISTS recording_tags (
     recording_id INTEGER NOT NULL,
     tag_id INTEGER NOT NULL,
     created_at DATETIME NOT NULL,
@@ -102,7 +102,7 @@ CREATE TABLE recording_tags (
 );
 
 -- Table for AI chat/query history (future feature)
-CREATE TABLE ai_queries (
+CREATE TABLE IF NOT EXISTS ai_queries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     query TEXT NOT NULL,                 -- User's question
     response TEXT NOT NULL,              -- AI's response
@@ -113,15 +113,17 @@ CREATE TABLE ai_queries (
 );
 
 -- Indexes for performance
-CREATE INDEX idx_recordings_created_at ON recordings(created_at DESC);
-CREATE INDEX idx_recordings_directory_name ON recordings(directory_name);
-CREATE INDEX idx_recordings_search ON recordings(display_name, tags, summary);
-CREATE INDEX idx_transcripts_recording_id ON transcripts(recording_id);
-CREATE INDEX idx_knowledge_items_recording_id ON knowledge_items(recording_id);
-CREATE INDEX idx_knowledge_items_type ON knowledge_items(item_type);
-CREATE INDEX idx_recording_tags_recording_id ON recording_tags(recording_id);
+CREATE INDEX IF NOT EXISTS idx_recordings_created_at ON recordings(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_recordings_directory_name ON recordings(directory_name);
+CREATE INDEX IF NOT EXISTS idx_recordings_search ON recordings(display_name, tags, summary);
+CREATE INDEX IF NOT EXISTS idx_transcripts_recording_id ON transcripts(recording_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_items_recording_id ON knowledge_items(recording_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_items_type ON knowledge_items(item_type);
+CREATE INDEX IF NOT EXISTS idx_recording_tags_recording_id ON recording_tags(recording_id);
 
 -- Full-text search virtual table (for transcript content)
+-- Note: Virtual tables don't support IF NOT EXISTS, so we drop and recreate
+DROP TABLE IF EXISTS transcripts_fts;
 CREATE VIRTUAL TABLE transcripts_fts USING fts5(
     content,
     recording_id UNINDEXED,
@@ -130,16 +132,20 @@ CREATE VIRTUAL TABLE transcripts_fts USING fts5(
 );
 
 -- Triggers to maintain FTS index
+-- Note: Triggers don't support IF NOT EXISTS, so we drop and recreate
+DROP TRIGGER IF EXISTS transcripts_fts_insert;
 CREATE TRIGGER transcripts_fts_insert AFTER INSERT ON transcripts BEGIN
     INSERT INTO transcripts_fts(rowid, content, recording_id) 
     VALUES (new.id, new.content, new.recording_id);
 END;
 
+DROP TRIGGER IF EXISTS transcripts_fts_delete;
 CREATE TRIGGER transcripts_fts_delete AFTER DELETE ON transcripts BEGIN
     INSERT INTO transcripts_fts(transcripts_fts, rowid, content, recording_id) 
     VALUES('delete', old.id, old.content, old.recording_id);
 END;
 
+DROP TRIGGER IF EXISTS transcripts_fts_update;
 CREATE TRIGGER transcripts_fts_update AFTER UPDATE ON transcripts BEGIN
     INSERT INTO transcripts_fts(transcripts_fts, rowid, content, recording_id) 
     VALUES('delete', old.id, old.content, old.recording_id);
@@ -147,10 +153,10 @@ CREATE TRIGGER transcripts_fts_update AFTER UPDATE ON transcripts BEGIN
     VALUES (new.id, new.content, new.recording_id);
 END;
 
--- Initial data
-INSERT INTO tags (name, color) VALUES 
-    ('meeting', '#3b82f6'),
-    ('interview', '#10b981'),
-    ('brainstorm', '#f59e0b'),
-    ('call', '#8b5cf6'),
-    ('personal', '#ef4444');
+-- Initial data (only insert if not already present)
+INSERT OR IGNORE INTO tags (name, color, created_at) VALUES 
+    ('meeting', '#3b82f6', datetime('now')),
+    ('interview', '#10b981', datetime('now')),
+    ('brainstorm', '#f59e0b', datetime('now')),
+    ('call', '#8b5cf6', datetime('now')),
+    ('personal', '#ef4444', datetime('now'));

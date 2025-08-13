@@ -3,8 +3,7 @@ use std::path::PathBuf;
 use structopt::StructOpt;
 use scriba::record::record;
 use scriba::transcribe::transcribe_file;
-use scriba::database::{Database, Recording, Transcript};
-use scriba::library::RecordingLibrary;
+use scriba::tui::TuiRecordingLibrary;
 use anyhow::{Context, Result};
 use chrono::Local;
 use std::io::{self, Write};
@@ -170,17 +169,17 @@ async fn interactive_mode() -> Result<()> {
             }
             "3" => {
                 println!("\n╭─ RECORDING LIBRARY ────────────────────────────────────╮");
-                println!("│ Loading your recordings...                            │");
+                println!("│ Loading your recordings with enhanced interface...     │");
                 println!("╰────────────────────────────────────────────────────────╯\n");
                 
-                match RecordingLibrary::new() {
-                    Ok(mut library) => {
-                        if let Err(err) = library.show_library().await {
-                            eprintln!("❌ Library error: {err}");
+                match TuiRecordingLibrary::new() {
+                    Ok(mut tui_library) => {
+                        if let Err(err) = tui_library.run().await {
+                            eprintln!("❌ TUI Library error: {err}");
                         }
                     }
                     Err(err) => {
-                        eprintln!("❌ Failed to open library: {err}");
+                        eprintln!("❌ Failed to open TUI library: {err}");
                     }
                 }
             }
@@ -304,3 +303,4 @@ async fn main() -> Result<()> {
     
     Ok(())
 }
+
