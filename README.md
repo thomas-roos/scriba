@@ -1,16 +1,16 @@
-# Scriba v0.2.0
+# Scriba v0.3.0
 
-A modern CLI tool for recording audio and transcribing it using OpenAI's Whisper API, featuring an interactive TUI library for managing your recordings.
+A modern CLI tool for recording audio and transcribing it using OpenAI's Whisper API, featuring an enhanced recording library with integrated statistics.
 
 ## Features
 
 - **🎙️ Audio Recording**: Capture audio directly from your microphone
 - **📝 AI Transcription**: Convert audio to text using OpenAI's Whisper API
 - **🔄 Combined Workflow**: Record and automatically transcribe in one command
-- **📚 Recording Library**: Interactive TUI browser for managing recordings
+- **📚 Enhanced Recording Library**: Interactive interface with integrated statistics display
 - **🗃️ Database Storage**: SQLite database for organized recording metadata
 - **🔍 Full-Text Search**: Search through your transcripts
-- **📊 Statistics**: View recording statistics and usage metrics
+- **📊 Always-On Statistics**: Recording statistics and usage metrics always visible
 - **▶️ Audio Playback**: Play recordings directly from the library
 - **🗑️ Safe Deletion**: Delete recordings with confirmation prompts
 - **📁 Smart Organization**: All recordings stored in `~/scriba_recordings/`
@@ -65,20 +65,22 @@ scriba
 This launches the main menu with options:
 1. **Record Audio + Auto-Transcribe** - Record and transcribe in one step
 2. **Record Audio Only** - Record without transcription
-3. **Browse Recording Library** - Interactive TUI for managing recordings
-4. **Transcribe Existing File** - Transcribe an audio file
-5. **Exit**
+3. **Transcribe Existing File** - Transcribe an audio file
+4. **Exit**
+**D. Recording Library with Statistics** - Enhanced library interface
 
-### Recording Library (TUI)
+### Recording Library with Statistics
 
-The interactive library provides:
-- **Navigation**: Use arrow keys to browse recordings
-- **View Transcripts**: Press `Enter` to read transcripts in full
-- **Play Audio**: Press `P` to play recordings
-- **Delete**: Press `D` to delete with confirmation
-- **Search**: Press `/` to search through transcripts
-- **Statistics**: Press `S` to view usage stats
-- **Help**: Press `H` for help
+The enhanced library interface provides:
+- **Always-Visible Statistics**: Recording metrics always displayed at the bottom
+- **Navigation**: Use arrow keys to browse recordings with table view
+- **View Transcripts**: Press `Enter` to read transcripts in popup
+- **Play Audio**: Press `P` to play recordings with external players
+- **Delete**: Press `D` to delete recordings with confirmation dialog
+- **Search**: Press `/` to search through all transcripts
+- **Quick Actions**: Press `R`/`A`/`T` for recording and transcription actions
+- **Help**: Press `H` for complete help guide
+- **Pagination**: Use `PgUp`/`PgDn` to navigate large libraries
 
 ### Command Line Interface
 
@@ -139,11 +141,12 @@ All recordings are organized in `~/scriba_recordings/`:
 - Automatic player detection (afplay, mpv, ffplay)
 - External playback with status updates
 
-### Statistics
-- Total recordings and duration
-- Storage usage tracking
-- Transcription progress metrics
-- Word count statistics
+### Integrated Statistics Display
+- Always visible at bottom of library interface
+- Total recordings and duration in real-time
+- Storage usage tracking with formatted sizes
+- Transcription progress metrics and percentages
+- Word count statistics across all transcripts
 
 ### Management
 - Safe deletion with confirmation
@@ -188,6 +191,15 @@ Scriba uses SQLite for:
 This project is licensed under the MIT License.
 
 ## Version History
+
+**v0.3.0** - Enhanced Library with Integrated Statistics
+- Merged recording library with always-visible statistics display
+- Enhanced table-based recording browser with improved UX
+- Integrated quick action controls (R/A/T) directly in library
+- Popup-based transcript viewing for better readability
+- Streamlined main menu (removed separate library option)
+- Improved help system with comprehensive key bindings
+- Better CLI launch preference while maintaining TUI functionality
 
 **v0.2.0** - Recording Library & Database
 - Interactive TUI library for managing recordings
