@@ -1283,8 +1283,10 @@ dependencies = [
  "hound",
  "lazy_static",
  "reqwest",
+ "serde_json",
  "structopt",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]

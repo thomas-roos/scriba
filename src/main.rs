@@ -5,6 +5,7 @@ use scriba::record::record;
 use scriba::transcribe::transcribe_file;
 use anyhow::{Context, Result};
 use chrono::Local;
+use std::io::{self, Write};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const ASCII_ART: &str = r#"
@@ -36,12 +37,11 @@ enum Command {
     },
 }
 
-
 #[derive(Debug, StructOpt)]
 #[structopt(name = "scriba", about = "A simple CLI tool for recording and transcribing", version = VERSION)]
 struct Cli {
     #[structopt(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 fn get_api_key(provided_key: Option<String>) -> Result<String> {
@@ -64,67 +64,218 @@ fn generate_filename(name: Option<String>) -> String {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Display ASCII art banner
+fn print_banner() {
     println!("{}", ASCII_ART);
-    println!("Scriba v{} - Audio Recording and Transcription Tool", VERSION);
-    println!("{}", "=".repeat(55));
+    println!("╔────────────────────────────────────────────────────────╗");
+    println!("║            SCRIBA v{} - AUDIO WORKSTATION           ║", VERSION);
+    println!("║               Recording & Transcription                ║");
+    println!("╚────────────────────────────────────────────────────────╝");
     println!();
+}
 
+fn print_main_menu() {
+    println!("┌────────────────────────────────────────────────────────┐");
+    println!("│                    MAIN MENU                           │");
+    println!("├────────────────────────────────────────────────────────┤");
+    println!("│  [1] Record Audio + Auto-Transcribe                    │");
+    println!("│  [2] Record Audio Only                                 │");
+    println!("│  [3] Transcribe Existing File                          │");
+    println!("│  [4] Exit                                              │");
+    println!("└────────────────────────────────────────────────────────┘");
+    println!();
+}
+
+fn get_user_input(prompt: &str) -> Result<String> {
+    print!(">> {}: ", prompt);
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+fn get_optional_input(prompt: &str) -> Result<Option<String>> {
+    let input = get_user_input(prompt)?;
+    if input.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(input))
+    }
+}
+
+async fn interactive_mode() -> Result<()> {
     // Load environment variables from .env file
     dotenv::dotenv().ok();
 
-    let cli = Cli::from_args();
-
-    let result = match cli.command {
-        Command::Record {
-            name,
-            skip_transcription,
-            api_key,
-        } => {
-            // Generate automatic filename
-            let recording_name = generate_filename(name.clone());
-            let audio_output = PathBuf::from(&recording_name);
-            
-            // Get API key from parameter or environment
-            let api_key = get_api_key(api_key)?;
-            // Start the recording task
-            let record_result = record(audio_output.clone()).await;
-
-            if !skip_transcription {
-                // Use the same directory as the recording
-                let transcript_output = audio_output.clone();
+    print_banner();
+    
+    loop {
+        print_main_menu();
+        
+        let choice = get_user_input("Select option (1-4)")?;
+        
+        match choice.as_str() {
+            "1" => {
+                println!("\n╭─ RECORD + AUTO-TRANSCRIBE ─────────────────────────────╮");
+                let name = get_optional_input("Recording name (optional)")?;
+                let api_key = get_optional_input("OpenAI API key (optional)")?;
+                let api_key = get_api_key(api_key)?;
                 
-                match transcribe_file(&audio_output, &transcript_output, &api_key).await {
+                println!("│ Starting recording session...                          │");
+                println!("╰────────────────────────────────────────────────────────╯\n");
+                
+                let recording_name = generate_filename(name);
+                let audio_output = PathBuf::from(&recording_name);
+                
+                let record_result = record(audio_output.clone()).await;
+                
+                if record_result.is_ok() {
+                    let transcript_output = audio_output.clone();
+                    println!("\n🎙️ Recording complete! Starting transcription...");
+                    
+                    match transcribe_file(&audio_output, &transcript_output, &api_key).await {
+                        Ok(()) => {
+                            println!("✅ Transcription complete!");
+                            println!("📁 Files saved in: ~/scriba_recordings/{}/", recording_name);
+                        }
+                        Err(err) => {
+                            eprintln!("❌ Transcription failed: {err}");
+                        }
+                    }
+                } else if let Err(err) = record_result {
+                    eprintln!("❌ Recording failed: {err}");
+                }
+            }
+            "2" => {
+                println!("\n╭─ RECORD AUDIO ONLY ────────────────────────────────────╮");
+                let name = get_optional_input("Recording name (optional)")?;
+                
+                println!("│ Starting recording session...                          │");
+                println!("╰────────────────────────────────────────────────────────╯\n");
+                
+                let recording_name = generate_filename(name);
+                let audio_output = PathBuf::from(&recording_name);
+                
+                match record(audio_output).await {
                     Ok(()) => {
-                        println!("Transcription saved to: {:?}", transcript_output);
+                        println!("✅ Recording complete!");
+                        println!("📁 File saved in: ~/scriba_recordings/{}/", recording_name);
                     }
                     Err(err) => {
-                        eprintln!("Error during transcription: {err}");
+                        eprintln!("❌ Recording failed: {err}");
                     }
                 }
             }
-
-            // Return the result of the record task
-            record_result
+            "3" => {
+                println!("\n╭─ TRANSCRIBE EXISTING FILE ─────────────────────────────╮");
+                let input_path = get_user_input("Path to audio file")?;
+                let name = get_optional_input("Transcript name (optional)")?;
+                let api_key = get_optional_input("OpenAI API key (optional)")?;
+                let api_key = get_api_key(api_key)?;
+                
+                let output = if let Some(n) = name {
+                    let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
+                    let sanitized = n.replace(' ', "-").replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
+                    PathBuf::from(format!("{}_{}_transcript", timestamp, sanitized))
+                } else {
+                    let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
+                    PathBuf::from(format!("{}_transcript", timestamp))
+                };
+                
+                println!("│ Starting transcription...                              │");
+                println!("╰────────────────────────────────────────────────────────╯\n");
+                
+                match transcribe_file(&PathBuf::from(input_path), &output, &api_key).await {
+                    Ok(()) => {
+                        println!("✅ Transcription complete!");
+                        println!("📁 File saved in: ~/scriba_recordings/{}/", output.display());
+                    }
+                    Err(err) => {
+                        eprintln!("❌ Transcription failed: {err}");
+                    }
+                }
+            }
+            "4" => {
+                println!("\n🎵 Thanks for using SCRIBA! Goodbye! 🎵\n");
+                break;
+            }
+            _ => {
+                println!("❌ Invalid choice. Please select 1-4.\n");
+            }
         }
-        Command::Transcribe { input, name, api_key } => {
-            // Generate automatic transcript filename if needed
-            let output = if let Some(n) = name {
-                let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
-                let sanitized = n.replace(' ', "-").replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
-                PathBuf::from(format!("{}_{}_transcript", timestamp, sanitized))
-            } else {
-                let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
-                PathBuf::from(format!("{}_transcript", timestamp))
-            };
+        
+        if choice != "4" {
+            println!("\n{}", "─".repeat(60));
+            get_user_input("Press Enter to continue")?;
+            println!();
+        }
+    }
+    
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::from_args();
+
+    // If no command is provided, start interactive mode
+    let result = match cli.command {
+        None => {
+            interactive_mode().await
+        }
+        Some(command) => {
+            // Load environment variables for CLI mode
+            dotenv::dotenv().ok();
             
-            // Get API key from parameter or environment
-            let api_key = get_api_key(api_key)?;
-            // Transcribe the specified file
-            let transcription = transcribe_file(&input, &output, &api_key).await;
-            transcription
+            match command {
+                Command::Record {
+                    name,
+                    skip_transcription,
+                    api_key,
+                } => {
+                    // Generate automatic filename
+                    let recording_name = generate_filename(name.clone());
+                    let audio_output = PathBuf::from(&recording_name);
+                    
+                    // Get API key from parameter or environment
+                    let api_key = get_api_key(api_key)?;
+                    // Start the recording task
+                    let record_result = record(audio_output.clone()).await;
+
+                    if !skip_transcription {
+                        // Use the same directory as the recording
+                        let transcript_output = audio_output.clone();
+                        
+                        match transcribe_file(&audio_output, &transcript_output, &api_key).await {
+                            Ok(()) => {
+                                println!("Transcription saved to: {:?}", transcript_output);
+                            }
+                            Err(err) => {
+                                eprintln!("Error during transcription: {err}");
+                            }
+                        }
+                    }
+
+                    // Return the result of the record task
+                    record_result
+                }
+                Command::Transcribe { input, name, api_key } => {
+                    // Generate automatic transcript filename if needed
+                    let output = if let Some(n) = name {
+                        let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
+                        let sanitized = n.replace(' ', "-").replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
+                        PathBuf::from(format!("{}_{}_transcript", timestamp, sanitized))
+                    } else {
+                        let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
+                        PathBuf::from(format!("{}_transcript", timestamp))
+                    };
+                    
+                    // Get API key from parameter or environment
+                    let api_key = get_api_key(api_key)?;
+                    // Transcribe the specified file
+                    let transcription = transcribe_file(&input, &output, &api_key).await;
+                    transcription
+                }
+            }
         }
     };
 
