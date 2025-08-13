@@ -3,3 +3,4 @@ pub mod transcribe;
 pub mod database;
 pub mod library;
 pub mod tui;
+pub mod dashboard;
