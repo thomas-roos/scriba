@@ -365,9 +365,9 @@ impl Dashboard {
                 // Candidate players differ by platform. We'll try a few in order.
                 #[cfg(target_os = "macos")]
                 let candidates: Vec<(&str, &[&str])> = vec![
-                    ("afplay", &[]),             // Native macOS (handles stereo automatically)
                     ("mpv", &["--really-quiet", "--audio-channels=stereo"]),
                     ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"]),
+                    ("afplay", &[]),             // Native macOS - we'll handle mono issue differently
                 ];
 
                 #[cfg(all(unix, not(target_os = "macos")))]
@@ -390,8 +390,21 @@ impl Dashboard {
                 #[cfg(not(target_os = "windows"))]
                 for (prog, base_args) in candidates {
                     let mut cmd = TokioCommand::new(prog);
-                    for a in base_args { cmd.arg(a); }
-                    cmd.arg(&audio_path);
+                    
+                    // For afplay on macOS, check if this is a mono file and needs special handling
+                    if prog == "afplay" && recording.channels == 1 {
+                        // Create a temporary stereo version of the mono file
+                        if let Ok(stereo_path) = self.create_stereo_temp_file(&audio_path).await {
+                            cmd.arg(stereo_path);
+                        } else {
+                            // Fallback to original mono file
+                            cmd.arg(&audio_path);
+                        }
+                    } else {
+                        for a in base_args { cmd.arg(a); }
+                        cmd.arg(&audio_path);
+                    }
+                    
                     match cmd.spawn() {
                         Ok(_child) => { launched_with = Some(prog.to_string()); break; }
                         Err(_e) => { /* try next */ }
@@ -1190,6 +1203,64 @@ impl Dashboard {
             format!("{}m {}s", minutes, secs)
         } else {
             format!("{}s", secs)
+        }
+    }
+    
+    async fn create_stereo_temp_file(&self, mono_file_path: &std::path::Path) -> Result<std::path::PathBuf> {
+        use std::process::Command;
+        use std::fs;
+        
+        // Create a temporary file path for the stereo version
+        let temp_dir = std::env::temp_dir();
+        let temp_filename = format!("scriba_stereo_{}.wav", 
+            mono_file_path.file_stem().unwrap_or_default().to_string_lossy());
+        let temp_path = temp_dir.join(temp_filename);
+        
+        // Create stereo version using Python's built-in audio tools via shell
+        // This duplicates the mono channel to both left and right
+        let script = format!(r#"
+import wave
+import struct
+
+# Read mono WAV file
+with wave.open('{}', 'rb') as mono:
+    frames = mono.readframes(-1)
+    params = mono.getparams()
+
+# Convert mono samples to stereo (duplicate each sample)
+mono_samples = struct.unpack('<' + 'h' * (len(frames) // 2), frames)
+stereo_samples = []
+for sample in mono_samples:
+    stereo_samples.extend([sample, sample])  # Duplicate to both channels
+
+# Write stereo WAV file
+with wave.open('{}', 'wb') as stereo:
+    stereo.setnchannels(2)  # Stereo
+    stereo.setsampwidth(params.sampwidth)
+    stereo.setframerate(params.framerate)
+    stereo.writeframes(struct.pack('<' + 'h' * len(stereo_samples), *stereo_samples))
+"#, 
+            mono_file_path.to_string_lossy(), 
+            temp_path.to_string_lossy()
+        );
+        
+        // Execute Python script to create stereo file
+        let output = Command::new("python3")
+            .arg("-c")
+            .arg(&script)
+            .output();
+        
+        match output {
+            Ok(result) if result.status.success() => {
+                // Schedule cleanup of temp file after a delay
+                let temp_path_clone = temp_path.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                    let _ = fs::remove_file(&temp_path_clone);
+                });
+                Ok(temp_path)
+            },
+            _ => Err(anyhow::anyhow!("Failed to create stereo version of audio file"))
         }
     }
 }
