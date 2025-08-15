@@ -365,20 +365,22 @@ impl Dashboard {
                 // Candidate players differ by platform. We'll try a few in order.
                 #[cfg(target_os = "macos")]
                 let candidates: Vec<(&str, &[&str])> = vec![
-                    ("afplay", &[]),             // Native macOS
-                    ("mpv", &["--really-quiet"]),
-                    ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet"]),
+                    ("afplay", &[]),             // Native macOS (handles stereo automatically)
+                    ("mpv", &["--really-quiet", "--audio-channels=stereo"]),
+                    ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"]),
                 ];
 
                 #[cfg(all(unix, not(target_os = "macos")))]
                 let candidates: Vec<(&str, &[&str])> = vec![
-                    ("mpv", &["--really-quiet"]),
-                    ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet"]),
-                    ("aplay", &[]),             // WAV-only fallback
+                    ("mpv", &["--really-quiet", "--audio-channels=stereo"]),
+                    ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"]),
+                    ("aplay", &["-c", "2"]),    // Force stereo output
                 ];
 
                 #[cfg(target_os = "windows")]
                 let candidates: Vec<(&str, &[&str])> = vec![
+                    ("mpv", &["--really-quiet", "--audio-channels=stereo"]),
+                    ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"]),
                     ("powershell", &["-NoProfile", "-Command", "(New-Object Media.SoundPlayer '" ]), // will be handled specially
                 ];
 
@@ -398,20 +400,33 @@ impl Dashboard {
 
                 #[cfg(target_os = "windows")]
                 {
-                    // Use PowerShell SoundPlayer fallback
-                    let escaped = audio_path.to_string_lossy().replace("'", "''");
-                    let ps = format!(
-                        "$p=New-Object Media.SoundPlayer '{}';$p.Play();",
-                        escaped
-                    );
-                    match TokioCommand::new("powershell")
-                        .arg("-NoProfile")
-                        .arg("-Command")
-                        .arg(ps)
-                        .spawn()
-                    {
-                        Ok(_child) => { launched_with = Some("powershell".to_string()); }
-                        Err(_e) => {}
+                    // Try standard players first (mpv, ffplay), then fallback to PowerShell
+                    for (prog, base_args) in &candidates[..candidates.len()-1] { // All except powershell
+                        let mut cmd = TokioCommand::new(prog);
+                        for a in base_args { cmd.arg(a); }
+                        cmd.arg(&audio_path);
+                        match cmd.spawn() {
+                            Ok(_child) => { launched_with = Some(prog.to_string()); break; }
+                            Err(_e) => continue,
+                        }
+                    }
+                    
+                    // PowerShell SoundPlayer fallback if no other player worked
+                    if launched_with.is_none() {
+                        let escaped = audio_path.to_string_lossy().replace("'", "''");
+                        let ps = format!(
+                            "$p=New-Object Media.SoundPlayer '{}';$p.Play();",
+                            escaped
+                        );
+                        match TokioCommand::new("powershell")
+                            .arg("-NoProfile")
+                            .arg("-Command")
+                            .arg(ps)
+                            .spawn()
+                        {
+                            Ok(_child) => { launched_with = Some("powershell".to_string()); }
+                            Err(_e) => {}
+                        }
                     }
                 }
 

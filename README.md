@@ -1,4 +1,4 @@
-# Scriba v0.3.0
+# Scriba v0.4.0
 
 A modern CLI tool for recording audio and transcribing it using OpenAI's Whisper API, featuring an enhanced recording library with integrated statistics.
 
@@ -191,6 +191,13 @@ Scriba uses SQLite for:
 This project is licensed under the MIT License.
 
 ## Version History
+
+**v0.4.0** - Improved Audio Playback Experience
+- Fixed mono audio playback to output to both stereo channels
+- Enhanced audio player compatibility across platforms (macOS, Linux, Windows)
+- Added stereo forcing arguments for mpv, ffplay, and aplay players
+- Improved audio experience for users with headphones and speakers
+- Better Windows audio support with multiple player fallbacks
 
 **v0.3.0** - Enhanced Library with Integrated Statistics
 - Merged recording library with always-visible statistics display
