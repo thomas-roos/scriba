@@ -38,6 +38,7 @@ pub struct TuiRecordingLibrary {
     transcript_content: String,
     show_delete_confirm: bool,
     delete_candidate: Option<Recording>,
+    current_playback_pid: Option<u32>,
 }
 
 impl TuiRecordingLibrary {
@@ -62,6 +63,7 @@ impl TuiRecordingLibrary {
             transcript_content: String::new(),
             show_delete_confirm: false,
             delete_candidate: None,
+            current_playback_pid: None,
         })
     }
 
@@ -127,6 +129,15 @@ impl TuiRecordingLibrary {
     }
 
     async fn handle_key_event(&mut self, key_code: KeyCode) -> Result<AppAction> {
+        // If audio is playing, any key press stops it
+        if let Some(pid) = self.current_playback_pid {
+            self.stop_audio_playback(pid)?;
+            self.current_playback_pid = None;
+            self.message = "🛑 Audio playback stopped".to_string();
+            self.show_message = true;
+            return Ok(AppAction::Continue);
+        }
+        
         if self.show_message {
             // Any key press closes the message popup
             self.show_message = false;
@@ -342,10 +353,13 @@ impl TuiRecordingLibrary {
                     
                     // For afplay on macOS, check if this is a mono file and needs special handling
                     if prog == "afplay" && recording.channels == 1 {
+                        println!("🎵 Detected mono recording, creating stereo version...");
                         // Create a temporary stereo version of the mono file
                         if let Ok(stereo_path) = self.create_stereo_temp_file(&audio_path).await {
+                            println!("✓ Using stereo temp file for playback");
                             cmd.arg(stereo_path);
                         } else {
+                            println!("✗ Stereo conversion failed, using original mono file");
                             // Fallback to original mono file
                             cmd.arg(&audio_path);
                         }
@@ -355,7 +369,19 @@ impl TuiRecordingLibrary {
                     }
                     
                     match cmd.spawn() {
-                        Ok(_child) => { launched_with = Some(prog.to_string()); break; }
+                        Ok(mut child) => { 
+                            launched_with = Some(prog.to_string()); 
+                            
+                            // Store child process for potential termination
+                            let child_id = child.id();
+                            tokio::spawn(async move {
+                                let _ = child.wait().await;
+                            });
+                            
+                            // Store the process ID for killing on key press
+                            self.current_playback_pid = child_id;
+                            break; 
+                        }
                         Err(_e) => { /* try next */ }
                     }
                 }
@@ -983,6 +1009,7 @@ with wave.open('{}', 'wb') as stereo:
         
         match output {
             Ok(result) if result.status.success() => {
+                println!("✓ Created stereo temp file: {}", temp_path.display());
                 // Schedule cleanup of temp file after a delay
                 let temp_path_clone = temp_path.clone();
                 tokio::spawn(async move {
@@ -991,7 +1018,49 @@ with wave.open('{}', 'wb') as stereo:
                 });
                 Ok(temp_path)
             },
-            _ => Err(anyhow::anyhow!("Failed to create stereo version of audio file"))
+            Ok(result) => {
+                println!("✗ Python script failed: {}", String::from_utf8_lossy(&result.stderr));
+                Err(anyhow::anyhow!("Failed to create stereo version of audio file"))
+            },
+            Err(e) => {
+                println!("✗ Failed to run python3: {}", e);
+                Err(anyhow::anyhow!("Failed to create stereo version of audio file"))
+            }
+        }
+    }
+    
+    fn stop_audio_playback(&self, pid: u32) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::process::Command;
+            // Use kill command to terminate the audio player process
+            let output = Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .output();
+                
+            match output {
+                Ok(result) if result.status.success() => Ok(()),
+                _ => {
+                    // Try SIGKILL if SIGTERM fails
+                    let _ = Command::new("kill")
+                        .arg("-KILL")
+                        .arg(pid.to_string())
+                        .output();
+                    Ok(())
+                }
+            }
+        }
+        
+        #[cfg(windows)]
+        {
+            use std::process::Command;
+            let _ = Command::new("taskkill")
+                .arg("/PID")
+                .arg(pid.to_string())
+                .arg("/F")
+                .output();
+            Ok(())
         }
     }
 }
