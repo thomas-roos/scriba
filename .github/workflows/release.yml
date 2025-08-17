@@ -114,13 +114,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Clone and update homebrew tap
+      - name: Update Homebrew formula in main repo
         run: |
-          git clone https://${{ secrets.GITHUB_TOKEN }}@github.com/giovannialberto/homebrew-scriba.git tap-repo
-          cd tap-repo
-          git config user.email "action@github.com"
-          git config user.name "GitHub Action"
-          
+          # Update the formula in the main repository
           mkdir -p Formula
           cat > Formula/scriba.rb << EOF
           class Scriba < Formula
@@ -146,8 +142,8 @@ jobs:
           end
           EOF
           
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
           git add Formula/scriba.rb
-          git commit -m "feat: update Scriba formula to v${{ steps.release.outputs.version }}"
+          git commit -m "feat: update Homebrew formula to v${{ steps.release.outputs.version }}"
           git push origin main
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
