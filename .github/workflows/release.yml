@@ -1,0 +1,166 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build and Release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            suffix: ''
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            suffix: ''
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: ''
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            suffix: ''
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        run: |
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          fi
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            cp target/${{ matrix.target }}/release/scriba.exe dist/scriba-${{ matrix.target }}.exe
+          else
+            cp target/${{ matrix.target }}/release/scriba dist/scriba-${{ matrix.target }}
+          fi
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+            shasum -a 256 scriba-${{ matrix.target }}${{ matrix.suffix }} > scriba-${{ matrix.target }}.sha256
+          else
+            sha256sum scriba-${{ matrix.target }}${{ matrix.suffix }} > scriba-${{ matrix.target }}.sha256
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: scriba-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find dist -name "scriba-*" -type f -exec cp {} release/ \;
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  homebrew:
+    name: Update Homebrew Formula
+    needs: release
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get release info
+        id: release
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          
+          # Download release assets to calculate checksums
+          gh release download v$VERSION --pattern "*.sha256"
+          
+          # Extract checksums for macOS binaries
+          MACOS_X86_SHA=$(cat scriba-x86_64-apple-darwin.sha256 | cut -d' ' -f1)
+          MACOS_ARM_SHA=$(cat scriba-aarch64-apple-darwin.sha256 | cut -d' ' -f1)
+          
+          echo "macos_x86_sha=$MACOS_X86_SHA" >> $GITHUB_OUTPUT
+          echo "macos_arm_sha=$MACOS_ARM_SHA" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Homebrew formula
+        run: |
+          mkdir -p Formula
+          cat > Formula/scriba.rb << 'EOF'
+          class Scriba < Formula
+            desc "Modern CLI tool for recording and transcribing audio using OpenAI Whisper"
+            homepage "https://github.com/giovannialberto/scriba"
+            version "${{ steps.release.outputs.version }}"
+            
+            if Hardware::CPU.intel?
+              url "https://github.com/giovannialberto/scriba/releases/download/v${{ steps.release.outputs.version }}/scriba-x86_64-apple-darwin"
+              sha256 "${{ steps.release.outputs.macos_x86_sha }}"
+            else
+              url "https://github.com/giovannialberto/scriba/releases/download/v${{ steps.release.outputs.version }}/scriba-aarch64-apple-darwin"
+              sha256 "${{ steps.release.outputs.macos_arm_sha }}"
+            end
+            
+            def install
+              bin.install "scriba-#{Hardware::CPU.intel? ? "x86_64" : "aarch64"}-apple-darwin" => "scriba"
+            end
+            
+            test do
+              assert_match version.to_s, shell_output("#{bin}/scriba --version")
+            end
+          end
+          EOF
+
+      - name: Commit and push formula
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add Formula/scriba.rb
+          git commit -m "feat: update Homebrew formula to v${{ steps.release.outputs.version }}" || exit 0
+          git push origin HEAD || exit 0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
