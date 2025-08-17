@@ -1,4 +1,4 @@
-# Scriba v0.5.0
+# Scriba v0.5.8
 
 A modern CLI tool for recording audio and transcribing it using OpenAI's Whisper API, featuring an enhanced recording library with integrated statistics.
 
@@ -25,8 +25,14 @@ A modern CLI tool for recording audio and transcribing it using OpenAI's Whisper
 
 ### Option 1: Homebrew (Recommended)
 ```bash
-# Install directly (no tap required)
-brew install giovannialberto/scriba/scriba
+# One-time setup
+brew tap giovannialberto/scriba
+
+# Install Scriba
+brew install scriba
+
+# Future updates
+brew upgrade scriba
 ```
 
 ### Option 2: From Source
@@ -199,11 +205,12 @@ This project is licensed under the MIT License.
 
 ## Version History
 
-**v0.5.0** - Homebrew Distribution Support
-- Added Homebrew formula for easy installation via `brew install`
-- Automated GitHub Actions release workflow with multi-architecture builds
-- Support for macOS (Intel + Apple Silicon) and Linux (x86_64 + ARM64)
-- Streamlined installation process with package manager integration
+**v0.5.8** - Complete Homebrew Distribution Automation
+- Full automated release workflow with multi-platform builds (macOS Intel/ARM64, Linux x86_64)
+- Automated Homebrew tap repository updates with proper authentication
+- Simple installation: `brew tap giovannialberto/scriba && brew install scriba`
+- Automatic formula updates with SHA256 checksums on new releases
+- Complete end-to-end automation for seamless distribution
 
 **v0.4.0** - Improved Audio Playback Experience
 - Fixed mono audio playback to output to both stereo channels
