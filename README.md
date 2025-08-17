@@ -25,11 +25,7 @@ A modern CLI tool for recording audio and transcribing it using OpenAI's Whisper
 
 ### Option 1: Homebrew (Recommended)
 ```bash
-# Install from custom tap
-brew tap giovannialberto/scriba
-brew install scriba
-
-# Or install directly
+# Install directly (no tap required)
 brew install giovannialberto/scriba/scriba
 ```
 

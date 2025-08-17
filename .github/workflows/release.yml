@@ -154,8 +154,8 @@ jobs:
 
       - name: Update Homebrew tap repository
         run: |
-          # Clone the tap repository
-          git clone https://github.com/giovannialberto/homebrew-scriba.git tap-repo
+          # Clone the tap repository using PAT
+          git clone https://${{ secrets.HOMEBREW_TAP_TOKEN }}@github.com/giovannialberto/homebrew-scriba.git tap-repo
           cd tap-repo
           
           # Copy the updated formula
@@ -168,5 +168,3 @@ jobs:
           git add Formula/scriba.rb
           git commit -m "feat: update Scriba formula to v${{ steps.release.outputs.version }}"
           git push origin main
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
