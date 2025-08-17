@@ -116,7 +116,11 @@ jobs:
 
       - name: Update Homebrew formula in main repo
         run: |
-          # Update the formula in the main repository
+          # Checkout main branch (we're currently in detached HEAD from tag)
+          git checkout main
+          git pull origin main
+          
+          # Update the formula
           mkdir -p Formula
           cat > Formula/scriba.rb << EOF
           class Scriba < Formula
