@@ -964,7 +964,6 @@ impl TuiRecordingLibrary {
     }
     
     async fn create_stereo_temp_file(&self, mono_file_path: &std::path::Path) -> Result<std::path::PathBuf> {
-        use std::process::Command;
         use std::fs;
         
         // Create a temporary file path for the stereo version
@@ -973,58 +972,94 @@ impl TuiRecordingLibrary {
             mono_file_path.file_stem().unwrap_or_default().to_string_lossy());
         let temp_path = temp_dir.join(temp_filename);
         
-        // Create stereo version using Python's built-in audio tools via shell
-        // This duplicates the mono channel to both left and right
-        let script = format!(r#"
-import wave
-import struct
-
-# Read mono WAV file
-with wave.open('{}', 'rb') as mono:
-    frames = mono.readframes(-1)
-    params = mono.getparams()
-
-# Convert mono samples to stereo (duplicate each sample)
-mono_samples = struct.unpack('<' + 'h' * (len(frames) // 2), frames)
-stereo_samples = []
-for sample in mono_samples:
-    stereo_samples.extend([sample, sample])  # Duplicate to both channels
-
-# Write stereo WAV file
-with wave.open('{}', 'wb') as stereo:
-    stereo.setnchannels(2)  # Stereo
-    stereo.setsampwidth(params.sampwidth)
-    stereo.setframerate(params.framerate)
-    stereo.writeframes(struct.pack('<' + 'h' * len(stereo_samples), *stereo_samples))
-"#, 
-            mono_file_path.to_string_lossy(), 
-            temp_path.to_string_lossy()
-        );
+        // Use Rust's hound crate to convert mono to stereo
+        let mono_reader = match hound::WavReader::open(mono_file_path) {
+            Ok(reader) => reader,
+            Err(e) => {
+                return Err(anyhow::anyhow!("Failed to open mono audio file: {}", e));
+            }
+        };
         
-        // Execute Python script to create stereo file
-        let output = Command::new("python3")
-            .arg("-c")
-            .arg(&script)
-            .output();
+        let spec = mono_reader.spec();
         
-        match output {
-            Ok(result) if result.status.success() => {
-                println!("✓ Created stereo temp file: {}", temp_path.display());
+        // Create stereo spec (2 channels)
+        let stereo_spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: spec.sample_rate,
+            bits_per_sample: spec.bits_per_sample,
+            sample_format: spec.sample_format,
+        };
+        
+        let mut stereo_writer = match hound::WavWriter::create(&temp_path, stereo_spec) {
+            Ok(writer) => writer,
+            Err(e) => {
+                return Err(anyhow::anyhow!("Failed to create stereo audio file: {}", e));
+            }
+        };
+        
+        // Convert samples based on format
+        match spec.sample_format {
+            hound::SampleFormat::Float => {
+                // 32-bit float samples
+                for sample in mono_reader.into_samples::<f32>() {
+                    match sample {
+                        Ok(s) => {
+                            // Write the same sample to both left and right channels
+                            stereo_writer.write_sample(s)?;  // Left
+                            stereo_writer.write_sample(s)?;  // Right
+                        }
+                        Err(e) => {
+                            return Err(anyhow::anyhow!("Error processing audio sample: {}", e));
+                        }
+                    }
+                }
+            }
+            hound::SampleFormat::Int => {
+                // Integer samples (16-bit or 24-bit)
+                if spec.bits_per_sample == 16 {
+                    for sample in mono_reader.into_samples::<i16>() {
+                        match sample {
+                            Ok(s) => {
+                                stereo_writer.write_sample(s)?;  // Left
+                                stereo_writer.write_sample(s)?;  // Right
+                            }
+                            Err(e) => {
+                                return Err(anyhow::anyhow!("Error processing audio sample: {}", e));
+                            }
+                        }
+                    }
+                } else if spec.bits_per_sample == 24 {
+                    for sample in mono_reader.into_samples::<i32>() {
+                        match sample {
+                            Ok(s) => {
+                                stereo_writer.write_sample(s)?;  // Left
+                                stereo_writer.write_sample(s)?;  // Right
+                            }
+                            Err(e) => {
+                                return Err(anyhow::anyhow!("Error processing audio sample: {}", e));
+                            }
+                        }
+                    }
+                } else {
+                    return Err(anyhow::anyhow!("Unsupported bit depth: {}", spec.bits_per_sample));
+                }
+            }
+        }
+        
+        // Finalize the stereo file
+        match stereo_writer.finalize() {
+            Ok(()) => {
                 // Schedule cleanup of temp file after a delay
                 let temp_path_clone = temp_path.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                     let _ = fs::remove_file(&temp_path_clone);
                 });
+                
                 Ok(temp_path)
             },
-            Ok(result) => {
-                println!("✗ Python script failed: {}", String::from_utf8_lossy(&result.stderr));
-                Err(anyhow::anyhow!("Failed to create stereo version of audio file"))
-            },
             Err(e) => {
-                println!("✗ Failed to run python3: {}", e);
-                Err(anyhow::anyhow!("Failed to create stereo version of audio file"))
+                Err(anyhow::anyhow!("Failed to finalize stereo audio file: {}", e))
             }
         }
     }

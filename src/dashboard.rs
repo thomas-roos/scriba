@@ -366,8 +366,14 @@ impl Dashboard {
 
     async fn play_selected_recording(&mut self) -> Result<()> {
         use anyhow::anyhow;
+        self.debug_log("📞 play_selected_recording() called");
+        
         if let Some(selected) = self.table_state.selected() {
             if let Some(recording) = self.recordings.get(selected) {
+                self.debug_log(&format!("🎵 Playing recording: {} (channels: {})", 
+                    recording.display_name.as_ref().unwrap_or(&recording.directory_name),
+                    recording.channels));
+                    
                 // Locate the audio file in ~/scriba_recordings/<directory_name>/
                 let audio_path = self
                     .find_audio_file(recording)
@@ -400,27 +406,30 @@ impl Dashboard {
 
                 #[cfg(not(target_os = "windows"))]
                 for (prog, base_args) in candidates {
+                    self.debug_log(&format!("🔍 Trying player: {} with channels: {}", prog, recording.channels));
                     let mut cmd = TokioCommand::new(prog);
                     
                     // For afplay on macOS, check if this is a mono file and needs special handling
                     if prog == "afplay" && recording.channels == 1 {
-                        println!("🎵 Detected mono recording, creating stereo version...");
+                        self.debug_log("🎵 Detected mono recording, creating stereo version...");
                         // Create a temporary stereo version of the mono file
                         if let Ok(stereo_path) = self.create_stereo_temp_file(&audio_path).await {
-                            println!("✓ Using stereo temp file for playback");
+                            self.debug_log(&format!("✓ Using stereo temp file for playback: {}", stereo_path.display()));
                             cmd.arg(stereo_path);
                         } else {
-                            println!("✗ Stereo conversion failed, using original mono file");
+                            self.debug_log("✗ Stereo conversion failed, using original mono file");
                             // Fallback to original mono file
                             cmd.arg(&audio_path);
                         }
                     } else {
+                        self.debug_log(&format!("ℹ️ Using standard playback for {} (channels: {})", prog, recording.channels));
                         for a in base_args { cmd.arg(a); }
                         cmd.arg(&audio_path);
                     }
                     
                     match cmd.spawn() {
                         Ok(mut child) => { 
+                            self.debug_log(&format!("✅ Successfully launched: {}", prog));
                             launched_with = Some(prog.to_string()); 
                             
                             // Store child process for potential termination
@@ -433,7 +442,10 @@ impl Dashboard {
                             self.current_playback_pid = child_id;
                             break; 
                         }
-                        Err(_e) => { /* try next */ }
+                        Err(e) => { 
+                            self.debug_log(&format!("❌ Failed to launch {}: {}", prog, e));
+                            /* try next */ 
+                        }
                     }
                 }
 
@@ -1233,7 +1245,6 @@ impl Dashboard {
     }
     
     async fn create_stereo_temp_file(&self, mono_file_path: &std::path::Path) -> Result<std::path::PathBuf> {
-        use std::process::Command;
         use std::fs;
         
         // Create a temporary file path for the stereo version
@@ -1242,59 +1253,122 @@ impl Dashboard {
             mono_file_path.file_stem().unwrap_or_default().to_string_lossy());
         let temp_path = temp_dir.join(temp_filename);
         
-        // Create stereo version using Python's built-in audio tools via shell
-        // This duplicates the mono channel to both left and right
-        let script = format!(r#"
-import wave
-import struct
-
-# Read mono WAV file
-with wave.open('{}', 'rb') as mono:
-    frames = mono.readframes(-1)
-    params = mono.getparams()
-
-# Convert mono samples to stereo (duplicate each sample)
-mono_samples = struct.unpack('<' + 'h' * (len(frames) // 2), frames)
-stereo_samples = []
-for sample in mono_samples:
-    stereo_samples.extend([sample, sample])  # Duplicate to both channels
-
-# Write stereo WAV file
-with wave.open('{}', 'wb') as stereo:
-    stereo.setnchannels(2)  # Stereo
-    stereo.setsampwidth(params.sampwidth)
-    stereo.setframerate(params.framerate)
-    stereo.writeframes(struct.pack('<' + 'h' * len(stereo_samples), *stereo_samples))
-"#, 
-            mono_file_path.to_string_lossy(), 
-            temp_path.to_string_lossy()
-        );
+        self.debug_log(&format!("🔄 Converting mono file: {} -> {}", 
+            mono_file_path.display(), temp_path.display()));
         
-        // Execute Python script to create stereo file
-        let output = Command::new("python3")
-            .arg("-c")
-            .arg(&script)
-            .output();
+        // Use Rust's hound crate to convert mono to stereo
+        let mono_reader = match hound::WavReader::open(mono_file_path) {
+            Ok(reader) => reader,
+            Err(e) => {
+                self.debug_log(&format!("✗ Failed to open mono file: {}", e));
+                return Err(anyhow::anyhow!("Failed to open mono audio file: {}", e));
+            }
+        };
         
-        match output {
-            Ok(result) if result.status.success() => {
-                println!("✓ Created stereo temp file: {}", temp_path.display());
+        let spec = mono_reader.spec();
+        self.debug_log(&format!("📊 Original spec: channels={}, sample_rate={}, bits_per_sample={}", 
+            spec.channels, spec.sample_rate, spec.bits_per_sample));
+        
+        // Create stereo spec (2 channels)
+        let stereo_spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: spec.sample_rate,
+            bits_per_sample: spec.bits_per_sample,
+            sample_format: spec.sample_format,
+        };
+        
+        let mut stereo_writer = match hound::WavWriter::create(&temp_path, stereo_spec) {
+            Ok(writer) => writer,
+            Err(e) => {
+                self.debug_log(&format!("✗ Failed to create stereo file: {}", e));
+                return Err(anyhow::anyhow!("Failed to create stereo audio file: {}", e));
+            }
+        };
+        
+        // Convert samples based on format
+        match spec.sample_format {
+            hound::SampleFormat::Float => {
+                // 32-bit float samples
+                for sample in mono_reader.into_samples::<f32>() {
+                    match sample {
+                        Ok(s) => {
+                            // Write the same sample to both left and right channels
+                            stereo_writer.write_sample(s)?;  // Left
+                            stereo_writer.write_sample(s)?;  // Right
+                        }
+                        Err(e) => {
+                            self.debug_log(&format!("✗ Error reading sample: {}", e));
+                            return Err(anyhow::anyhow!("Error processing audio sample: {}", e));
+                        }
+                    }
+                }
+            }
+            hound::SampleFormat::Int => {
+                // Integer samples (16-bit or 24-bit)
+                if spec.bits_per_sample == 16 {
+                    for sample in mono_reader.into_samples::<i16>() {
+                        match sample {
+                            Ok(s) => {
+                                stereo_writer.write_sample(s)?;  // Left
+                                stereo_writer.write_sample(s)?;  // Right
+                            }
+                            Err(e) => {
+                                self.debug_log(&format!("✗ Error reading sample: {}", e));
+                                return Err(anyhow::anyhow!("Error processing audio sample: {}", e));
+                            }
+                        }
+                    }
+                } else if spec.bits_per_sample == 24 {
+                    for sample in mono_reader.into_samples::<i32>() {
+                        match sample {
+                            Ok(s) => {
+                                stereo_writer.write_sample(s)?;  // Left
+                                stereo_writer.write_sample(s)?;  // Right
+                            }
+                            Err(e) => {
+                                self.debug_log(&format!("✗ Error reading sample: {}", e));
+                                return Err(anyhow::anyhow!("Error processing audio sample: {}", e));
+                            }
+                        }
+                    }
+                } else {
+                    self.debug_log(&format!("✗ Unsupported bit depth: {}", spec.bits_per_sample));
+                    return Err(anyhow::anyhow!("Unsupported bit depth: {}", spec.bits_per_sample));
+                }
+            }
+        }
+        
+        // Finalize the stereo file
+        match stereo_writer.finalize() {
+            Ok(()) => {
+                self.debug_log(&format!("✓ Successfully created stereo file: {}", temp_path.display()));
+                
                 // Schedule cleanup of temp file after a delay
                 let temp_path_clone = temp_path.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                     let _ = fs::remove_file(&temp_path_clone);
                 });
+                
                 Ok(temp_path)
             },
-            Ok(result) => {
-                println!("✗ Python script failed: {}", String::from_utf8_lossy(&result.stderr));
-                Err(anyhow::anyhow!("Failed to create stereo version of audio file"))
-            },
             Err(e) => {
-                println!("✗ Failed to run python3: {}", e);
-                Err(anyhow::anyhow!("Failed to create stereo version of audio file"))
+                self.debug_log(&format!("✗ Failed to finalize stereo file: {}", e));
+                Err(anyhow::anyhow!("Failed to finalize stereo audio file: {}", e))
             }
+        }
+    }
+    
+    fn debug_log(&self, message: &str) {
+        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let log_message = format!("[{}] AUDIO_DEBUG: {}\n", timestamp, message);
+        
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("debug.log") {
+            let _ = file.write_all(log_message.as_bytes());
+            let _ = file.flush();
         }
     }
     
