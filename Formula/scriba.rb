@@ -1,14 +1,14 @@
 class Scriba < Formula
   desc "Modern CLI tool for recording and transcribing audio using OpenAI Whisper"
   homepage "https://github.com/giovannialberto/scriba"
-  version "0.5.4"
+  version "0.5.5"
   
   if Hardware::CPU.intel?
-    url "https://github.com/giovannialberto/scriba/releases/download/v0.5.4/scriba-x86_64-apple-darwin"
-    sha256 "60f76005f0289daf4f08dd70739612083a0646412ecef13980478717c27650ec"
+    url "https://github.com/giovannialberto/scriba/releases/download/v0.5.5/scriba-x86_64-apple-darwin"
+    sha256 "940b679f276eccc506d549b25b9c37a8eed3f0ad8e0c690f22d3c44cbdaf35d9"
   else
-    url "https://github.com/giovannialberto/scriba/releases/download/v0.5.4/scriba-aarch64-apple-darwin"
-    sha256 "39b2cc5087a0ccbc94c1e67192b32901d78cf45fef1704a70464b80d1436c4f9"
+    url "https://github.com/giovannialberto/scriba/releases/download/v0.5.5/scriba-aarch64-apple-darwin"
+    sha256 "a5ca036a10b0ad0c02b3cf241750f762ed013c2ff7c892f9b5b1b8d528caa090"
   end
   
   def install
