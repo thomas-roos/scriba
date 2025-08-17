@@ -43,6 +43,7 @@ pub struct Dashboard {
     transcript_content: String,
     show_delete_confirm: bool,
     delete_candidate: Option<Recording>,
+    current_playback_pid: Option<u32>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -83,6 +84,7 @@ impl Dashboard {
             transcript_content: String::new(),
             show_delete_confirm: false,
             delete_candidate: None,
+            current_playback_pid: None,
         })
     }
 
@@ -136,6 +138,15 @@ impl Dashboard {
     }
 
     async fn handle_key_event(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
+        // If audio is playing, any key press stops it
+        if let Some(pid) = self.current_playback_pid {
+            self.stop_audio_playback(pid)?;
+            self.current_playback_pid = None;
+            self.message = "🛑 Audio playback stopped".to_string();
+            self.show_message = true;
+            return Ok(DashboardAction::Continue);
+        }
+        
         if self.show_message {
             // Any key press closes the message popup
             self.show_message = false;
@@ -365,20 +376,22 @@ impl Dashboard {
                 // Candidate players differ by platform. We'll try a few in order.
                 #[cfg(target_os = "macos")]
                 let candidates: Vec<(&str, &[&str])> = vec![
-                    ("afplay", &[]),             // Native macOS
-                    ("mpv", &["--really-quiet"]),
-                    ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet"]),
+                    ("mpv", &["--really-quiet", "--audio-channels=stereo"]),
+                    ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"]),
+                    ("afplay", &[]),             // Native macOS - we'll handle mono issue differently
                 ];
 
                 #[cfg(all(unix, not(target_os = "macos")))]
                 let candidates: Vec<(&str, &[&str])> = vec![
-                    ("mpv", &["--really-quiet"]),
-                    ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet"]),
-                    ("aplay", &[]),             // WAV-only fallback
+                    ("mpv", &["--really-quiet", "--audio-channels=stereo"]),
+                    ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"]),
+                    ("aplay", &["-c", "2"]),    // Force stereo output
                 ];
 
                 #[cfg(target_os = "windows")]
                 let candidates: Vec<(&str, &[&str])> = vec![
+                    ("mpv", &["--really-quiet", "--audio-channels=stereo"]),
+                    ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"]),
                     ("powershell", &["-NoProfile", "-Command", "(New-Object Media.SoundPlayer '" ]), // will be handled specially
                 ];
 
@@ -388,30 +401,68 @@ impl Dashboard {
                 #[cfg(not(target_os = "windows"))]
                 for (prog, base_args) in candidates {
                     let mut cmd = TokioCommand::new(prog);
-                    for a in base_args { cmd.arg(a); }
-                    cmd.arg(&audio_path);
+                    
+                    // For afplay on macOS, check if this is a mono file and needs special handling
+                    if prog == "afplay" && recording.channels == 1 {
+                        // Create a temporary stereo version of the mono file
+                        if let Ok(stereo_path) = self.create_stereo_temp_file(&audio_path).await {
+                            cmd.arg(stereo_path);
+                        } else {
+                            // Fallback to original mono file
+                            cmd.arg(&audio_path);
+                        }
+                    } else {
+                        for a in base_args { cmd.arg(a); }
+                        cmd.arg(&audio_path);
+                    }
+                    
                     match cmd.spawn() {
-                        Ok(_child) => { launched_with = Some(prog.to_string()); break; }
+                        Ok(mut child) => { 
+                            launched_with = Some(prog.to_string()); 
+                            
+                            // Store child process for potential termination
+                            let child_id = child.id();
+                            tokio::spawn(async move {
+                                let _ = child.wait().await;
+                            });
+                            
+                            // Store the process ID for killing on key press
+                            self.current_playback_pid = child_id;
+                            break; 
+                        }
                         Err(_e) => { /* try next */ }
                     }
                 }
 
                 #[cfg(target_os = "windows")]
                 {
-                    // Use PowerShell SoundPlayer fallback
-                    let escaped = audio_path.to_string_lossy().replace("'", "''");
-                    let ps = format!(
-                        "$p=New-Object Media.SoundPlayer '{}';$p.Play();",
-                        escaped
-                    );
-                    match TokioCommand::new("powershell")
-                        .arg("-NoProfile")
-                        .arg("-Command")
-                        .arg(ps)
-                        .spawn()
-                    {
-                        Ok(_child) => { launched_with = Some("powershell".to_string()); }
-                        Err(_e) => {}
+                    // Try standard players first (mpv, ffplay), then fallback to PowerShell
+                    for (prog, base_args) in &candidates[..candidates.len()-1] { // All except powershell
+                        let mut cmd = TokioCommand::new(prog);
+                        for a in base_args { cmd.arg(a); }
+                        cmd.arg(&audio_path);
+                        match cmd.spawn() {
+                            Ok(_child) => { launched_with = Some(prog.to_string()); break; }
+                            Err(_e) => continue,
+                        }
+                    }
+                    
+                    // PowerShell SoundPlayer fallback if no other player worked
+                    if launched_with.is_none() {
+                        let escaped = audio_path.to_string_lossy().replace("'", "''");
+                        let ps = format!(
+                            "$p=New-Object Media.SoundPlayer '{}';$p.Play();",
+                            escaped
+                        );
+                        match TokioCommand::new("powershell")
+                            .arg("-NoProfile")
+                            .arg("-Command")
+                            .arg(ps)
+                            .spawn()
+                        {
+                            Ok(_child) => { launched_with = Some("powershell".to_string()); }
+                            Err(_e) => {}
+                        }
                     }
                 }
 
@@ -1175,6 +1226,129 @@ impl Dashboard {
             format!("{}m {}s", minutes, secs)
         } else {
             format!("{}s", secs)
+        }
+    }
+    
+    async fn create_stereo_temp_file(&self, mono_file_path: &std::path::Path) -> Result<std::path::PathBuf> {
+        use std::fs;
+        
+        // Create a temporary file path for the stereo version
+        let temp_dir = std::env::temp_dir();
+        let temp_filename = format!("scriba_stereo_{}.wav", 
+            mono_file_path.file_stem().unwrap_or_default().to_string_lossy());
+        let temp_path = temp_dir.join(temp_filename);
+        
+        // Use Rust's hound crate to convert mono to stereo
+        let mono_reader = hound::WavReader::open(mono_file_path)
+            .context("Failed to open mono audio file")?;
+        
+        let spec = mono_reader.spec();
+        
+        // Create stereo spec (2 channels)
+        let stereo_spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: spec.sample_rate,
+            bits_per_sample: spec.bits_per_sample,
+            sample_format: spec.sample_format,
+        };
+        
+        let mut stereo_writer = hound::WavWriter::create(&temp_path, stereo_spec)
+            .context("Failed to create stereo audio file")?;
+        
+        // Convert samples based on format
+        match spec.sample_format {
+            hound::SampleFormat::Float => {
+                // 32-bit float samples
+                for sample in mono_reader.into_samples::<f32>() {
+                    match sample {
+                        Ok(s) => {
+                            // Write the same sample to both left and right channels
+                            stereo_writer.write_sample(s)?;  // Left
+                            stereo_writer.write_sample(s)?;  // Right
+                        }
+                        Err(e) => return Err(anyhow::anyhow!("Error processing audio sample: {}", e)),
+                    }
+                }
+            }
+            hound::SampleFormat::Int => {
+                // Integer samples (16-bit or 24-bit)
+                if spec.bits_per_sample == 16 {
+                    for sample in mono_reader.into_samples::<i16>() {
+                        match sample {
+                            Ok(s) => {
+                                stereo_writer.write_sample(s)?;  // Left
+                                stereo_writer.write_sample(s)?;  // Right
+                            }
+                            Err(e) => {
+                                return Err(anyhow::anyhow!("Error processing audio sample: {}", e));
+                            }
+                        }
+                    }
+                } else if spec.bits_per_sample == 24 {
+                    for sample in mono_reader.into_samples::<i32>() {
+                        match sample {
+                            Ok(s) => {
+                                stereo_writer.write_sample(s)?;  // Left
+                                stereo_writer.write_sample(s)?;  // Right
+                            }
+                            Err(e) => {
+                                return Err(anyhow::anyhow!("Error processing audio sample: {}", e));
+                            }
+                        }
+                    }
+                } else {
+                    return Err(anyhow::anyhow!("Unsupported bit depth: {}", spec.bits_per_sample));
+                }
+            }
+        }
+        
+        // Finalize the stereo file
+        stereo_writer.finalize()
+            .context("Failed to finalize stereo audio file")?;
+        
+        // Schedule cleanup of temp file after a delay
+        let temp_path_clone = temp_path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+            let _ = fs::remove_file(&temp_path_clone);
+        });
+        
+        Ok(temp_path)
+    }
+    
+    
+    fn stop_audio_playback(&self, pid: u32) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::process::Command;
+            // Use kill command to terminate the audio player process
+            let output = Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .output();
+                
+            match output {
+                Ok(result) if result.status.success() => Ok(()),
+                _ => {
+                    // Try SIGKILL if SIGTERM fails
+                    let _ = Command::new("kill")
+                        .arg("-KILL")
+                        .arg(pid.to_string())
+                        .output();
+                    Ok(())
+                }
+            }
+        }
+        
+        #[cfg(windows)]
+        {
+            use std::process::Command;
+            let _ = Command::new("taskkill")
+                .arg("/PID")
+                .arg(pid.to_string())
+                .arg("/F")
+                .output();
+            Ok(())
         }
     }
 }
