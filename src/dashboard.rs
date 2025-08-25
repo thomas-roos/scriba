@@ -73,7 +73,7 @@ impl Dashboard {
             recordings: Vec::new(),
             table_state,
             current_page: 0,
-            page_size: 10,
+            page_size: 50, // Show more recordings per page
             stats: None,
             show_help: false,
             current_view: DashboardView::Main,
@@ -579,6 +579,7 @@ impl Dashboard {
                     }
                     
                     self.load_recordings()?;
+                    self.load_stats()?;
                     self.message = "✅ Recording deleted successfully".to_string();
                     self.show_message = true;
                 }
@@ -1345,19 +1346,26 @@ impl Dashboard {
         #[cfg(unix)]
         {
             use std::process::Command;
-            // Use kill command to terminate the audio player process
-            let output = Command::new("kill")
-                .arg("-TERM")
+            // Use SIGKILL immediately for faster termination (audio players can be stubborn)
+            let kill_result = Command::new("kill")
+                .arg("-KILL")
                 .arg(pid.to_string())
                 .output();
                 
-            match output {
-                Ok(result) if result.status.success() => Ok(()),
-                _ => {
-                    // Try SIGKILL if SIGTERM fails
-                    let _ = Command::new("kill")
-                        .arg("-KILL")
-                        .arg(pid.to_string())
+            // Also try pkill in case the process spawned children
+            let _ = Command::new("pkill")
+                .arg("-P")
+                .arg(pid.to_string())
+                .output();
+                
+            match kill_result {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    // If direct kill fails, try killall on common audio players
+                    let _ = Command::new("killall")
+                        .arg("mpv")
+                        .arg("ffplay")
+                        .arg("afplay")
                         .output();
                     Ok(())
                 }
