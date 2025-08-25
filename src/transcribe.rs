@@ -136,8 +136,18 @@ pub async fn transcribe_file(
     output_path: &PathBuf,
     api_key: &str,
 ) -> Result<(), anyhow::Error> {
-    // Read the content of the WAV file
-    let audio_file_path = BASE_PATH.join(input_path).join("recording.wav");
+    // Find the audio file (could be WAV or MP3)
+    let recording_dir = BASE_PATH.join(input_path);
+    let (audio_file_path, filename) = if recording_dir.join("recording.mp3").exists() {
+        let path = recording_dir.join("recording.mp3");
+        (path, "recording.mp3".to_string())
+    } else if recording_dir.join("recording.wav").exists() {
+        let path = recording_dir.join("recording.wav");
+        (path, "recording.wav".to_string())
+    } else {
+        return Err(anyhow::anyhow!("No audio file found (recording.wav or recording.mp3) in {}", recording_dir.display()));
+    };
+    
     let audio_file = std::fs::read(&audio_file_path)
         .context("Unable to read the input file")?;
 
@@ -152,7 +162,7 @@ pub async fn transcribe_file(
 
     // Create a multipart form with the audio file and model parameter
     let form = Form::new()
-        .part("file", Part::bytes(audio_file).file_name("audio.m4a"))
+        .part("file", Part::bytes(audio_file).file_name(filename))
         .text("model", "whisper-1");
 
     // Start the progress animation in background

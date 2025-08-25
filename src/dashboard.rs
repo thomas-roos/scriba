@@ -1,6 +1,7 @@
 use crate::database::{Database, Recording, RecordingStats};
 use crate::record::record;
 use crate::transcribe::transcribe_file;
+use crate::audio::{CompressionSettings, AudioFormat};
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
@@ -373,13 +374,27 @@ impl Dashboard {
                     .find_audio_file(recording)
                     .ok_or_else(|| anyhow!("Could not find an audio file for this recording"))?;
 
-                // Candidate players differ by platform. We'll try a few in order.
+                // Determine file extension to choose optimal players
+                let is_mp3 = audio_path.extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.to_lowercase() == "mp3")
+                    .unwrap_or(false);
+
+                // Candidate players differ by platform. For MP3 files, prioritize mpv/ffplay over afplay
                 #[cfg(target_os = "macos")]
-                let candidates: Vec<(&str, &[&str])> = vec![
-                    ("mpv", &["--really-quiet", "--audio-channels=stereo"]),
-                    ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"]),
-                    ("afplay", &[]),             // Native macOS - we'll handle mono issue differently
-                ];
+                let candidates: Vec<(&str, &[&str])> = if is_mp3 {
+                    vec![
+                        ("mpv", &["--really-quiet", "--audio-channels=stereo"]),
+                        ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"]),
+                        ("afplay", &[]),         // Last resort for MP3
+                    ]
+                } else {
+                    vec![
+                        ("mpv", &["--really-quiet", "--audio-channels=stereo"]),
+                        ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"]),
+                        ("afplay", &[]),         // Works well with WAV
+                    ]
+                };
 
                 #[cfg(all(unix, not(target_os = "macos")))]
                 let candidates: Vec<(&str, &[&str])> = vec![
@@ -402,9 +417,9 @@ impl Dashboard {
                 for (prog, base_args) in candidates {
                     let mut cmd = TokioCommand::new(prog);
                     
-                    // For afplay on macOS, check if this is a mono file and needs special handling
-                    if prog == "afplay" && recording.channels == 1 {
-                        // Create a temporary stereo version of the mono file
+                    // For afplay on macOS, check if this is a mono WAV file and needs special handling
+                    if prog == "afplay" && recording.channels == 1 && !is_mp3 {
+                        // Create a temporary stereo version of the mono WAV file
                         if let Ok(stereo_path) = self.create_stereo_temp_file(&audio_path).await {
                             cmd.arg(stereo_path);
                         } else {
@@ -430,7 +445,12 @@ impl Dashboard {
                             self.current_playback_pid = child_id;
                             break; 
                         }
-                        Err(_e) => { /* try next */ }
+                        Err(e) => { 
+                            // Store error for debugging if no player works
+                            if prog == "mpv" && is_mp3 {
+                                self.message = format!("⚠️ mpv failed to play MP3: {}", e);
+                            }
+                        }
                     }
                 }
 
@@ -1040,7 +1060,9 @@ impl Dashboard {
         let audio_output = PathBuf::from(&recording_name);
         
         // Record audio
-        let record_result = record(audio_output.clone()).await;
+        // Use speech-optimized WAV compression (device adaptation happens in record function)
+        let compression_settings = CompressionSettings::speech_optimized();
+        let record_result = record(audio_output.clone(), Some(compression_settings)).await;
         
         if record_result.is_ok() {
             println!("\n📝 Recording complete! Starting transcription...");
@@ -1092,7 +1114,9 @@ impl Dashboard {
         let audio_output = PathBuf::from(&recording_name);
         
         // Record audio
-        match record(audio_output).await {
+        // Use speech-optimized WAV compression (device adaptation happens in record function)
+        let compression_settings = CompressionSettings::speech_optimized();
+        match record(audio_output, Some(compression_settings)).await {
             Ok(()) => {
                 println!("✅ Recording complete!");
                 println!("📁 File saved in: ~/scriba_recordings/{}/", recording_name);

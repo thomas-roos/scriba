@@ -4,6 +4,7 @@ use structopt::StructOpt;
 use scriba::record::record;
 use scriba::transcribe::transcribe_file;
 use scriba::dashboard::Dashboard;
+use scriba::audio::{AudioFormat, CompressionSettings};
 use anyhow::{Context, Result};
 use chrono::Local;
 use std::io::{self, Write};
@@ -27,6 +28,16 @@ enum Command {
         skip_transcription: bool,
         #[structopt(long = "api-key", help = "OpenAI API key (optional, falls back to OPENAI_API_KEY env var)")]
         api_key: Option<String>,
+        #[structopt(long = "format", help = "Audio format (wav, compressed, mp3)", default_value = "wav")]
+        format: AudioFormat,
+        #[structopt(long = "sample-rate", help = "Sample rate in Hz", default_value = "48000")]
+        sample_rate: u32,
+        #[structopt(long = "bitrate", help = "Bitrate in kbps for compressed formats")]
+        bitrate: Option<u32>,
+        #[structopt(long = "channels", help = "Number of channels (1=mono, 2=stereo)", default_value = "1")]
+        channels: u16,
+        #[structopt(long = "speech-optimized", help = "Use speech-optimized compression settings")]
+        speech_optimized: bool,
     },
     Transcribe {
         #[structopt(parse(from_os_str), help = "Path to the input recording file or directory name")]
@@ -128,7 +139,9 @@ async fn interactive_mode() -> Result<()> {
                 let recording_name = generate_filename(name);
                 let audio_output = PathBuf::from(&recording_name);
                 
-                let record_result = record(audio_output.clone()).await;
+                // Use speech-optimized WAV compression (dynamic device adaptation happens in record function)
+                let compression_settings = CompressionSettings::speech_optimized();
+                let record_result = record(audio_output.clone(), Some(compression_settings)).await;
                 
                 if record_result.is_ok() {
                     let transcript_output = audio_output.clone();
@@ -157,7 +170,9 @@ async fn interactive_mode() -> Result<()> {
                 let recording_name = generate_filename(name);
                 let audio_output = PathBuf::from(&recording_name);
                 
-                match record(audio_output).await {
+                // Use speech-optimized WAV compression (dynamic device adaptation happens in record function)
+                let compression_settings = CompressionSettings::speech_optimized();
+                match record(audio_output, Some(compression_settings)).await {
                     Ok(()) => {
                         println!("✅ Recording complete!");
                         println!("📁 File saved in: ~/scriba_recordings/{}/", recording_name);
@@ -249,15 +264,29 @@ async fn main() -> Result<()> {
                     name,
                     skip_transcription,
                     api_key,
+                    format,
+                    sample_rate,
+                    bitrate,
+                    channels,
+                    speech_optimized,
                 } => {
                     // Generate automatic filename
                     let recording_name = generate_filename(name.clone());
                     let audio_output = PathBuf::from(&recording_name);
                     
+                    // Create compression settings
+                    let compression_settings = CompressionSettings {
+                        format,
+                        sample_rate,
+                        bitrate_kbps: bitrate,
+                        channels,
+                        speech_optimized,
+                    };
+                    
                     // Get API key from parameter or environment
                     let api_key = get_api_key(api_key)?;
                     // Start the recording task
-                    let record_result = record(audio_output.clone()).await;
+                    let record_result = record(audio_output.clone(), Some(compression_settings)).await;
 
                     if !skip_transcription {
                         // Use the same directory as the recording
