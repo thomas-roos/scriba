@@ -1,14 +1,14 @@
 use std::path::PathBuf;
 use anyhow::Context;
 use std::sync::{Arc, Mutex};
-use std::fs::File;
 use cpal::traits::{HostTrait, DeviceTrait, StreamTrait};
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use tokio::signal;
 use lazy_static::lazy_static;
 use dirs::home_dir;
 use std::time::{Duration, Instant};
 use crate::database::{Database, Recording};
+use crate::audio::{CompressionSettings, create_encoder, AudioEncoder, AudioFormat, convert_wav_to_mp3};
 use chrono::Utc;
 
 lazy_static! {
@@ -79,7 +79,7 @@ impl AudioLevelMonitor {
 }
 
 // Main recording function
-pub async fn record(output_path: PathBuf) -> Result<(), anyhow::Error> {
+pub async fn record(output_path: PathBuf, compression_settings: Option<CompressionSettings>) -> Result<(), anyhow::Error> {
 
     // Get the default input device
     let host = cpal::default_host();
@@ -94,20 +94,46 @@ pub async fn record(output_path: PathBuf) -> Result<(), anyhow::Error> {
     println!("Default input config: {:?}", config);
     
     // Save config values for database insertion (before they're consumed)
-    let sample_rate = config.sample_rate().0 as i64;
-    let channels = config.channels() as i64;
+    let (sample_rate, channels) = if let Some(ref settings) = compression_settings {
+        (settings.sample_rate as i64, settings.channels as i64)
+    } else {
+        (config.sample_rate().0 as i64, config.channels() as i64)
+    };
 
-    // The WAV file we're recording to.
-    let file_path = BASE_PATH.join(&output_path).join("recording.wav");
+    // Always record as WAV first (for perfect quality), then convert if needed
+    let wav_file_path = BASE_PATH.join(&output_path).join("recording.wav");
+    
+    // Determine final file path and format
+    let (final_file_path, audio_format_str, needs_conversion) = if let Some(ref settings) = compression_settings {
+        match settings.format {
+            AudioFormat::Mp3 => {
+                let mp3_path = BASE_PATH.join(&output_path).join("recording.mp3");
+                (mp3_path, "mp3".to_string(), true)
+            },
+            _ => {
+                let filename = settings.get_filename("recording");
+                (BASE_PATH.join(&output_path).join(filename), settings.format.to_string().to_lowercase(), false)
+            }
+        }
+    } else {
+        (wav_file_path.clone(), "wav".to_string(), false)
+    };
     
     // Ensure the recording directory exists
-    if let Some(parent) = file_path.parent() {
+    if let Some(parent) = wav_file_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     
-    let spec = wav_spec_from_config(&config);
-    let writer = hound::WavWriter::create(&file_path, spec)?;
-    let writer = Arc::new(Mutex::new(Some(writer)));
+    // Always create WAV encoder with device settings (perfect quality recording)
+    let recording_settings = CompressionSettings {
+        format: AudioFormat::Wav,
+        sample_rate: config.sample_rate().0,
+        bitrate_kbps: None,
+        channels: config.channels(),
+        speech_optimized: false,
+    };
+    let encoder = create_encoder(&wav_file_path, &recording_settings)?;
+    let encoder = Arc::new(Mutex::new(Some(encoder)));
 
     // Create audio level monitor
     let level_monitor = Arc::new(Mutex::new(AudioLevelMonitor::new()));
@@ -117,7 +143,7 @@ pub async fn record(output_path: PathBuf) -> Result<(), anyhow::Error> {
     println!();
 
     // Run the input stream on a separate thread.
-    let writer_2 = writer.clone();
+    let encoder_2 = encoder.clone();
     let level_monitor_2 = level_monitor.clone();
 
     let err_fn = move |err| {
@@ -127,25 +153,25 @@ pub async fn record(output_path: PathBuf) -> Result<(), anyhow::Error> {
     let stream = match config.sample_format() {
         cpal::SampleFormat::I8 => device.build_input_stream(
             &config.into(),
-            move |data, _: &_| write_input_data_with_monitoring_i8(data, &writer_2, &level_monitor_2),
+            move |data, _: &_| write_input_data_with_monitoring_i8(data, &encoder_2, &level_monitor_2),
             err_fn,
             None,
         )?,
         cpal::SampleFormat::I16 => device.build_input_stream(
             &config.into(),
-            move |data, _: &_| write_input_data_with_monitoring_i16(data, &writer_2, &level_monitor_2),
+            move |data, _: &_| write_input_data_with_monitoring_i16(data, &encoder_2, &level_monitor_2),
             err_fn,
             None,
         )?,
         cpal::SampleFormat::I32 => device.build_input_stream(
             &config.into(),
-            move |data, _: &_| write_input_data_with_monitoring_i32(data, &writer_2, &level_monitor_2),
+            move |data, _: &_| write_input_data_with_monitoring_i32(data, &encoder_2, &level_monitor_2),
             err_fn,
             None,
         )?,
         cpal::SampleFormat::F32 => device.build_input_stream(
             &config.into(),
-            move |data, _: &_| write_input_data_with_monitoring_f32(data, &writer_2, &level_monitor_2),
+            move |data, _: &_| write_input_data_with_monitoring_f32(data, &encoder_2, &level_monitor_2),
             err_fn,
             None,
         )?,
@@ -164,19 +190,38 @@ pub async fn record(output_path: PathBuf) -> Result<(), anyhow::Error> {
 
     // Clear the level display line and show completion message
     print!("\r");
-    println!("Recording {} complete!", file_path.display());
+    println!("Recording {} complete!", wav_file_path.display());
     
-    writer.lock().unwrap().take().unwrap().finalize()?;
+    // Finalize the encoder
+    if let Some(encoder) = encoder.lock().unwrap().as_mut() {
+        encoder.finalize()?;
+    }
+
+    // Post-recording conversion if needed
+    if needs_conversion {
+        println!("🔄 Converting to MP3...");
+        if let Some(ref settings) = compression_settings {
+            convert_wav_to_mp3(&wav_file_path, &final_file_path, settings)
+                .context("Failed to convert WAV to MP3")?;
+            
+            // Optionally remove the WAV file after successful conversion
+            std::fs::remove_file(&wav_file_path)
+                .context("Failed to remove temporary WAV file")?;
+        }
+    }
+
+    // Use the final file path for metadata
+    let metadata_file_path = if needs_conversion { &final_file_path } else { &wav_file_path };
 
     // Save recording metadata to database
     let mut db = Database::new().context("Failed to connect to database")?;
     
     // Get file size and duration info
-    let file_metadata = std::fs::metadata(&file_path)?;
+    let file_metadata = std::fs::metadata(metadata_file_path)?;
     let file_size_bytes = file_metadata.len() as i64;
     
-    // Calculate duration from WAV file
-    let duration_seconds = calculate_wav_duration(&file_path, sample_rate, channels)?;
+    // Calculate duration based on file format
+    let duration_seconds = calculate_audio_duration(metadata_file_path, sample_rate, channels)?;
     
     // Create recording record
     let recording = Recording {
@@ -187,7 +232,7 @@ pub async fn record(output_path: PathBuf) -> Result<(), anyhow::Error> {
         updated_at: Utc::now(),
         duration_seconds: Some(duration_seconds),
         file_size_bytes: Some(file_size_bytes),
-        audio_format: "wav".to_string(),
+        audio_format: audio_format_str,
         sample_rate,
         channels,
         has_transcript: false,
@@ -203,7 +248,7 @@ pub async fn record(output_path: PathBuf) -> Result<(), anyhow::Error> {
         search_index: None,
         categories: None,
         confidence_score: None,
-        audio_path: "recording.wav".to_string(),
+        audio_path: metadata_file_path.file_name().unwrap().to_string_lossy().to_string(),
         transcript_path: None,
     };
     
@@ -224,7 +269,7 @@ fn wav_spec_from_config(config: &cpal::SupportedStreamConfig) -> hound::WavSpec 
     }
 }
 
-type WavWriterHandle = Arc<Mutex<Option<hound::WavWriter<BufWriter<File>>>>>;
+type AudioEncoderHandle = Arc<Mutex<Option<Box<dyn AudioEncoder>>>>;
 
 fn sample_format(format: cpal::SampleFormat) -> hound::SampleFormat {
     if format.is_float() {
@@ -235,24 +280,22 @@ fn sample_format(format: cpal::SampleFormat) -> hound::SampleFormat {
 }
 
 // Specialized functions for level monitoring with audio level feedback
-fn write_input_data_with_monitoring_f32(input: &[f32], writer: &WavWriterHandle, level_monitor: &Arc<Mutex<AudioLevelMonitor>>) {
+fn write_input_data_with_monitoring_f32(input: &[f32], encoder: &AudioEncoderHandle, level_monitor: &Arc<Mutex<AudioLevelMonitor>>) {
     // Update the level monitor with f32 samples
     if let Ok(mut monitor) = level_monitor.try_lock() {
         monitor.update_level(input);
     }
     
     // Write audio data
-    if let Ok(mut guard) = writer.try_lock() {
-        if let Some(writer) = guard.as_mut() {
-            for &sample in input.iter() {
-                writer.write_sample(sample).ok();
-            }
+    if let Ok(mut guard) = encoder.try_lock() {
+        if let Some(encoder) = guard.as_mut() {
+            encoder.encode_samples(input).ok();
         }
     }
 }
 
-fn write_input_data_with_monitoring_i16(input: &[i16], writer: &WavWriterHandle, level_monitor: &Arc<Mutex<AudioLevelMonitor>>) {
-    // Convert i16 to f32 for level calculation
+fn write_input_data_with_monitoring_i16(input: &[i16], encoder: &AudioEncoderHandle, level_monitor: &Arc<Mutex<AudioLevelMonitor>>) {
+    // Convert i16 to f32 for level calculation and encoding
     let f32_samples: Vec<f32> = input.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
     
     if let Ok(mut monitor) = level_monitor.try_lock() {
@@ -260,17 +303,15 @@ fn write_input_data_with_monitoring_i16(input: &[i16], writer: &WavWriterHandle,
     }
     
     // Write audio data
-    if let Ok(mut guard) = writer.try_lock() {
-        if let Some(writer) = guard.as_mut() {
-            for &sample in input.iter() {
-                writer.write_sample(sample).ok();
-            }
+    if let Ok(mut guard) = encoder.try_lock() {
+        if let Some(encoder) = guard.as_mut() {
+            encoder.encode_samples(&f32_samples).ok();
         }
     }
 }
 
-fn write_input_data_with_monitoring_i32(input: &[i32], writer: &WavWriterHandle, level_monitor: &Arc<Mutex<AudioLevelMonitor>>) {
-    // Convert i32 to f32 for level calculation
+fn write_input_data_with_monitoring_i32(input: &[i32], encoder: &AudioEncoderHandle, level_monitor: &Arc<Mutex<AudioLevelMonitor>>) {
+    // Convert i32 to f32 for level calculation and encoding
     let f32_samples: Vec<f32> = input.iter().map(|&s| s as f32 / i32::MAX as f32).collect();
     
     if let Ok(mut monitor) = level_monitor.try_lock() {
@@ -278,17 +319,15 @@ fn write_input_data_with_monitoring_i32(input: &[i32], writer: &WavWriterHandle,
     }
     
     // Write audio data
-    if let Ok(mut guard) = writer.try_lock() {
-        if let Some(writer) = guard.as_mut() {
-            for &sample in input.iter() {
-                writer.write_sample(sample).ok();
-            }
+    if let Ok(mut guard) = encoder.try_lock() {
+        if let Some(encoder) = guard.as_mut() {
+            encoder.encode_samples(&f32_samples).ok();
         }
     }
 }
 
-fn write_input_data_with_monitoring_i8(input: &[i8], writer: &WavWriterHandle, level_monitor: &Arc<Mutex<AudioLevelMonitor>>) {
-    // Convert i8 to f32 for level calculation
+fn write_input_data_with_monitoring_i8(input: &[i8], encoder: &AudioEncoderHandle, level_monitor: &Arc<Mutex<AudioLevelMonitor>>) {
+    // Convert i8 to f32 for level calculation and encoding
     let f32_samples: Vec<f32> = input.iter().map(|&s| s as f32 / i8::MAX as f32).collect();
     
     if let Ok(mut monitor) = level_monitor.try_lock() {
@@ -296,28 +335,62 @@ fn write_input_data_with_monitoring_i8(input: &[i8], writer: &WavWriterHandle, l
     }
     
     // Write audio data
-    if let Ok(mut guard) = writer.try_lock() {
-        if let Some(writer) = guard.as_mut() {
-            for &sample in input.iter() {
-                writer.write_sample(sample).ok();
-            }
+    if let Ok(mut guard) = encoder.try_lock() {
+        if let Some(encoder) = guard.as_mut() {
+            encoder.encode_samples(&f32_samples).ok();
         }
     }
 }
 
-fn calculate_wav_duration(file_path: &std::path::Path, _sample_rate: i64, _channels: i64) -> Result<i64, anyhow::Error> {
-    // Use hound to properly read the WAV file header and get accurate info
-    let reader = hound::WavReader::open(file_path)
-        .context("Failed to open WAV file for duration calculation")?;
+fn calculate_audio_duration(file_path: &std::path::Path, sample_rate: i64, channels: i64) -> Result<i64, anyhow::Error> {
+    let extension = file_path.extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("");
     
-    let spec = reader.spec();
-    let sample_rate = spec.sample_rate as i64;
-    
-    // Get the total number of samples
-    let duration_samples = reader.duration() as i64;
-    
-    // Calculate duration in seconds
-    let duration_seconds = duration_samples / sample_rate;
-    
-    Ok(duration_seconds)
+    match extension.to_lowercase().as_str() {
+        "wav" => {
+            // Use hound to properly read the WAV file header and get accurate info
+            let reader = hound::WavReader::open(file_path)
+                .context("Failed to open WAV file for duration calculation")?;
+            
+            let spec = reader.spec();
+            let wav_sample_rate = spec.sample_rate as i64;
+            
+            // Get the total number of samples
+            let duration_samples = reader.duration() as i64;
+            
+            // Calculate duration in seconds
+            let duration_seconds = duration_samples / wav_sample_rate;
+            
+            Ok(duration_seconds)
+        },
+        "mp3" => {
+            // For MP3, use ffprobe for accurate duration calculation
+            let output = std::process::Command::new("ffprobe")
+                .arg("-v").arg("quiet")
+                .arg("-show_entries").arg("format=duration")
+                .arg("-of").arg("csv=p=0")
+                .arg(file_path)
+                .output();
+                
+            match output {
+                Ok(output) if output.status.success() => {
+                    let duration_str = String::from_utf8_lossy(&output.stdout);
+                    let duration_f64: f64 = duration_str.trim().parse().unwrap_or(1.0);
+                    Ok(duration_f64.round() as i64)
+                },
+                _ => {
+                    // Fallback: estimate using 32kbps bitrate (our default)
+                    let file_size = std::fs::metadata(file_path)?.len() as i64;
+                    // 32kbps = 32000 bits per second = 4000 bytes per second
+                    let estimated_duration = file_size / 4000;
+                    Ok(estimated_duration.max(1))
+                }
+            }
+        },
+        _ => {
+            // Fallback: estimate based on provided sample rate and assume reasonable file size
+            Ok(1) // Default to 1 second for unknown formats
+        }
+    }
 }

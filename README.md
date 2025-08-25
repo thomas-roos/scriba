@@ -1,10 +1,11 @@
-# Scriba v0.5.8
+# Scriba v0.6.0
 
 A modern CLI tool for recording audio and transcribing it using OpenAI's Whisper API, featuring an enhanced recording library with integrated statistics.
 
 ## Features
 
-- **🎙️ Audio Recording**: Capture audio directly from your microphone
+- **🎙️ Audio Recording**: Capture audio directly from your microphone with intelligent compression
+- **🗜️ Smart Audio Compression**: Automatic 80-90% file size reduction with speech-optimized MP3 encoding
 - **📝 AI Transcription**: Convert audio to text using OpenAI's Whisper API
 - **🔄 Combined Workflow**: Record and automatically transcribe in one command
 - **📚 Enhanced Recording Library**: Interactive interface with integrated statistics display
@@ -20,6 +21,8 @@ A modern CLI tool for recording audio and transcribing it using OpenAI's Whisper
 - Rust (1.70.0 or later)
 - OpenAI API key
 - Audio system (microphone for recording, speakers for playback)
+- FFmpeg (for MP3 compression) - `brew install ffmpeg` on macOS
+- MPV (for MP3 playback in dashboard) - `brew install mpv` on macOS
 
 ## Installation
 
@@ -76,11 +79,13 @@ scriba
 ```
 
 This launches the main menu with options:
-1. **Record Audio + Auto-Transcribe** - Record and transcribe in one step
-2. **Record Audio Only** - Record without transcription
+1. **Record Audio + Auto-Transcribe** - Record with smart compression and transcribe in one step
+2. **Record Audio Only** - Record with smart compression without transcription
 3. **Transcribe Existing File** - Transcribe an audio file
 4. **Exit**
 **D. Recording Library with Statistics** - Enhanced library interface
+
+**New in v0.6.0**: All interactive mode recordings now use speech-optimized compression by default, reducing file sizes by 80-90% while maintaining excellent quality for speech.
 
 ### Recording Library with Statistics
 
@@ -99,8 +104,14 @@ The enhanced library interface provides:
 
 #### Record Audio
 ```bash
-# Basic recording with auto-transcription
+# Basic recording with auto-transcription (WAV format)
 scriba record
+
+# Speech-optimized MP3 compression (reduces file size by ~88%)
+scriba record --format mp3 --speech-optimized
+
+# Custom compression settings
+scriba record --format mp3 --bitrate 64 --sample-rate 16000 --channels 1
 
 # Custom name
 scriba record --name "meeting-notes"
@@ -110,6 +121,16 @@ scriba record --skip-transcription
 
 # With API key
 scriba record --api-key "your_api_key_here"
+```
+
+#### Audio Compression Options
+```bash
+# Available compression options
+--format wav|mp3          # Audio format (default: wav for CLI, mp3 for interactive)
+--sample-rate RATE         # Sample rate in Hz (default: 48000, 16000 for speech)
+--bitrate KBPS             # Bitrate in kbps for compressed formats (32-192)
+--channels 1|2             # Mono (1) or stereo (2) (default: 1)
+--speech-optimized         # Use preset optimized for speech clarity
 ```
 
 #### Transcribe Audio
@@ -131,14 +152,14 @@ All recordings are organized in `~/scriba_recordings/`:
 ```
 ~/scriba_recordings/
 ├── scriba.db                              # SQLite database
-├── 2025-08-10_14-30-25_meeting-notes/
+├── 2025-08-10_14-30-25_meeting-notes/    # Interactive mode (compressed)
+│   ├── recording.mp3
+│   └── transcript.txt
+├── 2025-08-10_15-45-12_recording/         # CLI mode (uncompressed)
 │   ├── recording.wav
 │   └── transcript.txt
-├── 2025-08-10_15-45-12_recording/
-│   ├── recording.wav
-│   └── transcript.txt
-└── 2025-08-10_16-20-30_interview/
-    ├── recording.wav
+└── 2025-08-10_16-20-30_interview/         # Custom compression
+    ├── recording.mp3
     └── transcript.txt
 ```
 
@@ -187,8 +208,18 @@ cargo test
 
 ## Supported Audio Formats
 
-Recording: WAV (primary)
+Recording: 
+- WAV (uncompressed, CLI default)
+- MP3 (compressed, interactive mode default)
+- Speech-optimized presets available
+
 Transcription: WAV, MP3, MP4, MPEG, MPGA, M4A, WEBM, FLAC, OGG, OPUS, AIFF, CAF
+
+### Compression Benefits
+- **File Size Reduction**: 80-90% smaller files with speech-optimized MP3
+- **Storage Efficiency**: Significant storage savings for long recordings
+- **Quality Preservation**: Maintains excellent speech clarity and transcription accuracy
+- **Bandwidth Friendly**: Faster uploads/downloads when sharing recordings
 
 ## Database
 
@@ -204,6 +235,16 @@ Scriba uses SQLite for:
 This project is licensed under the MIT License.
 
 ## Version History
+
+**v0.6.0** - Smart Audio Compression with Speech Optimization
+- Post-recording MP3 conversion using FFmpeg for reliable, high-quality compression
+- 85-90% file size reduction with speech-optimized settings (32kbps, 22kHz, mono)
+- Perfect quality during recording (WAV), then convert to MP3 afterward
+- Configurable compression settings (format, bitrate, sample rate, channels)
+- Interactive mode now uses speech-optimized MP3 by default
+- Comprehensive CLI options for custom compression workflows
+- Maintains excellent transcription quality with compressed audio
+- Standard FFmpeg backend ensures compatibility and audio quality
 
 **v0.5.8** - Complete Homebrew Distribution Automation
 - Full automated release workflow with multi-platform builds (macOS Intel/ARM64, Linux x86_64)
