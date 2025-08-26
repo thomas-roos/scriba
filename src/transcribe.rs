@@ -131,16 +131,42 @@ pub async fn transcribe_file(
     output_path: &PathBuf,
     api_key: &str,
 ) -> Result<(), anyhow::Error> {
-    // Find the audio file (could be WAV or MP3)
-    let recording_dir = BASE_PATH.join(input_path);
-    let (audio_file_path, filename) = if recording_dir.join("recording.mp3").exists() {
-        let path = recording_dir.join("recording.mp3");
-        (path, "recording.mp3".to_string())
-    } else if recording_dir.join("recording.wav").exists() {
-        let path = recording_dir.join("recording.wav");
-        (path, "recording.wav".to_string())
+    // Find the audio file - handle both directory names and full file paths
+    let (audio_file_path, filename) = if input_path.is_absolute() {
+        // User provided an absolute path - use it directly
+        if input_path.exists() {
+            let filename = input_path.file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            (input_path.clone(), filename)
+        } else {
+            return Err(anyhow::anyhow!("Audio file not found: {}", input_path.display()));
+        }
+    } else if input_path.extension().is_some() {
+        // User provided a relative path with file extension (like "dir/recording.wav")
+        let full_path = BASE_PATH.join(input_path);
+        if full_path.exists() {
+            let filename = input_path.file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            (full_path, filename)
+        } else {
+            return Err(anyhow::anyhow!("Audio file not found: {}", full_path.display()));
+        }
     } else {
-        return Err(anyhow::anyhow!("No audio file found (recording.wav or recording.mp3) in {}", recording_dir.display()));
+        // User provided just a directory name - look for recording.mp3 or recording.wav inside it
+        let recording_dir = BASE_PATH.join(input_path);
+        if recording_dir.join("recording.mp3").exists() {
+            let path = recording_dir.join("recording.mp3");
+            (path, "recording.mp3".to_string())
+        } else if recording_dir.join("recording.wav").exists() {
+            let path = recording_dir.join("recording.wav");
+            (path, "recording.wav".to_string())
+        } else {
+            return Err(anyhow::anyhow!("No audio file found (recording.wav or recording.mp3) in {}", recording_dir.display()));
+        }
     };
     
     let audio_file = std::fs::read(&audio_file_path)
@@ -191,13 +217,10 @@ pub async fn transcribe_file(
         let json: Value = serde_json::from_str(&text)?;
         let transcription_text = json["text"].as_str().unwrap_or(&text);
 
-        // Save the transcript to the specified or default file
-        let transcript_file_path = BASE_PATH.join(output_path).join("transcript.txt");
-        
-        // Ensure the directory exists
-        if let Some(parent) = transcript_file_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        // Store transcript in same folder as the audio file
+        let audio_dir = audio_file_path.parent()
+            .context("Could not determine audio file directory")?;
+        let transcript_file_path = audio_dir.join("transcript.txt");
         
         let transcript_file = File::create(&transcript_file_path)?;
         let mut transcript_writer = BufWriter::new(transcript_file);
@@ -209,14 +232,17 @@ pub async fn transcribe_file(
         // Show the transcription with typing effect
         show_transcription_typing_effect(transcription_text).await;
 
-        println!("\n📁 Transcript saved to: ~/scriba_recordings/{}/transcript.txt", output_path.display());
+        println!("\n📁 Transcript saved to: {}", transcript_file_path.display());
 
-        // Save transcript to database
+        // Save transcript to database and link to existing recording
         let mut db = Database::new().context("Failed to connect to database")?;
         
-        // Find the recording by directory name
-        let directory_name = output_path.to_string_lossy().to_string();
-        match db.get_recording_by_directory(&directory_name) {
+        // Find the recording by looking for the directory name that contains this audio file
+        let directory_name = audio_dir.file_name()
+            .and_then(|name| name.to_str())
+            .context("Could not determine directory name")?;
+            
+        match db.get_recording_by_directory(directory_name) {
             Ok(Some(recording)) => {
                 if let Some(recording_id) = recording.id {
                     // Create transcript record
