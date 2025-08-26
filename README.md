@@ -1,283 +1,83 @@
-# Scriba v0.6.0
+# Scriba
 
-A modern CLI tool for recording audio and transcribing it using OpenAI's Whisper API, featuring an enhanced recording library with integrated statistics.
+A modern CLI tool for recording audio and transcribing it using OpenAI's Whisper API.
 
-## Features
+## ✨ Features
 
-- **🎙️ Audio Recording**: Capture audio directly from your microphone with intelligent compression
-- **🗜️ Smart Audio Compression**: Automatic 80-90% file size reduction with speech-optimized MP3 encoding
-- **📝 AI Transcription**: Convert audio to text using OpenAI's Whisper API
-- **🔄 Combined Workflow**: Record and automatically transcribe in one command
-- **📚 Enhanced Recording Library**: Interactive interface with integrated statistics display
-- **🗃️ Database Storage**: SQLite database for organized recording metadata
-- **🔍 Full-Text Search**: Search through your transcripts
-- **📊 Always-On Statistics**: Recording statistics and usage metrics always visible
-- **▶️ Audio Playback**: Play recordings directly from the library
-- **🗑️ Safe Deletion**: Delete recordings with confirmation prompts
-- **📁 Smart Organization**: All recordings stored in `~/scriba_recordings/`
+- 🎙️ **Audio Recording** - High-quality microphone recording with smart MP3 compression
+- 📝 **AI Transcription** - OpenAI Whisper API integration with progress indicators  
+- 📊 **Interactive Dashboard** - Browse, search, and manage recordings with live statistics
+- 🔍 **Full-Text Search** - Find recordings by searching transcript content
+- ▶️ **Audio Playback** - Play recordings directly from the dashboard
+- 📋 **Transcript Management** - Copy, view, and transcribe recordings with one keystroke
 
-## Prerequisites
+## 🚀 Quick Start
 
-- Rust (1.70.0 or later)
-- OpenAI API key
-- Audio system (microphone for recording, speakers for playback)
-- FFmpeg (for MP3 compression) - `brew install ffmpeg` on macOS
-- MPV (for MP3 playback in dashboard) - `brew install mpv` on macOS
-
-## Installation
-
-### Option 1: Homebrew (Recommended)
+### Installation
 ```bash
-# One-time setup
+# Homebrew (recommended)
 brew tap giovannialberto/scriba
-
-# Install Scriba
 brew install scriba
 
-# Future updates
-brew upgrade scriba
+# From source
+cargo install --git https://github.com/giovannialberto/scriba
 ```
 
-### Option 2: From Source
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/giovannialberto/scriba
-   cd scriba
-   ```
-
-2. Build the project:
-   ```bash
-   cargo build --release
-   ```
-
-3. The binary will be available at `target/release/scriba`
-
-## Configuration
-
-### Option 1: Environment Variable
-Create a `.env` file in the project root:
-```env
-OPENAI_API_KEY=your_api_key_here
-```
-
-### Option 2: Command Line Parameter
-Pass your API key directly when running commands:
+### Setup
+Set your OpenAI API key:
 ```bash
-scriba record --api-key your_api_key_here
+export OPENAI_API_KEY="your-api-key-here"
 ```
 
-Get an API key from [OpenAI's platform](https://platform.openai.com/api-keys).
-
-## Usage
-
-### Interactive Mode (Default)
-
-Simply run `scriba` without arguments to enter interactive mode:
-
+### Usage
 ```bash
+# Launch interactive dashboard
 scriba
-```
 
-This launches the main menu with options:
-1. **Record Audio + Auto-Transcribe** - Record with smart compression and transcribe in one step
-2. **Record Audio Only** - Record with smart compression without transcription
-3. **Transcribe Existing File** - Transcribe an audio file
-4. **Exit**
-**D. Recording Library with Statistics** - Enhanced library interface
-
-**New in v0.6.0**: All interactive mode recordings now use speech-optimized compression by default, reducing file sizes by 80-90% while maintaining excellent quality for speech.
-
-### Recording Library with Statistics
-
-The enhanced library interface provides:
-- **Always-Visible Statistics**: Recording metrics always displayed at the bottom
-- **Navigation**: Use arrow keys to browse recordings with table view
-- **View Transcripts**: Press `Enter` to read transcripts in popup
-- **Play Audio**: Press `P` to play recordings with external players
-- **Delete**: Press `D` to delete recordings with confirmation dialog
-- **Search**: Press `/` to search through all transcripts
-- **Quick Actions**: Press `R`/`A`/`T` for recording and transcription actions
-- **Help**: Press `H` for complete help guide
-- **Pagination**: Use `PgUp`/`PgDn` to navigate large libraries
-
-### Command Line Interface
-
-#### Record Audio
-```bash
-# Basic recording with auto-transcription (WAV format)
+# Record and transcribe in CLI
 scriba record
-
-# Speech-optimized MP3 compression (reduces file size by ~88%)
-scriba record --format mp3 --speech-optimized
-
-# Custom compression settings
-scriba record --format mp3 --bitrate 64 --sample-rate 16000 --channels 1
-
-# Custom name
-scriba record --name "meeting-notes"
-
-# Skip transcription
-scriba record --skip-transcription
-
-# With API key
-scriba record --api-key "your_api_key_here"
+scriba transcribe audio-file.wav
 ```
 
-#### Audio Compression Options
-```bash
-# Available compression options
---format wav|mp3          # Audio format (default: wav for CLI, mp3 for interactive)
---sample-rate RATE         # Sample rate in Hz (default: 48000, 16000 for speech)
---bitrate KBPS             # Bitrate in kbps for compressed formats (32-192)
---channels 1|2             # Mono (1) or stereo (2) (default: 1)
---speech-optimized         # Use preset optimized for speech clarity
-```
+## 📊 Dashboard Controls
 
-#### Transcribe Audio
-```bash
-# Basic transcription
-scriba transcribe path/to/audio.wav
+| Key | Action |
+|-----|--------|
+| **R** | Record + Auto-transcribe |
+| **A** | Record audio only |
+| **T** | Transcribe selected recording |
+| **Enter** | View transcript |
+| **C** | Copy transcript to clipboard |
+| **P** | Play recording |
+| **/** | Search transcripts |
+| **D** | Delete recording |
+| **H** | Show help |
 
-# With custom name
-scriba transcribe audio.wav --name "interview-transcript"
+## 🗂️ File Organization
 
-# With API key
-scriba transcribe audio.wav --api-key "your_api_key_here"
-```
-
-### File Organization
-
-All recordings are organized in `~/scriba_recordings/`:
-
+All recordings are stored in `~/scriba_recordings/`:
 ```
 ~/scriba_recordings/
-├── scriba.db                              # SQLite database
-├── 2025-08-10_14-30-25_meeting-notes/    # Interactive mode (compressed)
+├── 2025-08-26_14-30-25_meeting/
 │   ├── recording.mp3
 │   └── transcript.txt
-├── 2025-08-10_15-45-12_recording/         # CLI mode (uncompressed)
-│   ├── recording.wav
-│   └── transcript.txt
-└── 2025-08-10_16-20-30_interview/         # Custom compression
-    ├── recording.mp3
-    └── transcript.txt
+└── scriba.db
 ```
 
-## Library Features
+## 🔧 Requirements
 
-### Search & Browse
-- Full-text search through all transcripts
-- Filter recordings by transcription status
-- Paginated results for large libraries
+- **OpenAI API key** - Get one at [platform.openai.com](https://platform.openai.com/api-keys)
+- **FFmpeg** - For audio compression (`brew install ffmpeg`)
+- **Audio system** - Microphone for recording, speakers for playback
 
-### Playback
-- Cross-platform audio playback
-- Automatic player detection (afplay, mpv, ffplay)
-- External playback with status updates
+## 🎯 Key Benefits
 
-### Integrated Statistics Display
-- Always visible at bottom of library interface
-- Total recordings and duration in real-time
-- Storage usage tracking with formatted sizes
-- Transcription progress metrics and percentages
-- Word count statistics across all transcripts
+- **80-90% file size reduction** with speech-optimized MP3 compression
+- **Instant transcription** with animated progress indicators
+- **Seamless workflow** - record, transcribe, and manage from one interface
+- **Smart search** - find any recording by searching transcript text
+- **Cross-platform** - works on macOS, Linux, and Windows
 
-### Management
-- Safe deletion with confirmation
-- Database integrity checks
-- Automatic corruption recovery
+## 📄 License
 
-## Development
-
-### Building
-```bash
-cargo build
-```
-
-### Running in Development
-```bash
-cargo run
-cargo run -- record --name "test"
-cargo run -- transcribe test.wav
-```
-
-### Running Tests
-```bash
-cargo test
-```
-
-## Supported Audio Formats
-
-Recording: 
-- WAV (uncompressed, CLI default)
-- MP3 (compressed, interactive mode default)
-- Speech-optimized presets available
-
-Transcription: WAV, MP3, MP4, MPEG, MPGA, M4A, WEBM, FLAC, OGG, OPUS, AIFF, CAF
-
-### Compression Benefits
-- **File Size Reduction**: 80-90% smaller files with speech-optimized MP3
-- **Storage Efficiency**: Significant storage savings for long recordings
-- **Quality Preservation**: Maintains excellent speech clarity and transcription accuracy
-- **Bandwidth Friendly**: Faster uploads/downloads when sharing recordings
-
-## Database
-
-Scriba uses SQLite for:
-- Recording metadata storage
-- Transcript content and full-text search
-- Usage statistics
-- Automatic schema management
-- Foreign key constraints for data integrity
-
-## License
-
-This project is licensed under the MIT License.
-
-## Version History
-
-**v0.6.0** - Smart Audio Compression with Speech Optimization
-- Post-recording MP3 conversion using FFmpeg for reliable, high-quality compression
-- 85-90% file size reduction with speech-optimized settings (32kbps, 22kHz, mono)
-- Perfect quality during recording (WAV), then convert to MP3 afterward
-- Configurable compression settings (format, bitrate, sample rate, channels)
-- Interactive mode now uses speech-optimized MP3 by default
-- Comprehensive CLI options for custom compression workflows
-- Maintains excellent transcription quality with compressed audio
-- Standard FFmpeg backend ensures compatibility and audio quality
-
-**v0.5.8** - Complete Homebrew Distribution Automation
-- Full automated release workflow with multi-platform builds (macOS Intel/ARM64, Linux x86_64)
-- Automated Homebrew tap repository updates with proper authentication
-- Simple installation: `brew tap giovannialberto/scriba && brew install scriba`
-- Automatic formula updates with SHA256 checksums on new releases
-- Complete end-to-end automation for seamless distribution
-
-**v0.4.0** - Improved Audio Playback Experience
-- Fixed mono audio playback to output to both stereo channels
-- Enhanced audio player compatibility across platforms (macOS, Linux, Windows)
-- Added stereo forcing arguments for mpv, ffplay, and aplay players
-- Improved audio experience for users with headphones and speakers
-- Better Windows audio support with multiple player fallbacks
-
-**v0.3.0** - Enhanced Library with Integrated Statistics
-- Merged recording library with always-visible statistics display
-- Enhanced table-based recording browser with improved UX
-- Integrated quick action controls (R/A/T) directly in library
-- Popup-based transcript viewing for better readability
-- Streamlined main menu (removed separate library option)
-- Improved help system with comprehensive key bindings
-- Better CLI launch preference while maintaining TUI functionality
-
-**v0.2.0** - Recording Library & Database
-- Interactive TUI library for managing recordings
-- SQLite database with full-text search
-- Audio playback functionality
-- Statistics and usage tracking
-- Safe deletion with confirmation prompts
-- Improved CLI interface
-
-**v0.1.x** - Basic Recording & Transcription
-- Command-line audio recording
-- OpenAI Whisper API integration
-- Basic file organization
+MIT License - see [LICENSE](LICENSE) file for details.
