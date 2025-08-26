@@ -1,7 +1,7 @@
 use crate::database::{Database, Recording, RecordingStats};
 use crate::record::record;
-use crate::transcribe::transcribe_file;
-use crate::audio::{CompressionSettings, AudioFormat};
+use crate::transcribe::{transcribe_file, transcribe_file_silent};
+use crate::audio::CompressionSettings;
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
@@ -46,6 +46,10 @@ pub struct Dashboard {
     show_delete_confirm: bool,
     delete_candidate: Option<Recording>,
     current_playback_pid: Option<u32>,
+    last_transcribe_warning: Option<usize>, // Track which recording showed overwrite warning
+    progress_animation: Option<String>, // Base message for progress animation
+    progress_frame: usize, // Animation frame counter
+    transcription_task: Option<tokio::task::JoinHandle<Result<(), anyhow::Error>>>, // Background transcription task
 }
 
 #[derive(Debug, PartialEq)]
@@ -61,6 +65,7 @@ enum DashboardAction {
     RecordAndTranscribe,
     RecordOnly,
     TranscribeFile,
+    TranscribeSelected,
 }
 
 impl Dashboard {
@@ -88,6 +93,10 @@ impl Dashboard {
             show_delete_confirm: false,
             delete_candidate: None,
             current_playback_pid: None,
+            last_transcribe_warning: None,
+            progress_animation: None,
+            progress_frame: 0,
+            transcription_task: None,
         })
     }
 
@@ -119,6 +128,38 @@ impl Dashboard {
 
     async fn run_app<B: ratatui::backend::Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         loop {
+            // Check if transcription task completed
+            if let Some(task) = &mut self.transcription_task {
+                if task.is_finished() {
+                    let completed_task = self.transcription_task.take().unwrap();
+                    match completed_task.await {
+                        Ok(Ok(())) => {
+                            self.stop_progress_animation();
+                            self.message = "✅ Transcription complete!".to_string();
+                            self.show_message = true;
+                            // Reload data to show new transcript
+                            let _ = self.load_recordings();
+                            let _ = self.load_stats();
+                        }
+                        Ok(Err(err)) => {
+                            self.stop_progress_animation();
+                            self.message = format!("❌ Transcription failed: {}", err);
+                            self.show_message = true;
+                        }
+                        Err(_) => {
+                            self.stop_progress_animation();
+                            self.message = "❌ Transcription task failed".to_string();
+                            self.show_message = true;
+                        }
+                    }
+                }
+            }
+            
+            // Update progress animation if active
+            if self.progress_animation.is_some() {
+                self.update_progress_message();
+            }
+            
             terminal.draw(|f| self.ui(f))?;
 
             if event::poll(Duration::from_millis(100))? {
@@ -151,9 +192,12 @@ impl Dashboard {
         }
         
         if self.show_message {
-            // Any key press closes the message popup
-            self.show_message = false;
-            self.message.clear();
+            // Don't close message if progress animation is active
+            if self.progress_animation.is_none() {
+                // Any key press closes the message popup
+                self.show_message = false;
+                self.message.clear();
+            }
             return Ok(DashboardAction::Continue);
         }
 
@@ -188,7 +232,7 @@ impl Dashboard {
                 return Ok(DashboardAction::RecordOnly);
             }
             KeyCode::Char('t') | KeyCode::Char('T') => {
-                return Ok(DashboardAction::TranscribeFile);
+                return Ok(DashboardAction::TranscribeSelected);
             }
             KeyCode::Char('/') => {
                 self.search_mode = true;
@@ -246,6 +290,9 @@ impl Dashboard {
             }
             DashboardAction::TranscribeFile => {
                 self.execute_transcribe_file().await?;
+            }
+            DashboardAction::TranscribeSelected => {
+                self.execute_transcribe_selected().await?;
             }
             _ => {}
         }
@@ -1047,7 +1094,7 @@ impl Dashboard {
             Line::from("Quick Actions:"),
             Line::from("  R          - Record Audio + Auto-Transcribe"),
             Line::from("  A          - Record Audio Only"),
-            Line::from("  T          - Transcribe Existing File"),
+            Line::from("  T          - Transcribe Selected Recording"),
             Line::from(""),
             Line::from("Navigation:"),
             Line::from("  ↑/↓        - Navigate recordings"),
@@ -1468,6 +1515,95 @@ impl Dashboard {
         Ok(())
     }
     
+    async fn execute_transcribe_selected(&mut self) -> Result<()> {
+        // Check if transcription is already running
+        if self.transcription_task.is_some() {
+            self.message = "⚠️ Transcription already in progress. Please wait...".to_string();
+            self.show_message = true;
+            return Ok(());
+        }
+        
+        // Get the selected recording
+        let selected_index = match self.table_state.selected() {
+            Some(i) => i,
+            None => {
+                self.message = "❌ No recording selected".to_string();
+                self.show_message = true;
+                return Ok(());
+            }
+        };
+        
+        let selected_recording = match self.recordings.get(selected_index) {
+            Some(recording) => recording.clone(),
+            None => {
+                self.message = "❌ Invalid recording selection".to_string();
+                self.show_message = true;
+                return Ok(());
+            }
+        };
+        
+        // Check if transcript already exists
+        let has_transcript = if let Some(id) = selected_recording.id {
+            self.db.get_transcript_by_recording_id(id).is_ok_and(|t| t.is_some())
+        } else {
+            false
+        };
+        
+        if has_transcript {
+            // Check if this is the second press on the same recording
+            if self.last_transcribe_warning == Some(selected_index) {
+                // User confirmed overwrite - proceed with transcription
+                self.last_transcribe_warning = None;
+            } else {
+                // First press - show warning and remember this recording
+                self.last_transcribe_warning = Some(selected_index);
+                self.message = "⚠️ Recording already has transcript. Press T again to overwrite.".to_string();
+                self.show_message = true;
+                return Ok(());
+            }
+        } else {
+            // Clear any previous warning state
+            self.last_transcribe_warning = None;
+        }
+        
+        // Get API key
+        let api_key = match env::var("OPENAI_API_KEY") {
+            Ok(key) => key,
+            Err(_) => {
+                self.message = "❌ OPENAI_API_KEY environment variable required".to_string();
+                self.show_message = true;
+                return Ok(());
+            }
+        };
+        
+        if api_key.is_empty() {
+            self.message = "❌ OPENAI_API_KEY environment variable is empty".to_string();
+            self.show_message = true;
+            return Ok(());
+        }
+        
+        let display_name = selected_recording.display_name
+            .as_ref()
+            .unwrap_or(&selected_recording.directory_name);
+        
+        // Show immediate progress animation
+        self.progress_animation = Some(format!("🎵 Transcribing: {}", display_name));
+        self.progress_frame = 0;
+        self.show_message = true;
+        
+        // Build the audio file path - use the directory name as input
+        let input_path = PathBuf::from(&selected_recording.directory_name);
+        
+        // Start transcription in background task
+        let api_key_clone = api_key.clone();
+        let input_path_clone = input_path.clone();
+        self.transcription_task = Some(tokio::spawn(async move {
+            transcribe_file_silent(&input_path_clone, &api_key_clone).await
+        }));
+        
+        Ok(())
+    }
+    
     fn generate_filename(&self, name: Option<String>) -> String {
         let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
         match name {
@@ -1620,6 +1756,43 @@ impl Dashboard {
                 .arg("/F")
                 .output();
             Ok(())
+        }
+    }
+    
+    async fn start_progress_animation(&mut self, base_message: String) {
+        self.progress_animation = Some(base_message);
+        self.progress_frame = 0;
+    }
+    
+    fn stop_progress_animation(&mut self) {
+        self.progress_animation = None;
+    }
+    
+    fn update_progress_message(&mut self) {
+        if let Some(base_msg) = &self.progress_animation {
+            let spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let spinner = spinners[self.progress_frame % spinners.len()];
+            
+            // Create progress bar
+            let _progress_chars = ["▱", "▰"];
+            let bar_width = 20;
+            let progress_pos = (self.progress_frame / 2) % (bar_width * 2);
+            let mut bar = vec!["▱"; bar_width];
+            
+            if progress_pos < bar_width {
+                for i in 0..=progress_pos.min(bar_width - 1) {
+                    bar[i] = "▰";
+                }
+            } else {
+                let reverse_pos = (bar_width * 2 - 1) - progress_pos;
+                for i in reverse_pos..bar_width {
+                    bar[i] = "▰";
+                }
+            }
+            
+            let bar_str = bar.join("");
+            self.message = format!("{} {} [{}]", spinner, base_msg, bar_str);
+            self.progress_frame += 1;
         }
     }
 }

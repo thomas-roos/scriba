@@ -125,10 +125,136 @@ async fn show_transcription_typing_effect(text: &str) {
     println!("╰────────────────────────────────────────────────────────╯");
 }
 
+// Silent transcription function for TUI usage (no stdout prints)
+pub async fn transcribe_file_silent(
+    input_path: &PathBuf,
+    api_key: &str,
+) -> Result<(), anyhow::Error> {
+    // Find the audio file - handle both directory names and full file paths
+    let (audio_file_path, filename) = if input_path.is_absolute() {
+        // User provided an absolute path - use it directly
+        if input_path.exists() {
+            let filename = input_path.file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            (input_path.clone(), filename)
+        } else {
+            return Err(anyhow::anyhow!("Audio file not found: {}", input_path.display()));
+        }
+    } else if input_path.extension().is_some() {
+        // User provided a relative path with file extension (like "dir/recording.wav")
+        let full_path = BASE_PATH.join(input_path);
+        if full_path.exists() {
+            let filename = input_path.file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            (full_path, filename)
+        } else {
+            return Err(anyhow::anyhow!("Audio file not found: {}", full_path.display()));
+        }
+    } else {
+        // User provided just a directory name - look for recording.mp3 or recording.wav inside it
+        let recording_dir = BASE_PATH.join(input_path);
+        if recording_dir.join("recording.mp3").exists() {
+            let path = recording_dir.join("recording.mp3");
+            (path, "recording.mp3".to_string())
+        } else if recording_dir.join("recording.wav").exists() {
+            let path = recording_dir.join("recording.wav");
+            (path, "recording.wav".to_string())
+        } else {
+            return Err(anyhow::anyhow!("No audio file found (recording.wav or recording.mp3) in {}", recording_dir.display()));
+        }
+    };
+    
+    let audio_file = std::fs::read(&audio_file_path)
+        .context("Unable to read the input file")?;
+
+    // Set up the reqwest client
+    let client = Client::new();
+
+    // Create a multipart form with the audio file and model parameter
+    let form = Form::new()
+        .part("file", Part::bytes(audio_file).file_name(filename))
+        .text("model", "whisper-1");
+
+    // Make the POST request to the OpenAI API
+    let response = client
+        .post("https://api.openai.com/v1/audio/transcriptions")
+        .multipart(form)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .await
+        .context("Failed to send request")?;
+
+    if response.status().is_success() {
+        let text = response.text().await.context("Failed to read response body")?;
+
+        // Parse the JSON response to extract just the text
+        let json: Value = serde_json::from_str(&text)?;
+        let transcription_text = json["text"].as_str().unwrap_or(&text);
+
+        // Store transcript in same folder as the audio file
+        let audio_dir = audio_file_path.parent()
+            .context("Could not determine audio file directory")?;
+        let transcript_file_path = audio_dir.join("transcript.txt");
+        
+        let transcript_file = File::create(&transcript_file_path)?;
+        let mut transcript_writer = BufWriter::new(transcript_file);
+        transcript_writer.write_all(transcription_text.as_bytes())?;
+
+        // Save transcript to database and link to existing recording
+        let mut db = Database::new().context("Failed to connect to database")?;
+        
+        // Find the recording by looking for the directory name that contains this audio file
+        let directory_name = audio_dir.file_name()
+            .and_then(|name| name.to_str())
+            .context("Could not determine directory name")?;
+            
+        match db.get_recording_by_directory(directory_name) {
+            Ok(Some(recording)) => {
+                if let Some(recording_id) = recording.id {
+                    // Create transcript record
+                    let transcript = Transcript {
+                        id: None,
+                        recording_id,
+                        content: transcription_text.to_string(),
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                        word_count: None, // Will be calculated by database
+                        character_count: None, // Will be calculated by database
+                        language_detected: None,
+                        confidence_scores: None,
+                        segments: None,
+                        entities: None,
+                        topics: None,
+                    };
+                    
+                    match db.insert_transcript(&transcript) {
+                        Ok(_transcript_id) => {
+                            // Update recording status
+                            let _ = db.update_recording_transcript_status(recording_id, "completed", true);
+                        },
+                        Err(_e) => {} // Silently handle errors
+                    }
+                }
+            },
+            _ => {} // Silently handle errors
+        }
+
+        Ok(())
+    } else {
+        let status = response.status();
+        let text = response.text().await.context("Failed to read response body")?;
+        Err(anyhow::Error::msg(format!("Transcription failed: {} - {}", status, text)))
+    }
+}
+
 // Enhanced transcription function with delightful UX
 pub async fn transcribe_file(
     input_path: &PathBuf,
-    output_path: &PathBuf,
+    _output_path: &PathBuf,
     api_key: &str,
 ) -> Result<(), anyhow::Error> {
     // Find the audio file - handle both directory names and full file paths
