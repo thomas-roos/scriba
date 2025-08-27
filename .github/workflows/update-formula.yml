@@ -1,0 +1,61 @@
+name: Update Formula (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to update formula from (e.g., v0.8.1)"
+        required: true
+
+jobs:
+  update:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute checksums from release assets
+        id: sums
+        run: |
+          TAG=${{ inputs.tag }}
+          gh release download "$TAG" --pattern "scriba-*apple-darwin" --dir release
+          cd release
+          echo "macos_x86_sha=$(shasum -a 256 scriba-x86_64-apple-darwin | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+          echo "macos_arm_sha=$(shasum -a 256 scriba-aarch64-apple-darwin | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Formula/scriba.rb
+        run: |
+          VERSION=${{ inputs.tag }}
+          VERSION=${VERSION#v}
+          mkdir -p Formula
+          cat > Formula/scriba.rb << EOF
+          class Scriba < Formula
+            desc "Modern CLI tool for recording and transcribing audio using OpenAI Whisper"
+            homepage "https://github.com/giovannialberto/scriba"
+            version "${VERSION}"
+
+            if Hardware::CPU.intel?
+              url "https://github.com/giovannialberto/scriba/releases/download/v${VERSION}/scriba-x86_64-apple-darwin"
+              sha256 "${{ steps.sums.outputs.macos_x86_sha }}"
+            else
+              url "https://github.com/giovannialberto/scriba/releases/download/v${VERSION}/scriba-aarch64-apple-darwin"
+              sha256 "${{ steps.sums.outputs.macos_arm_sha }}"
+            end
+
+            def install
+              bin.install "scriba-#{Hardware::CPU.intel? ? "x86_64" : "aarch64"}-apple-darwin" => "scriba"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/scriba --version")
+            end
+          end
+          EOF
+
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git add Formula/scriba.rb
+          git commit -m "chore(formula): update to ${VERSION}"
+          git push origin HEAD:main

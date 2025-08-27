@@ -96,23 +96,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Get release info
+      - name: Get release version
         id: release
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          
-          # Download release assets to get checksums
-          gh release download v$VERSION --pattern "*.sha256"
-          
-          # Extract checksums for macOS binaries
-          MACOS_X86_SHA=$(cat scriba-x86_64-apple-darwin.sha256 | cut -d' ' -f1)
-          MACOS_ARM_SHA=$(cat scriba-aarch64-apple-darwin.sha256 | cut -d' ' -f1)
-          
-          echo "macos_x86_sha=$MACOS_X86_SHA" >> $GITHUB_OUTPUT
-          echo "macos_arm_sha=$MACOS_ARM_SHA" >> $GITHUB_OUTPUT
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find dist -name "scriba-*" -type f -exec cp {} release/ \;
+
+      - name: Compute macOS checksums
+        id: sums
+        run: |
+          cd release
+          echo "macos_x86_sha=$(shasum -a 256 scriba-x86_64-apple-darwin | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+          echo "macos_arm_sha=$(shasum -a 256 scriba-aarch64-apple-darwin | cut -d' ' -f1)" >> $GITHUB_OUTPUT
 
       - name: Update Homebrew formula in main repo
         run: |
@@ -130,10 +135,10 @@ jobs:
             
             if Hardware::CPU.intel?
               url "https://github.com/giovannialberto/scriba/releases/download/v${{ steps.release.outputs.version }}/scriba-x86_64-apple-darwin"
-              sha256 "${{ steps.release.outputs.macos_x86_sha }}"
+              sha256 "${{ steps.sums.outputs.macos_x86_sha }}"
             else
               url "https://github.com/giovannialberto/scriba/releases/download/v${{ steps.release.outputs.version }}/scriba-aarch64-apple-darwin"
-              sha256 "${{ steps.release.outputs.macos_arm_sha }}"
+              sha256 "${{ steps.sums.outputs.macos_arm_sha }}"
             end
             
             def install
