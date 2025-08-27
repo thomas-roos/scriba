@@ -158,19 +158,24 @@ jobs:
           git push origin main
 
       - name: Update Homebrew tap repository
-        if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          # Clone the tap repository using PAT
-          git clone https://${{ secrets.HOMEBREW_TAP_TOKEN }}@github.com/giovannialberto/homebrew-scriba.git tap-repo
-          cd tap-repo
-          
-          # Copy the updated formula
-          mkdir -p Formula
-          cp ../Formula/scriba.rb Formula/scriba.rb
-          
-          # Commit and push to tap
-          git config user.email "action@github.com"
-          git config user.name "GitHub Action"
-          git add Formula/scriba.rb
-          git commit -m "chore(formula): update to v${{ steps.release.outputs.version }}"
-          git push origin main
+          if [ -n "${HOMEBREW_TAP_TOKEN}" ]; then
+            # Clone the tap repository using PAT
+            git clone https://${HOMEBREW_TAP_TOKEN}@github.com/giovannialberto/homebrew-scriba.git tap-repo
+            cd tap-repo
+            
+            # Copy the updated formula
+            mkdir -p Formula
+            cp ../Formula/scriba.rb Formula/scriba.rb
+            
+            # Commit and push to tap
+            git config user.email "action@github.com"
+            git config user.name "GitHub Action"
+            git add Formula/scriba.rb
+            git commit -m "chore(formula): update to v${{ steps.release.outputs.version }}"
+            git push origin main
+          else
+            echo "HOMEBREW_TAP_TOKEN not set; skipping external tap update."
+          fi
