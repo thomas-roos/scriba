@@ -1,6 +1,6 @@
 use crate::database::{Database, Recording, RecordingStats};
 use crate::record::record_with_control;
-use crate::transcribe::transcribe_file_silent;
+use crate::transcribe::transcribe_file_silent_with_mode;
 use crate::audio::CompressionSettings;
 use crate::config::{ScribaConfig, TranscriptionMode, LocalModelSize};
 use tokio::sync::mpsc;
@@ -188,8 +188,9 @@ impl Dashboard {
                                 // Start transcription
                                 let input_path = PathBuf::from(&recording_name);
                                 let input_path_clone = input_path.clone();
+                                let transcription_mode = self.config.transcription.clone();
                                 self.transcription_task = Some(tokio::spawn(async move {
-                                    transcribe_file_silent(&input_path_clone, Some(LocalModelSize::Turbo)).await
+                                    transcribe_file_silent_with_mode(&input_path_clone, Some(transcription_mode)).await
                                 }));
                             } else {
                                 // Recording only mode - complete
@@ -385,10 +386,10 @@ impl Dashboard {
             KeyCode::Down => {
                 self.next_recording();
             }
-            KeyCode::PageUp => {
+            KeyCode::PageUp | KeyCode::Char('[') => {
                 self.previous_page().await?;
             }
-            KeyCode::PageDown => {
+            KeyCode::PageDown | KeyCode::Char(']') => {
                 self.next_page().await?;
             }
             KeyCode::Enter => {
@@ -512,10 +513,17 @@ impl Dashboard {
     }
 
     async fn next_page(&mut self) -> Result<()> {
-        if self.recordings.len() == self.page_size {
-            self.current_page += 1;
+        // Try to load next page - if it has recordings, advance
+        let old_page = self.current_page;
+        self.current_page += 1;
+        self.load_recordings()?;
+        
+        // If no recordings found on next page, go back to previous page
+        if self.recordings.is_empty() {
+            self.current_page = old_page;
             self.load_recordings()?;
         }
+        
         Ok(())
     }
 
@@ -945,7 +953,11 @@ impl Dashboard {
                             // Toggle transcription mode
                             let new_mode = match &self.config.transcription {
                                 TranscriptionMode::Local { .. } => {
-                                    TranscriptionMode::Api { api_key: String::new() }
+                                    // Use preserved API key if available, otherwise empty
+                                    let api_key = self.config.last_api_key.as_ref()
+                                        .map(|key| key.clone())
+                                        .unwrap_or_else(String::new);
+                                    TranscriptionMode::Api { api_key }
                                 }
                                 TranscriptionMode::Api { .. } => {
                                     TranscriptionMode::Local { model_size: LocalModelSize::Medium }
@@ -1293,8 +1305,11 @@ impl Dashboard {
             let status = if recording.has_transcript { "[T]" } else { "[A]" };
             let created = recording.created_at.format("%m/%d %H:%M").to_string();
 
+            // Calculate global index across all pages
+            let global_index = (self.current_page * self.page_size) + i + 1;
+
             let cells = vec![
-                Cell::from((i + 1).to_string()),
+                Cell::from(global_index.to_string()),
                 Cell::from(status).style(
                     if recording.has_transcript {
                         Style::default().fg(Color::Green)
@@ -1325,7 +1340,11 @@ impl Dashboard {
                 Block::default()
                     .borders(Borders::ALL)
                     .style(Style::default().fg(Color::Cyan))
-                    .title("Recordings")
+                    .title({
+                        let start_index = (self.current_page * self.page_size) + 1;
+                        let end_index = start_index + self.recordings.len() - 1;
+                        format!("Recordings (Page {} - #{}-#{})", self.current_page + 1, start_index, end_index)
+                    })
             )
             .highlight_style(
                 Style::default()
@@ -1382,7 +1401,7 @@ impl Dashboard {
         let controls = if self.search_mode {
             "ESC: Cancel | ENTER: Search | Type to search..."
         } else {
-"↑↓: Navigate | ENTER: Transcript | P: Play | D/Del: Delete | /: Search | R/A/T: Quick Actions | S: Settings | H: Help | Q: Quit"
+"↑↓: Navigate | [/]: Pages | ENTER: Transcript | P: Play | D/Del: Delete | /: Search | R/A/T: Quick Actions | S: Settings | H: Help | Q: Quit"
         };
 
         let controls_paragraph = Paragraph::new(controls)
@@ -1429,7 +1448,7 @@ impl Dashboard {
             Line::from(""),
             Line::from("Navigation:"),
             Line::from("  ↑/↓        - Navigate recordings"),
-            Line::from("  PgUp/PgDn  - Change pages"),
+            Line::from("  PgUp/PgDn  - Change pages (or '['/']')"),
             Line::from("  Enter      - View transcript"),
             Line::from("  P          - Play recording"),
             Line::from(""),
@@ -1887,8 +1906,9 @@ impl Dashboard {
         
         // Start transcription in background task
         let input_path_clone = input_path.clone();
+        let transcription_mode = self.config.transcription.clone();
         self.transcription_task = Some(tokio::spawn(async move {
-            transcribe_file_silent(&input_path_clone, Some(LocalModelSize::Turbo)).await
+            transcribe_file_silent_with_mode(&input_path_clone, Some(transcription_mode)).await
         }));
         
         Ok(())
