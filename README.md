@@ -6,10 +6,13 @@ Modern CLI to record audio and transcribe it locally using Whisper via whisper-r
 
 - 🎙️ **Audio Recording** - High-quality microphone recording with smart MP3 compression
 - 📝 **Local Transcription** - Whisper.cpp engine via whisper-rs with progress indicators  
-- 📊 **Interactive Dashboard** - Browse, search, and manage recordings with live statistics
+- 📊 **Interactive Dashboard** - Browse, search, and manage recordings with model display
 - 🔍 **Full-Text Search** - Find recordings by searching transcript content
 - ▶️ **Audio Playback** - Play recordings directly from the dashboard
-- 📋 **Transcript Management** - Copy, view, and transcribe recordings with one keystroke
+- 📋 **Transcript Management** - Copy, view, re-transcribe, and manage recordings
+- 🏷️ **Model Tracking** - See which transcription model was used for each recording
+- 🔄 **Re-transcription** - Easily re-transcribe with different models from transcript view
+- 📁 **External Audio Import** - Import and transcribe external audio files
 
 ## 🚀 Quick Start
 
@@ -39,10 +42,14 @@ scriba
 # Record and transcribe in CLI (choose model)
 scriba record --model turbo
 scriba transcribe audio-file.wav --model large
+
+# Import external audio file for transcription
+scriba /path/to/audio/file.mp3
 ```
 
 ## 📊 Dashboard Controls
 
+### Main Dashboard
 | Key | Action |
 |-----|--------|
 | **R** | Record + Auto-transcribe |
@@ -54,6 +61,13 @@ scriba transcribe audio-file.wav --model large
 | **/** | Search transcripts |
 | **D** | Delete recording |
 | **H** | Show help |
+
+### Transcript View
+| Key | Action |
+|-----|--------|
+| **T** | Re-transcribe with current model |
+| **C** | Copy transcript to clipboard |
+| **Esc** | Return to dashboard |
 
 ## 🗂️ File Organization
 
@@ -83,9 +97,10 @@ Model selection
 ## 🎯 Key Benefits
 
 - **80-90% file size reduction** with speech-optimized MP3 compression
-- **Instant transcription** with animated progress indicators
-- **Seamless workflow** - record, transcribe, and manage from one interface
+- **Instant transcription** with animated progress indicators and model tracking
+- **Seamless workflow** - record, transcribe, re-transcribe, and manage from one interface
 - **Smart search** - find any recording by searching transcript text
+- **Model flexibility** - easily compare transcriptions using different Whisper models
 - **Cross-platform** - works on macOS, Linux, and Windows
 
 ## 📄 License
