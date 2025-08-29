@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use structopt::StructOpt;
-use scriba::record::record;
+use anyhow::Context;
+use scriba::record::{record, calculate_audio_duration};
 use scriba::transcribe::transcribe_file;
 use scriba::dashboard::Dashboard;
 use scriba::audio::{AudioFormat, CompressionSettings};
@@ -44,9 +45,9 @@ enum Command {
         api_key: Option<String>,
     },
     Transcribe {
-        #[structopt(parse(from_os_str), help = "Path to the input recording file or directory name")]
+        #[structopt(parse(from_os_str), help = "Path to existing recording directory name OR external audio file to import")]
         input: PathBuf,
-        #[structopt(short = "n", long = "name", help = "Optional name for the transcript (auto-generated if not provided)")]
+        #[structopt(short = "n", long = "name", help = "Display name for imported files (auto-generated if not provided)")]
         name: Option<String>,
         #[structopt(long = "local", help = "Force local transcription (overrides config)")]
         force_local: bool,
@@ -116,6 +117,118 @@ fn resolve_transcription_mode(
     
     // Use config default
     Ok(config.transcription.clone())
+}
+
+async fn import_audio_file(
+    input: PathBuf, 
+    name: Option<String>, 
+    force_local: bool, 
+    model: Option<LocalModelSize>, 
+    api_key: Option<String>
+) -> Result<()> {
+    use std::fs;
+    use chrono::{Local, Utc};
+    use scriba::database::{Database, Recording};
+    
+    // Check if input file exists
+    if !input.exists() {
+        return Err(anyhow::anyhow!("File not found: {}", input.display()));
+    }
+    
+    // Generate display name
+    let display_name = name.unwrap_or_else(|| {
+        input.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("imported_audio")
+            .to_string()
+    });
+    
+    println!("📁 Importing audio file: {}", input.display());
+    println!("📝 Display name: {}", display_name);
+    
+    // Generate unique directory name based on timestamp
+    let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
+    let directory_name = format!("{}_{}", timestamp, display_name.replace(' ', "_"));
+    
+    // Create destination directory
+    let base_path = dirs::home_dir()
+        .context("Could not find home directory")?
+        .join("scriba_recordings");
+    let dest_dir = base_path.join(&directory_name);
+    fs::create_dir_all(&dest_dir)?;
+    
+    // Copy audio file to destination with standard name
+    let file_extension = input
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("wav");
+    let dest_file = dest_dir.join(format!("recording.{}", file_extension));
+    
+    println!("📂 Copying file to: {}", dest_file.display());
+    fs::copy(&input, &dest_file)
+        .with_context(|| format!("Failed to copy {} to {}", input.display(), dest_file.display()))?;
+    
+    // Insert into database
+    let mut db = Database::new()?;
+    let audio_format = file_extension.to_string();
+    let recording = Recording {
+        id: None,
+        directory_name: directory_name.clone(),
+        display_name: Some(display_name.clone()),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        duration_seconds: {
+            // Calculate duration from the copied file
+            match calculate_audio_duration(&dest_file, 44100, 2) {
+                Ok(duration) => Some(duration),
+                Err(_) => None, // Fallback to None if calculation fails
+            }
+        },
+        file_size_bytes: None,  // TODO: We could get file size
+        audio_format,
+        sample_rate: 44100, // Default value
+        channels: 2,       // Default value
+        has_transcript: false,
+        transcript_status: "pending".to_string(),
+        language_code: "auto".to_string(),
+        model_used: "whisper".to_string(),
+        tags: None,
+        summary: None,
+        key_points: None,
+        action_items: None,
+        speakers: None,
+        sentiment_score: None,
+        search_index: None,
+        categories: None,
+        confidence_score: None,
+        audio_path: format!("recording.{}", file_extension),
+        transcript_path: None,
+    };
+    
+    let recording_id = db.insert_recording(&recording)
+        .with_context(|| "Failed to insert recording into database")?;
+    
+    println!("✅ File imported to database with ID: {}", recording_id);
+    
+    // Load config and resolve transcription mode
+    let config = ScribaConfig::load()?;
+    let transcription_mode = resolve_transcription_mode(
+        force_local,
+        model,
+        api_key,
+        &config,
+    )?;
+    
+    // Start transcription - pass just the directory name, not the full path
+    println!("📝 Starting transcription...");
+    let directory_path = PathBuf::from(&directory_name);
+    transcribe_file(&directory_path, &directory_path, Some(transcription_mode)).await
+        .with_context(|| "Transcription failed")?;
+    
+    println!("🎉 Import and transcription complete!");
+    println!("📁 Files saved in: ~/scriba_recordings/{}/", directory_name);
+    
+    Ok(())
 }
 
 fn print_banner() {
@@ -306,7 +419,7 @@ async fn main() -> Result<()> {
             // Launch dashboard directly
             println!("\n╭─ SCRIBA DASHBOARD ─────────────────────────────────────╮");
             println!("│ Launching dashboard interface...                       │");
-            println!("╰───────────────────────────────────────────────────────╯\n");
+            println!("╰────────────────────────────────────────────────────────╯\n");
             
             match Dashboard::new() {
                 Ok(mut dashboard) => {
@@ -378,28 +491,37 @@ async fn main() -> Result<()> {
                     record_result
                 }
                 Command::Transcribe { input, name, force_local, model, api_key } => {
-                    // Generate automatic transcript filename if needed
-                    let output = if let Some(n) = name {
-                        let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
-                        let sanitized = n.replace(' ', "-").replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
-                        PathBuf::from(format!("{}_{}_transcript", timestamp, sanitized))
+                    // Detect if input is an external audio file (import + transcribe) or existing recording directory
+                    if input.is_file() && input.extension().is_some() {
+                        // External audio file - import and transcribe
+                        println!("📁 Detected external audio file, importing and transcribing...");
+                        import_audio_file(input, name, force_local, model, api_key).await
                     } else {
-                        let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
-                        PathBuf::from(format!("{}_transcript", timestamp))
-                    };
-                    
-                    // Load config and resolve transcription mode
-                    let config = ScribaConfig::load()?;
-                    let transcription_mode = resolve_transcription_mode(
-                        force_local,
-                        model,
-                        api_key,
-                        &config,
-                    )?;
-                    
-                    // Transcribe the specified file
-                    let transcription = transcribe_file(&input, &output, Some(transcription_mode)).await;
-                    transcription
+                        // Existing recording directory - transcribe only
+                        println!("📝 Transcribing existing recording...");
+                        
+                        // Generate automatic transcript filename if needed
+                        let output = if let Some(n) = name {
+                            let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
+                            let sanitized = n.replace(' ', "-").replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
+                            PathBuf::from(format!("{}_{}_transcript", timestamp, sanitized))
+                        } else {
+                            let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
+                            PathBuf::from(format!("{}_transcript", timestamp))
+                        };
+                        
+                        // Load config and resolve transcription mode
+                        let config = ScribaConfig::load()?;
+                        let transcription_mode = resolve_transcription_mode(
+                            force_local,
+                            model,
+                            api_key,
+                            &config,
+                        )?;
+                        
+                        // Transcribe the specified file
+                        transcribe_file(&input, &output, Some(transcription_mode)).await
+                    }
                 }
                 Command::Config { cmd } => {
                     match cmd {

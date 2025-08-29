@@ -1,6 +1,7 @@
 use crate::database::{Database, Recording, RecordingStats};
 use crate::record::record_with_control;
 use crate::transcribe::transcribe_file_silent_with_mode;
+use crate::record::calculate_audio_duration;
 use crate::audio::CompressionSettings;
 use crate::config::{ScribaConfig, TranscriptionMode, LocalModelSize};
 use tokio::sync::mpsc;
@@ -28,6 +29,7 @@ const ASCII_ART: &str = r#" ███████  ██████ ███�
      ██ ██      ██   ██ ██ ██   ██ ██   ██ 
 ███████  ██████ ██   ██ ██ ██████  ██   ██"#;
 use std::path::PathBuf;
+use std::fs;
 use std::time::Duration;
 use chrono::Local;
 use tokio::process::Command as TokioCommand;
@@ -69,6 +71,11 @@ pub struct Dashboard {
     editing_api_key: bool, // Whether we're editing API key
     api_key_input: String, // API key input buffer
     return_to_view: Option<DashboardView>, // View to return to after message dismissal
+    // File import dialog state
+    show_file_dialog: bool,
+    file_path_input: String,
+    file_name_input: String,
+    file_dialog_stage: FileDialogStage, // Current stage of file import process
 }
 
 #[derive(Debug, PartialEq)]
@@ -78,9 +85,14 @@ enum DashboardView {
     Settings,
 }
 
+#[derive(Debug, PartialEq)]
+enum FileDialogStage {
+    FilePath,  // Asking for file path
+    FileName,  // Asking for display name (optional)
+}
+
 #[derive(Debug, Clone)]
 enum RecordingMode {
-    RecordOnly,
     RecordAndTranscribe,
 }
 
@@ -89,7 +101,7 @@ enum DashboardAction {
     Continue,
     Quit,
     RecordAndTranscribe,
-    RecordOnly,
+    AddExternalFile,
     TranscribeSelected,
 }
 
@@ -134,6 +146,11 @@ impl Dashboard {
             editing_api_key: false,
             api_key_input: String::new(),
             return_to_view: None,
+            // File import dialog state
+            show_file_dialog: false,
+            file_path_input: String::new(),
+            file_name_input: String::new(),
+            file_dialog_stage: FileDialogStage::FilePath,
         })
     }
 
@@ -320,6 +337,10 @@ impl Dashboard {
             return Ok(DashboardAction::Continue);
         }
         
+        if self.show_file_dialog {
+            return self.handle_file_dialog_keys(key_code).await;
+        }
+        
         if self.show_message {
             // Don't close message if progress animation is active
             if self.progress_animation.is_none() && matches!(key_code, KeyCode::Esc) {
@@ -371,7 +392,7 @@ impl Dashboard {
                 return Ok(DashboardAction::RecordAndTranscribe);
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                return Ok(DashboardAction::RecordOnly);
+                return Ok(DashboardAction::AddExternalFile);
             }
             KeyCode::Char('t') | KeyCode::Char('T') => {
                 return Ok(DashboardAction::TranscribeSelected);
@@ -427,8 +448,8 @@ impl Dashboard {
             DashboardAction::RecordAndTranscribe => {
                 self.execute_record_and_transcribe().await?;
             }
-            DashboardAction::RecordOnly => {
-                self.execute_record_only().await?;
+            DashboardAction::AddExternalFile => {
+                self.execute_add_external_file().await?;
             }
             DashboardAction::TranscribeSelected => {
                 self.execute_transcribe_selected().await?;
@@ -1063,6 +1084,92 @@ impl Dashboard {
         Ok(DashboardAction::Continue)
     }
 
+    async fn handle_file_dialog_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
+        match key_code {
+            KeyCode::Esc => {
+                // Cancel file import
+                self.show_file_dialog = false;
+                self.file_path_input.clear();
+                self.file_name_input.clear();
+                self.file_dialog_stage = FileDialogStage::FilePath;
+                Ok(DashboardAction::Continue)
+            }
+            KeyCode::Enter => {
+                match self.file_dialog_stage {
+                    FileDialogStage::FilePath => {
+                        // Validate file path
+                        if self.file_path_input.trim().is_empty() {
+                            self.message = "❌ Please enter a file path".to_string();
+                            self.show_message = true;
+                            self.return_to_view = Some(DashboardView::Main);
+                            self.show_file_dialog = false;
+                            return Ok(DashboardAction::Continue);
+                        }
+                        
+                        // Check if file exists
+                        let file_path = PathBuf::from(self.file_path_input.trim());
+                        if !file_path.exists() {
+                            self.message = "❌ File not found. Please check the path.".to_string();
+                            self.show_message = true;
+                            self.return_to_view = Some(DashboardView::Main);
+                            self.show_file_dialog = false;
+                            return Ok(DashboardAction::Continue);
+                        }
+                        
+                        // Move to name input stage
+                        self.file_dialog_stage = FileDialogStage::FileName;
+                        // Pre-fill with file stem as default name
+                        if let Some(stem) = file_path.file_stem().and_then(|s| s.to_str()) {
+                            self.file_name_input = stem.to_string();
+                        }
+                    }
+                    FileDialogStage::FileName => {
+                        // Use file name or default to file stem
+                        let display_name = if self.file_name_input.trim().is_empty() {
+                            let file_path = PathBuf::from(self.file_path_input.trim());
+                            file_path.file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("imported_audio")
+                                .to_string()
+                        } else {
+                            self.file_name_input.trim().to_string()
+                        };
+                        
+                        // Start import process
+                        self.show_file_dialog = false;
+                        self.start_file_import(self.file_path_input.clone(), display_name).await?;
+                    }
+                }
+                Ok(DashboardAction::Continue)
+            }
+            KeyCode::Char(c) => {
+                // Add character to current input
+                match self.file_dialog_stage {
+                    FileDialogStage::FilePath => {
+                        self.file_path_input.push(c);
+                    }
+                    FileDialogStage::FileName => {
+                        self.file_name_input.push(c);
+                    }
+                }
+                Ok(DashboardAction::Continue)
+            }
+            KeyCode::Backspace => {
+                // Remove character from current input
+                match self.file_dialog_stage {
+                    FileDialogStage::FilePath => {
+                        self.file_path_input.pop();
+                    }
+                    FileDialogStage::FileName => {
+                        self.file_name_input.pop();
+                    }
+                }
+                Ok(DashboardAction::Continue)
+            }
+            _ => Ok(DashboardAction::Continue)
+        }
+    }
+
     async fn perform_delete_recording(&mut self, recording: Recording) -> Result<()> {
         if let Some(id) = recording.id {
             match self.db.delete_recording(id) {
@@ -1224,6 +1331,11 @@ impl Dashboard {
     fn render_main_dashboard(&mut self, f: &mut Frame) {
         let size = f.size();
 
+        if self.show_file_dialog {
+            self.render_file_dialog_popup(f, size);
+            return;
+        }
+        
         if self.show_message {
             self.render_message_popup(f, size);
             return;
@@ -1443,7 +1555,7 @@ impl Dashboard {
             Line::from(""),
             Line::from("Quick Actions:"),
             Line::from("  R          - Record Audio + Auto-Transcribe (Esc to stop)"),
-            Line::from("  A          - Record Audio Only (Esc to stop)"),
+            Line::from("  A          - Add External Audio File & Transcribe"),
             Line::from("  T          - Transcribe Selected Recording"),
             Line::from(""),
             Line::from("Navigation:"),
@@ -1817,7 +1929,7 @@ impl Dashboard {
         Ok(())
     }
     
-    async fn execute_record_only(&mut self) -> Result<()> {
+    async fn execute_add_external_file(&mut self) -> Result<()> {
         // Check if already recording or transcribing
         if self.recording_task.is_some() || self.transcription_task.is_some() {
             self.message = "⚠️ Recording or transcription already in progress".to_string();
@@ -1825,15 +1937,112 @@ impl Dashboard {
             return Ok(());
         }
         
-        // Show immediate progress animation
-        self.progress_animation = Some("🎙️ Recording... (Press Esc to stop)".to_string());
+        // Show file dialog for importing audio file
+        self.show_file_dialog = true;
+        self.file_dialog_stage = FileDialogStage::FilePath;
+        self.file_path_input.clear();
+        self.file_name_input.clear();
+        
+        Ok(())
+    }
+    
+    async fn start_file_import(&mut self, file_path: String, display_name: String) -> Result<()> {
+        use dirs::home_dir;
+        use chrono::Utc;
+        use crate::database::Recording;
+        
+        // Show progress message
+        self.progress_animation = Some(format!("📁 Importing: {}", display_name));
         self.progress_frame = 0;
         self.show_message = true;
-        self.recording_mode = Some(RecordingMode::RecordOnly);
         
-        // Generate filename and start recording task
-        let recording_name = self.generate_filename(None); // No name prompt for now
-        self.start_recording_task(recording_name).await?;
+        let source_path = PathBuf::from(file_path.trim());
+        
+        // Generate unique directory name based on timestamp
+        let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
+        let directory_name = format!("{}_{}", timestamp, display_name.replace(' ', "_"));
+        
+        // Create destination directory
+        let base_path = home_dir()
+            .context("Could not find home directory")?
+            .join("scriba_recordings");
+        let dest_dir = base_path.join(&directory_name);
+        fs::create_dir_all(&dest_dir)?;
+        
+        // Copy audio file to destination with standard name
+        let file_extension = source_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("wav");
+        let dest_file = dest_dir.join(format!("recording.{}", file_extension));
+        
+        // Copy the file
+        if let Err(e) = fs::copy(&source_path, &dest_file) {
+            self.message = format!("❌ Failed to copy file: {}", e);
+            self.show_message = true;
+            self.stop_progress_animation();
+            return Ok(());
+        }
+        
+        // Insert into database
+        let audio_format = file_extension.to_string();
+        let recording = Recording {
+            id: None,
+            directory_name: directory_name.clone(),
+            display_name: Some(display_name.clone()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            duration_seconds: {
+                // Calculate duration from the copied file
+                match calculate_audio_duration(&dest_file, 44100, 2) {
+                    Ok(duration) => Some(duration),
+                    Err(_) => None, // Fallback to None if calculation fails
+                }
+            },
+            file_size_bytes: None,  // TODO: We could get file size
+            audio_format,
+            sample_rate: 44100, // Default value
+            channels: 2,       // Default value
+            has_transcript: false,
+            transcript_status: "pending".to_string(),
+            language_code: "auto".to_string(),
+            model_used: "whisper".to_string(),
+            tags: None,
+            summary: None,
+            key_points: None,
+            action_items: None,
+            speakers: None,
+            sentiment_score: None,
+            search_index: None,
+            categories: None,
+            confidence_score: None,
+            audio_path: format!("recording.{}", file_extension),
+            transcript_path: None,
+        };
+        
+        let _recording_id = match self.db.insert_recording(&recording) {
+            Ok(id) => {
+                self.message = format!("✅ File imported: {}", display_name);
+                id
+            }
+            Err(e) => {
+                self.message = format!("❌ Database error: {}", e);
+                self.show_message = true;
+                self.stop_progress_animation();
+                return Ok(());
+            }
+        };
+        
+        // Update progress message for transcription
+        self.progress_animation = Some(format!("📝 Transcribing: {}", display_name));
+        
+        // Start transcription task - pass just the directory name, not the full path
+        let directory_name_clone = directory_name.clone();
+        let transcription_mode = self.config.transcription.clone();
+        self.transcription_task = Some(tokio::spawn(async move {
+            let directory_path = PathBuf::from(directory_name_clone);
+            transcribe_file_silent_with_mode(&directory_path, Some(transcription_mode)).await
+        }));
         
         Ok(())
     }
@@ -2181,5 +2390,74 @@ impl Dashboard {
         }));
         
         Ok(())
+    }
+
+    fn render_file_dialog_popup(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        let popup_area = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(25),
+                Constraint::Length(12),
+                Constraint::Percentage(65),
+            ])
+            .split(area)[1];
+
+        let popup_area = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(15),
+                Constraint::Percentage(70),
+                Constraint::Percentage(15),
+            ])
+            .split(popup_area)[1];
+
+        f.render_widget(Clear, popup_area);
+        
+        let (title, prompt, current_input, hint) = match self.file_dialog_stage {
+            FileDialogStage::FilePath => (
+                "Import Audio File - Step 1/2",
+                "Enter the full path to the audio file:",
+                &self.file_path_input,
+                "Example: /path/to/your/audio.mp3 or ~/Downloads/recording.wav"
+            ),
+            FileDialogStage::FileName => (
+                "Import Audio File - Step 2/2",
+                "Enter a display name for this recording:",
+                &self.file_name_input,
+                "This name will be shown in your recordings list"
+            ),
+        };
+        
+        let content = vec![
+            Line::from(vec![
+                Span::styled(prompt, Style::default().fg(Color::White)),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Input: ", Style::default().fg(Color::Green)),
+                Span::styled(format!("{}_", current_input), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(hint, Style::default().fg(Color::Gray)),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Press ENTER to continue, ESC to cancel", Style::default().fg(Color::Blue)),
+            ]),
+        ];
+
+        let dialog_paragraph = Paragraph::new(content)
+            .style(Style::default().fg(Color::White))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                    .border_style(Style::default().fg(Color::Cyan))
+            )
+            .wrap(Wrap { trim: true });
+
+        f.render_widget(dialog_paragraph, popup_area);
     }
 }
