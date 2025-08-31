@@ -15,9 +15,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: macos-14
+          - os: macos-latest
             target: x86_64-apple-darwin
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
@@ -37,19 +37,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libssl-dev pkg-config
 
-      - name: Build (aarch64 macOS, force no i8mm)
-        if: matrix.target == 'aarch64-apple-darwin'
-        env:
-          # Disable GGML i8mm (ARMv8.6) which is not available on all Apple Silicon runners
-          CFLAGS: -DGGML_CPU_USE_I8MM=0 -DGGML_NATIVE=0 -U__ARM_FEATURE_MATMUL_INT8
-          CXXFLAGS: -DGGML_CPU_USE_I8MM=0 -DGGML_NATIVE=0 -U__ARM_FEATURE_MATMUL_INT8
-          # Also pass through potential cmake args used by whisper-rs/ggml build scripts
-          WHISPER_CMAKE_ARGS: -DGGML_CPU_USE_I8MM=OFF -DGGML_NATIVE=OFF
-          GGML_CMAKE_ARGS: -DGGML_CPU_USE_I8MM=OFF -DGGML_NATIVE=OFF
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build (default)
-        if: matrix.target != 'aarch64-apple-darwin'
+      - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
@@ -94,7 +82,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: release/*
-          body_path: RELEASE_NOTES.md
+          generate_release_notes: true
           draft: false
           prerelease: false
         env:
