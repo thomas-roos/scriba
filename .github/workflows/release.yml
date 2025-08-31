@@ -38,6 +38,9 @@ jobs:
           sudo apt-get install -y libasound2-dev libssl-dev pkg-config
 
       - name: Build
+        env:
+          CMAKE_C_FLAGS: ${{ matrix.target == 'aarch64-apple-darwin' && '-U__ARM_FEATURE_MATMUL_INT8' || '' }}
+          CMAKE_CXX_FLAGS: ${{ matrix.target == 'aarch64-apple-darwin' && '-U__ARM_FEATURE_MATMUL_INT8' || '' }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
