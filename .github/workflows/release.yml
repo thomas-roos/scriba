@@ -37,12 +37,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libssl-dev pkg-config
 
-      - name: Build (aarch64 macOS, disable i8mm)
+      - name: Build (aarch64 macOS, force no i8mm)
         if: matrix.target == 'aarch64-apple-darwin'
         env:
           # Disable GGML i8mm (ARMv8.6) which is not available on all Apple Silicon runners
-          CFLAGS: -DGGML_CPU_USE_I8MM=0 -DGGML_NATIVE=0
-          CXXFLAGS: -DGGML_CPU_USE_I8MM=0 -DGGML_NATIVE=0
+          CFLAGS: -DGGML_CPU_USE_I8MM=0 -DGGML_NATIVE=0 -U__ARM_FEATURE_MATMUL_INT8
+          CXXFLAGS: -DGGML_CPU_USE_I8MM=0 -DGGML_NATIVE=0 -U__ARM_FEATURE_MATMUL_INT8
           # Also pass through potential cmake args used by whisper-rs/ggml build scripts
           WHISPER_CMAKE_ARGS: -DGGML_CPU_USE_I8MM=OFF -DGGML_NATIVE=OFF
           GGML_CMAKE_ARGS: -DGGML_CPU_USE_I8MM=OFF -DGGML_NATIVE=OFF
