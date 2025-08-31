@@ -1,8 +1,7 @@
 use crate::config::{LocalModelSize, ScribaConfig, TranscriptionMode};
 use crate::database::Database;
+use crate::utils::BASE_PATH;
 use anyhow::{Context, Result};
-use dirs::home_dir;
-use lazy_static::lazy_static;
 use std::ffi::{c_char, c_void};
 use std::io::stdout;
 use std::io::Write;
@@ -10,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
-use unicode_width::UnicodeWidthStr;
+// use unicode_width::UnicodeWidthStr; // no longer used (typing effect removed)
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 extern "C" {
     fn whisper_log_set(
@@ -26,12 +25,6 @@ use reqwest::{
 use serde_json::Value;
 use std::process::Command;
 
-lazy_static! {
-    static ref BASE_PATH: PathBuf = home_dir()
-        .expect("error home dir")
-        .join("scriba_recordings");
-}
-
 static INIT_WHISPER_LOG: Once = Once::new();
 
 unsafe extern "C" fn discard_whisper_log(_level: i32, _text: *const c_char, _ud: *mut c_void) {
@@ -44,24 +37,23 @@ fn ensure_whisper_logs_suppressed() {
     });
 }
 
-// Canonical persistence for transcripts + DB update used by CLI and TUI (API/local)
+// Persist transcript to a single file (transcript.txt) and update DB
 fn save_transcript_to_files_and_db(
     audio_path: &Path,
     transcript_text: &str,
     model_used: &str,
 ) -> Result<()> {
-    // Write transcript.txt (canonical)
+    // Write transcript.txt
     let audio_dir = audio_path
         .parent()
         .context("Could not determine audio file directory")?;
     let transcript_file_path = audio_dir.join("transcript.txt");
-    std::fs::write(&transcript_file_path, transcript_text)
-        .with_context(|| format!("Failed to write transcript to {}", transcript_file_path.display()))?;
-
-    // Maintain legacy recording.txt for backward compatibility
-    let recording_file_path = audio_dir.join("recording.txt");
-    std::fs::write(&recording_file_path, transcript_text)
-        .with_context(|| format!("Failed to write transcript to {}", recording_file_path.display()))?;
+    std::fs::write(&transcript_file_path, transcript_text).with_context(|| {
+        format!(
+            "Failed to write transcript to {}",
+            transcript_file_path.display()
+        )
+    })?;
 
     // Update database
     let mut db = Database::new().context("Failed to connect to database")?;
@@ -149,49 +141,6 @@ impl TranscriptionProgress {
     }
 }
 
-async fn show_transcription_typing_effect(text: &str) {
-    const BOX_WIDTH: usize = 58;
-    const CONTENT_WIDTH: usize = BOX_WIDTH - 4; // Account for "│ " and " │"
-
-    println!("\n╭─ TRANSCRIPTION RESULT ─────────────────────────────────╮");
-
-    // Split text into words and wrap properly
-    let words: Vec<&str> = text.split_whitespace().collect();
-    let mut current_line = String::new();
-    let mut lines = Vec::new();
-
-    for word in words {
-        if current_line.is_empty() {
-            current_line = word.to_string();
-        } else {
-            let test_line = format!("{} {}", current_line, word);
-            if test_line.width() <= CONTENT_WIDTH {
-                current_line = test_line;
-            } else {
-                lines.push(current_line);
-                current_line = word.to_string();
-            }
-        }
-    }
-    if !current_line.is_empty() {
-        lines.push(current_line);
-    }
-
-    // Show completion message without typewriter delay
-    let success_msg = "✅ Transcription completed successfully!";
-    let success_width = success_msg.width();
-    let success_padding = CONTENT_WIDTH.saturating_sub(success_width);
-    println!("│ {}{} │", success_msg, " ".repeat(success_padding));
-
-    println!("│{}  │", " ".repeat(CONTENT_WIDTH));
-
-    let dashboard_msg = "📋 Use dashboard to view and copy transcripts";
-    let dashboard_width = dashboard_msg.width();
-    let dashboard_padding = CONTENT_WIDTH.saturating_sub(dashboard_width);
-    println!("│ {}{} │", dashboard_msg, " ".repeat(dashboard_padding));
-
-    println!("╰────────────────────────────────────────────────────────╯");
-}
 
 fn find_ffmpeg() -> Result<String> {
     let possible_paths = [
@@ -319,111 +268,58 @@ fn resolve_audio_path(input_path: &PathBuf) -> Result<PathBuf> {
     }
 }
 
-// Silent transcription function for TUI usage (no stdout prints)
-pub async fn transcribe_file_silent_with_mode(
+/// Unified transcription function. Handles local vs API and verbose vs silent modes.
+pub async fn transcribe_audio(
     input_path: &PathBuf,
     mode_override: Option<TranscriptionMode>,
+    verbose: bool,
 ) -> Result<(), anyhow::Error> {
-    // Suppress any whisper/ggml logs globally to avoid interfering with TUI
-    ensure_whisper_logs_suppressed();
+    if !verbose {
+        ensure_whisper_logs_suppressed();
+    }
 
     let audio_file_path = resolve_audio_path(input_path)?;
-
-    // Determine which transcription mode to use
     let config = ScribaConfig::load()?;
     let transcription_mode = mode_override.unwrap_or_else(|| config.transcription.clone());
 
-    match transcription_mode {
-        TranscriptionMode::Local { model_size } => {
-            transcribe_file_silent_local(input_path, Some(model_size)).await
-        }
-        TranscriptionMode::Api { api_key } => {
-            transcribe_with_openai_api_silent(&audio_file_path, &api_key).await
-        }
-    }
-}
-
-pub async fn transcribe_file_silent_local(
-    input_path: &PathBuf,
-    model: Option<LocalModelSize>,
-) -> Result<(), anyhow::Error> {
-    // Suppress any whisper/ggml logs globally to avoid interfering with TUI
-    ensure_whisper_logs_suppressed();
-
-    let audio_file_path = resolve_audio_path(input_path)?;
-    let tmp_wav = ensure_mono_16k_wav(&audio_file_path)?;
-    let model_choice = model.unwrap_or(LocalModelSize::Turbo);
-
-    // Add timeout wrapper for model operations
-    let download_future = download_model_with_timeout(model_choice);
-    let model_path = tokio::time::timeout(Duration::from_secs(300), download_future)
-        .await
-        .context("Model download timed out after 5 minutes")?
-        .context("Failed to download model")?;
-
-    let transcript = run_whisper_transcription(&model_path, &tmp_wav)?;
-
-    // Clean up temporary wav file
-    if tmp_wav.file_name() == Some(std::ffi::OsStr::new("_tmp_whisper_16k.wav")) {
-        let _ = std::fs::remove_file(&tmp_wav);
-    }
-
-    // Persist consistently and update DB/model
-    let model_name = format!("whisper-{}", model_choice);
-    save_transcript_to_files_and_db(&audio_file_path, &transcript, &model_name)?;
-
-    Ok(())
-}
-
-// Enhanced transcription function with delightful UX and dual mode support
-pub async fn transcribe_file(
-    input_path: &PathBuf,
-    _output_path: &PathBuf,
-    mode_override: Option<TranscriptionMode>,
-) -> Result<(), anyhow::Error> {
-    let audio_file_path = resolve_audio_path(input_path)?;
-
-    // Determine which transcription mode to use
-    let config = ScribaConfig::load()?;
-    let transcription_mode = mode_override.unwrap_or_else(|| config.transcription.clone());
-
-    // Create progress indicator
     let progress = TranscriptionProgress::new();
 
-    // Show initial progress with mode-specific message
-    let mode_description = match &transcription_mode {
-        TranscriptionMode::Local { model_size } => {
-            format!(
-                "🎤 → 📝 Transcribing locally using Whisper {} model...",
-                model_size
-            )
-        }
-        TranscriptionMode::Api { .. } => {
-            "🎤 → ☁️ Transcribing using OpenAI Whisper API...".to_string()
-        }
-    };
-    println!("\n{}\n", mode_description);
+    if verbose {
+        let mode_description = match &transcription_mode {
+            TranscriptionMode::Local { model_size } => {
+                format!(
+                    "🎤 → 📝 Transcribing locally using Whisper {} model...",
+                    model_size
+                )
+            }
+            TranscriptionMode::Api { .. } => {
+                "🎤 → ☁️ Transcribing using OpenAI Whisper API...".to_string()
+            }
+        };
+        println!("\n{}\n", mode_description);
+    }
 
     let (transcription_text, model_used) = match transcription_mode {
         TranscriptionMode::Local { model_size } => {
-            // Start the progress animation for local mode
-            let mut local_progress = progress;
-            let progress_task = tokio::spawn(async move {
-                loop {
-                    let message = match local_progress.start_time.elapsed().as_secs() {
-                        0..=3 => Some("Preparing audio (16kHz mono)"),
-                        4..=8 => Some("Loading Whisper model"),
-                        9..=25 => Some("Running local transcription"),
-                        _ => Some("Almost there, hang tight"),
-                    };
-                    local_progress.show_progress(message).await;
-                }
-            });
+            let progress_task = if verbose {
+                let mut local_progress = progress;
+                Some(tokio::spawn(async move {
+                    loop {
+                        let message = match local_progress.start_time.elapsed().as_secs() {
+                            0..=3 => Some("Preparing audio (16kHz mono)"),
+                            4..=8 => Some("Loading Whisper model"),
+                            9..=25 => Some("Running local transcription"),
+                            _ => Some("Almost there, hang tight"),
+                        };
+                        local_progress.show_progress(message).await;
+                    }
+                }))
+            } else {
+                None
+            };
 
-            // Prepare audio and model
             let wav_path = ensure_mono_16k_wav(&audio_file_path)
                 .context("Failed to prepare 16kHz mono WAV for transcription")?;
-
             let model_path = {
                 let download_future = download_model_with_timeout(model_size);
                 tokio::time::timeout(Duration::from_secs(300), download_future)
@@ -431,68 +327,68 @@ pub async fn transcribe_file(
                     .context("Model download timed out after 5 minutes")?
                     .context("Failed to download model")?
             };
-
-            // Run local transcription
             let result = run_whisper_transcription(&model_path, &wav_path)
                 .context("Local Whisper transcription failed")?;
-
-            // Clean up temporary wav file
             if wav_path.file_name() == Some(std::ffi::OsStr::new("_tmp_whisper_16k.wav")) {
                 let _ = std::fs::remove_file(&wav_path);
             }
-
-            progress_task.abort();
+            if let Some(task) = progress_task {
+                task.abort();
+            }
             let model_name = format!("whisper-{}", model_size);
             (result, model_name)
         }
         TranscriptionMode::Api { api_key } => {
-            // Start the progress animation for API mode
-            let mut api_progress = progress;
-            let progress_task = tokio::spawn(async move {
-                loop {
-                    let message = match api_progress.start_time.elapsed().as_secs() {
-                        0..=3 => Some("Uploading audio file"),
-                        4..=8 => Some("OpenAI is processing your audio"),
-                        9..=15 => Some("Converting speech to text"),
-                        16..=25 => Some("This is taking longer than usual"),
-                        _ => Some("Almost there, hang tight"),
-                    };
-                    api_progress.show_progress(message).await;
-                }
-            });
+            let progress_task = if verbose {
+                let mut api_progress = progress;
+                Some(tokio::spawn(async move {
+                    loop {
+                        let message = match api_progress.start_time.elapsed().as_secs() {
+                            0..=3 => Some("Uploading audio file"),
+                            4..=8 => Some("OpenAI is processing your audio"),
+                            9..=15 => Some("Converting speech to text"),
+                            16..=25 => Some("This is taking longer than usual"),
+                            _ => Some("Almost there, hang tight"),
+                        };
+                        api_progress.show_progress(message).await;
+                    }
+                }))
+            } else {
+                None
+            };
 
             let result = transcribe_with_openai_api(&audio_file_path, &api_key)
                 .await
                 .context("OpenAI API transcription failed")?;
-
-            progress_task.abort();
+            if let Some(task) = progress_task {
+                task.abort();
+            }
             (result, "whisper-1".to_string())
         }
     };
 
-    // Clear progress line
-    print!("\r{}", " ".repeat(80));
-    print!("\r");
-    stdout().flush().unwrap();
+    if verbose {
+        print!("\r{}", " ".repeat(80));
+        print!("\r");
+        stdout().flush().unwrap();
+        println!("✨ Transcription complete! ✨");
+    }
 
-    // Show success animation
-    println!("✨ Transcription complete! ✨");
-
-    // Show the transcription with typing effect
-    show_transcription_typing_effect(&transcription_text).await;
-
-    // Save using the unified persistence helper
     save_transcript_to_files_and_db(&audio_file_path, &transcription_text, &model_used)?;
 
-    // Inform path written for CLI UX
-    let transcript_file_path = audio_file_path
-        .parent()
-        .context("Could not determine audio file directory")?
-        .join("transcript.txt");
-    println!("\n📁 Transcript saved to: {}", transcript_file_path.display());
+    if verbose {
+        let transcript_file_path = audio_file_path
+            .parent()
+            .context("Could not determine audio file directory")?
+            .join("transcript.txt");
+        println!("\n📁 Transcript saved to: {}", transcript_file_path.display());
+    }
 
     Ok(())
 }
+
+// Enhanced transcription function with delightful UX and dual mode support
+// Deprecated wrappers are removed in favor of `transcribe_audio`
 
 async fn transcribe_with_openai_api(audio_path: &PathBuf, api_key: &str) -> Result<String> {
     let audio_file = std::fs::read(audio_path).context("Unable to read audio file")?;
@@ -545,10 +441,7 @@ async fn transcribe_with_openai_api(audio_path: &PathBuf, api_key: &str) -> Resu
         .ok_or_else(|| anyhow::anyhow!("No 'text' field found in OpenAI response"))
 }
 
-async fn transcribe_with_openai_api_silent(audio_path: &PathBuf, api_key: &str) -> Result<()> {
-    let transcript_text = transcribe_with_openai_api(audio_path, api_key).await?;
-    save_transcript_to_files_and_db(audio_path, &transcript_text, "whisper-1")
-}
+// Silent variant covered by transcribe_audio(..., false)
 
 fn ensure_mono_16k_wav(input: &Path) -> Result<PathBuf> {
     // Always normalize using ffmpeg for simplicity and robustness
