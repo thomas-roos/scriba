@@ -37,7 +37,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libssl-dev pkg-config
 
-      - name: Build
+      - name: Build (aarch64 macOS with i8mm flags)
+        if: matrix.target == 'aarch64-apple-darwin'
+        env:
+          # Ensure C compilation enables Apple Silicon CPU features (i8mm) to match ggml intrinsics
+          CFLAGS: -mcpu=apple-m1
+          CXXFLAGS: -mcpu=apple-m1
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (default)
+        if: matrix.target != 'aarch64-apple-darwin'
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
