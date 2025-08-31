@@ -127,7 +127,8 @@ impl Database {
                 // Mark as initialized
                 tx.execute("PRAGMA user_version = 1", [])
                     .context("Failed to set user_version")?;
-                tx.commit().context("Failed to commit schema initialization")?;
+                tx.commit()
+                    .context("Failed to commit schema initialization")?;
             } else {
                 tx.commit().ok();
             }
@@ -148,10 +149,12 @@ impl Database {
         let ok: bool = self
             .conn
             .prepare("PRAGMA integrity_check")
-            .and_then(|mut stmt| stmt.query_row([], |row| {
-                let r: String = row.get(0)?;
-                Ok(r == "ok")
-            }))
+            .and_then(|mut stmt| {
+                stmt.query_row([], |row| {
+                    let r: String = row.get(0)?;
+                    Ok(r == "ok")
+                })
+            })
             .unwrap_or(true); // don't block initialization if pragma not available
         if !ok {
             // Try to rebuild FTS as this is a common source of corruption-like errors

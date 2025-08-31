@@ -1,9 +1,8 @@
 use crate::audio::CompressionSettings;
 use crate::config::{LocalModelSize, ScribaConfig, TranscriptionMode};
+use crate::core::WorkflowManager;
 use crate::database::{Database, Recording, RecordingStats};
-use crate::record::calculate_audio_duration;
-use crate::record::record_with_control;
-use crate::transcribe::transcribe_file_silent_with_mode;
+use crate::utils::generate_recording_name;
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
@@ -27,9 +26,7 @@ const ASCII_ART: &str = r#" ███████  ██████ ███�
      ██ ██      ██   ██ ██ ██   ██ ██   ██ 
 ███████  ██████ ██   ██ ██ ██████  ██   ██"#;
 use anyhow::Context;
-use chrono::Local;
 use dirs::home_dir;
-use std::fs;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -75,6 +72,7 @@ pub struct Dashboard {
     file_name_input: String,
     file_dialog_stage: FileDialogStage, // Current stage of file import process
     is_retranscribing: bool,            // Track if current transcription is a re-transcription
+    is_importing: bool,                 // Track if current task is import+transcribe
 }
 
 #[derive(Debug, PartialEq)]
@@ -151,6 +149,7 @@ impl Dashboard {
             file_name_input: String::new(),
             file_dialog_stage: FileDialogStage::FilePath,
             is_retranscribing: false,
+            is_importing: false,
         })
     }
 
@@ -215,15 +214,18 @@ impl Dashboard {
                                 self.progress_frame = 0;
 
                                 // Start transcription
-                                let input_path = PathBuf::from(&recording_name);
-                                let input_path_clone = input_path.clone();
+                                // Start auto-transcription using unified workflow
                                 let transcription_mode = self.config.transcription.clone();
+                                let recording_name_clone = recording_name.clone();
+
                                 self.transcription_task = Some(tokio::spawn(async move {
-                                    transcribe_file_silent_with_mode(
-                                        &input_path_clone,
-                                        Some(transcription_mode),
-                                    )
-                                    .await
+                                    let mut workflow = WorkflowManager::new().unwrap();
+                                    workflow
+                                        .retranscribe_recording_silent(
+                                            &recording_name_clone,
+                                            transcription_mode,
+                                        )
+                                        .await
                                 }));
                             } else {
                                 // Recording only mode - complete
@@ -258,11 +260,14 @@ impl Dashboard {
                             self.stop_progress_animation();
                             self.message = if self.is_retranscribing {
                                 "✅ Re-transcription complete!".to_string()
+                            } else if self.is_importing {
+                                "✅ Import and transcription complete!".to_string()
                             } else {
                                 "✅ Recording and transcription complete!".to_string()
                             };
                             self.show_message = true;
                             self.is_retranscribing = false;
+                            self.is_importing = false;
                             // Reload data to show updated transcript
                             let _ = self.load_recordings();
                             let _ = self.load_stats();
@@ -989,12 +994,28 @@ impl Dashboard {
                     self.transcript_content.clear();
                     self.transcript_scroll_offset = 0;
 
-                    // Start re-transcription
-                    let recording_path = PathBuf::from(&recording.directory_name);
+                    // Start re-transcription using unified workflow
                     let transcription_mode = self.config.transcription.clone();
+                    let directory_name = recording.directory_name.clone();
+                    let display_name = recording
+                        .display_name
+                        .as_ref()
+                        .unwrap_or(&recording.directory_name);
 
-                    self.message = "🔄 Re-transcribing recording...".to_string();
+                    // Clean up display name for UI (remove _recording suffix)
+                    let clean_display_name = if display_name == &recording.directory_name
+                        && display_name.ends_with("_recording")
+                    {
+                        display_name
+                            .strip_suffix("_recording")
+                            .unwrap_or(display_name)
+                    } else {
+                        display_name
+                    };
+
+                    self.message = "🔄 Re-transcribing...".to_string();
                     self.show_message = true;
+
                     let model_info = match &self.config.transcription {
                         crate::config::TranscriptionMode::Local { model_size } => {
                             format!("Local ({})", model_size)
@@ -1003,21 +1024,16 @@ impl Dashboard {
                     };
                     self.progress_animation = Some(format!(
                         "🔄 Re-transcribing with {}: {}",
-                        model_info,
-                        recording
-                            .display_name
-                            .as_ref()
-                            .unwrap_or(&recording.directory_name)
+                        model_info, clean_display_name
                     ));
                     self.is_retranscribing = true;
 
-                    let input_path_clone = recording_path.clone();
+                    // Use unified workflow for re-transcription
                     self.transcription_task = Some(tokio::spawn(async move {
-                        transcribe_file_silent_with_mode(
-                            &input_path_clone,
-                            Some(transcription_mode),
-                        )
-                        .await
+                        let mut workflow = WorkflowManager::new().unwrap();
+                        workflow
+                            .retranscribe_recording_silent(&directory_name, transcription_mode)
+                            .await
                     }));
                 }
                 Ok(DashboardAction::Continue)
@@ -1344,29 +1360,20 @@ impl Dashboard {
             }
         }
 
-        // Fallback: try to load from file (check both possible filenames)
+        // Fallback: try to load from file (standard transcript.txt)
         let base_path = home_dir()
             .context("Could not find home directory")?
             .join("scriba_recordings");
         let recording_dir = base_path.join(&recording.directory_name);
 
-        // Try transcript.txt first (newer format)
+        // Try transcript.txt
         let transcript_path = recording_dir.join("transcript.txt");
         if transcript_path.exists() {
             return std::fs::read_to_string(&transcript_path)
                 .context("Failed to read transcript.txt file");
         }
 
-        // Try recording.txt (legacy format)
-        let recording_path = recording_dir.join("recording.txt");
-        if recording_path.exists() {
-            return std::fs::read_to_string(&recording_path)
-                .context("Failed to read recording.txt file");
-        }
-
-        Err(anyhow::anyhow!(
-            "No transcript file found (checked transcript.txt and recording.txt)"
-        ))
+        Err(anyhow::anyhow!("No transcript file found (expected transcript.txt)"))
     }
 
     fn wrap_text_to_lines(&self, text: &str, max_width: usize) -> Vec<String> {
@@ -1782,7 +1789,7 @@ impl Dashboard {
         f.render_widget(Clear, popup_area);
 
         let help_text = vec![
-            Line::from("🎵 SCRIBA - RECORDING LIBRARY WITH STATISTICS HELP 🎵"),
+            Line::from("🎵 SCRIBA - RECORDING ON STEROIDS HELP 🎵"),
             Line::from(""),
             Line::from("Quick Actions:"),
             Line::from("  R          - Record Audio + Auto-Transcribe (Esc to stop)"),
@@ -2072,14 +2079,13 @@ impl Dashboard {
             let end = std::cmp::min(actual_offset + content_height, total_lines);
 
             let visible_lines = wrapped_lines[actual_offset..end].join("\n");
-            let scroll_info = format!("📝 Transcript [Line {}/{}] - ↑↓/b/f/g/G: scroll, C: copy, T: re-transcribe, ESC: close", 
-                                    actual_offset + 1, 
+            let scroll_info = format!("📝 Transcript [Line {}/{}] - ↑↓/b/f/g/G: scroll, C: copy, T: re-transcribe, ESC: close",
+                                    actual_offset + 1,
                                     total_lines);
             (visible_lines, scroll_info)
         } else {
-            // Even if content fits vertically, still use wrapped lines to prevent horizontal overflow
             (
-                wrapped_lines.join("\n"),
+                self.transcript_content.clone(),
                 "📝 Transcript - C: copy, T: re-transcribe, ESC: close".to_string(),
             )
         };
@@ -2192,7 +2198,7 @@ impl Dashboard {
         self.recording_mode = Some(RecordingMode::RecordAndTranscribe);
 
         // Generate filename and start recording task (no name prompt, consistent with A command)
-        let recording_name = self.generate_filename(None);
+        let recording_name = generate_recording_name(None);
         self.start_recording_task(recording_name).await?;
 
         Ok(())
@@ -2216,110 +2222,26 @@ impl Dashboard {
     }
 
     async fn start_file_import(&mut self, file_path: String, display_name: String) -> Result<()> {
-        use crate::database::Recording;
-        use chrono::Utc;
-        use dirs::home_dir;
-
-        // Show progress message
-        self.progress_animation = Some(format!("📁 Importing: {}", display_name));
+        // Start animated progress and background task (non-blocking)
+        self.progress_animation = Some(format!("📁 Importing + transcribing: {}", display_name));
         self.progress_frame = 0;
         self.show_message = true;
+        self.is_importing = true;
 
         let source_path = PathBuf::from(file_path.trim());
-
-        // Generate unique directory name based on timestamp
-        let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
-        let directory_name = format!("{}_{}", timestamp, display_name.replace(' ', "_"));
-
-        // Create destination directory
-        let base_path = home_dir()
-            .context("Could not find home directory")?
-            .join("scriba_recordings");
-        let dest_dir = base_path.join(&directory_name);
-        fs::create_dir_all(&dest_dir)?;
-
-        // Copy audio file to destination with standard name
-        let file_extension = source_path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("wav");
-        let dest_file = dest_dir.join(format!("recording.{}", file_extension));
-
-        // Copy the file
-        if let Err(e) = fs::copy(&source_path, &dest_file) {
-            self.message = format!("❌ Failed to copy file: {}", e);
-            self.show_message = true;
-            self.stop_progress_animation();
-            return Ok(());
-        }
-
-        // Insert into database
-        let audio_format = file_extension.to_string();
-        let recording = Recording {
-            id: None,
-            directory_name: directory_name.clone(),
-            display_name: Some(display_name.clone()),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            duration_seconds: {
-                // Calculate duration from the copied file
-                match calculate_audio_duration(&dest_file, 44100, 2) {
-                    Ok(duration) => Some(duration),
-                    Err(_) => None, // Fallback to None if calculation fails
-                }
-            },
-            file_size_bytes: None, // TODO: We could get file size
-            audio_format,
-            sample_rate: 44100, // Default value
-            channels: 2,        // Default value
-            has_transcript: false,
-            transcript_status: "pending".to_string(),
-            language_code: "auto".to_string(),
-            model_used: "whisper".to_string(),
-            tags: None,
-            summary: None,
-            key_points: None,
-            action_items: None,
-            speakers: None,
-            sentiment_score: None,
-            search_index: None,
-            categories: None,
-            confidence_score: None,
-            audio_path: format!("recording.{}", file_extension),
-            transcript_path: None,
-        };
-
-        let _recording_id = match self.db.insert_recording(&recording) {
-            Ok(id) => {
-                self.message = format!("✅ File imported: {}", display_name);
-                id
-            }
-            Err(e) => {
-                self.message = format!("❌ Database error: {}", e);
-                self.show_message = true;
-                self.stop_progress_animation();
-                return Ok(());
-            }
-        };
-
-        // Update progress message for transcription
-        let model_info = match &self.config.transcription {
-            crate::config::TranscriptionMode::Local { model_size } => {
-                format!("Local ({})", model_size)
-            }
-            crate::config::TranscriptionMode::Api { .. } => "OpenAI API".to_string(),
-        };
-        self.progress_animation = Some(format!(
-            "📝 Transcribing with {}: {}",
-            model_info, display_name
-        ));
-
-        // Start transcription task - pass just the directory name, not the full path
-        let directory_name_clone = directory_name.clone();
         let transcription_mode = self.config.transcription.clone();
+        let display_name_clone = display_name.clone();
+
         self.transcription_task = Some(tokio::spawn(async move {
-            let directory_path = PathBuf::from(directory_name_clone);
-            transcribe_file_silent_with_mode(&directory_path, Some(transcription_mode)).await
+            let mut workflow = WorkflowManager::new().unwrap();
+            workflow
+                .complete_import_workflow_silent(
+                    &source_path,
+                    Some(display_name_clone),
+                    Some(transcription_mode),
+                )
+                .await
+                .map(|_| ())
         }));
 
         Ok(())
@@ -2387,6 +2309,17 @@ impl Dashboard {
             .as_ref()
             .unwrap_or(&selected_recording.directory_name);
 
+        // Clean up display name for UI (remove _recording suffix)
+        let clean_display_name = if display_name == &selected_recording.directory_name
+            && display_name.ends_with("_recording")
+        {
+            display_name
+                .strip_suffix("_recording")
+                .unwrap_or(display_name)
+        } else {
+            display_name
+        };
+
         // Show immediate progress animation
         let model_info = match &self.config.transcription {
             crate::config::TranscriptionMode::Local { model_size } => {
@@ -2394,37 +2327,30 @@ impl Dashboard {
             }
             crate::config::TranscriptionMode::Api { .. } => "OpenAI API".to_string(),
         };
+        let action = if has_transcript {
+            "Re-transcribing"
+        } else {
+            "Transcribing"
+        };
         self.progress_animation = Some(format!(
-            "🎵 Transcribing with {}: {}",
-            model_info, display_name
+            "🔄 {} with {}: {}",
+            action, model_info, clean_display_name
         ));
         self.progress_frame = 0;
         self.show_message = true;
 
-        // Build the audio file path - use the directory name as input
-        let input_path = PathBuf::from(&selected_recording.directory_name);
-
-        // Start transcription in background task
-        let input_path_clone = input_path.clone();
+        // Start transcription using unified workflow
+        let directory_name = selected_recording.directory_name.clone();
         let transcription_mode = self.config.transcription.clone();
+
         self.transcription_task = Some(tokio::spawn(async move {
-            transcribe_file_silent_with_mode(&input_path_clone, Some(transcription_mode)).await
+            let mut workflow = WorkflowManager::new().unwrap();
+            workflow
+                .retranscribe_recording_silent(&directory_name, transcription_mode)
+                .await
         }));
 
         Ok(())
-    }
-
-    fn generate_filename(&self, name: Option<String>) -> String {
-        let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
-        match name {
-            Some(n) => {
-                let sanitized = n
-                    .replace(' ', "-")
-                    .replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
-                format!("{}_{}", timestamp, sanitized)
-            }
-            None => format!("{}_recording", timestamp),
-        }
     }
 
     fn format_duration(&self, seconds: i64) -> String {
@@ -2692,11 +2618,28 @@ impl Dashboard {
 
         // Use speech-optimized compression settings
         let compression_settings = CompressionSettings::speech_optimized();
+
+        // Determine if auto-transcription is enabled based on recording mode
+        let _auto_transcribe = matches!(
+            self.recording_mode,
+            Some(RecordingMode::RecordAndTranscribe)
+        );
+
+        // Use unified recording function with TUI control channels
+        use crate::record::{record_audio, RecordOptions};
         let output_path = PathBuf::from(&recording_name);
 
-        // Start the recording task
         self.recording_task = Some(tokio::spawn(async move {
-            record_with_control(output_path, Some(compression_settings), stop_rx, level_tx).await
+            record_audio(
+                output_path,
+                RecordOptions {
+                    compression_settings: Some(compression_settings),
+                    stop_rx: Some(stop_rx),
+                    level_tx: Some(level_tx),
+                    verbose: false,
+                },
+            )
+            .await
         }));
 
         Ok(())
