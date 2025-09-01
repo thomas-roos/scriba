@@ -252,7 +252,7 @@ async fn handle_tools_list(id: Option<Value>) -> Value {
     response_ok(id, json!({"tools": tools}))
 }
 
-async fn handle_tools_call(db: &Database, id: Option<Value>, params: Option<Value>) -> Value {
+async fn handle_tools_call(id: Option<Value>, params: Option<Value>) -> Value {
     let Some(Value::Object(map)) = params else {
         return response_err(id, make_error(-32602, "Missing params", None));
     };
@@ -261,6 +261,12 @@ async fn handle_tools_call(db: &Database, id: Option<Value>, params: Option<Valu
         None => return response_err(id, make_error(-32602, "Missing tool name", None)),
     };
     let args = map.get("arguments").cloned().unwrap_or_else(|| json!({}));
+
+    // Create fresh database connection to ensure latest data from all Scriba instances
+    let db = match Database::new() {
+        Ok(database) => database,
+        Err(e) => return response_err(id, make_error(-32000, format!("Database error: {}", e), None)),
+    };
 
     match name {
         "list_transcripts" => {
@@ -386,7 +392,7 @@ async fn handle_tools_call(db: &Database, id: Option<Value>, params: Option<Valu
     }
 }
 
-async fn handle_resources_list(_db: &Database, id: Option<Value>) -> Value {
+async fn handle_resources_list(id: Option<Value>) -> Value {
     // Resources are not implemented in this version - focus on tools
     response_ok(id, json!({"resources": []}))
 }
@@ -398,15 +404,6 @@ pub async fn run_mcp_server() -> Result<()> {
 
     let mut reader = BufReader::new(io::stdin());
     let mut writer = io::stdout();
-
-    // Initialize database at startup for better performance
-    let db = match Database::new() {
-        Ok(db) => Some(db),
-        Err(e) => {
-            eprintln!("[scriba-mcp] Database initialization failed: {}", e);
-            None
-        }
-    };
 
     while let Some(line) = read_json_message(&mut reader).await? {
         if line.is_empty() {
@@ -438,23 +435,8 @@ pub async fn run_mcp_server() -> Result<()> {
             "initialize" => handle_initialize(id, req.params).await,
             "ping" => response_ok(id, json!({})),
             "tools/list" => handle_tools_list(id).await,
-            "tools/call" => {
-                if let Some(ref database) = db {
-                    handle_tools_call(database, id.clone(), req.params).await
-                } else {
-                    response_err(
-                        id.clone(),
-                        make_error(-32000, "Database not available", None)
-                    )
-                }
-            }
-            "resources/list" => {
-                if let Some(ref database) = db {
-                    handle_resources_list(database, id.clone()).await
-                } else {
-                    response_ok(id, json!({"resources": []}))
-                }
-            }
+            "tools/call" => handle_tools_call(id.clone(), req.params).await,
+            "resources/list" => handle_resources_list(id.clone()).await,
             "resources/templates/list" => response_ok(id, json!({"resourceTemplates": []})),
             "prompts/list" => response_ok(id, json!({"prompts": []})),
             "prompts/get" => response_err(id, make_error(404, "Prompt not found", None)),
