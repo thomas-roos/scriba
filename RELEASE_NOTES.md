@@ -1,3 +1,19 @@
+Scriba 0.12.1 — Real-Time MCP Data Access
+
+Highlights
+
+- **Real-Time Database Access**: MCP server now creates fresh database connections for each request, ensuring Claude Desktop and other MCP clients see new recordings immediately without restart.
+- **Improved Data Consistency**: Eliminates stale data issues when multiple Scriba instances are running concurrently.
+- **Better UX**: Record audio and immediately ask Claude about it - no restart required.
+
+Changelog
+
+- fix(mcp): ensure fresh database connection for real-time data access
+- fix(mcp): remove cached database connection at startup
+- fix(mcp): improve data consistency for concurrent Scriba instances
+
+---
+
 Scriba 0.12.0 — MCP Server Integration for AI Assistants
 
 Highlights
