@@ -145,21 +145,25 @@ impl Database {
             ));
         }
 
-        // Attempt a quick integrity check; if it fails, try to rebuild FTS index once
-        let ok: bool = self
-            .conn
-            .prepare("PRAGMA integrity_check")
-            .and_then(|mut stmt| {
-                stmt.query_row([], |row| {
-                    let r: String = row.get(0)?;
-                    Ok(r == "ok")
+        // Attempt a quick integrity check; allow skipping in MCP mode to keep startup snappy
+        let skip_integrity = std::env::var("SCRIBA_SKIP_INTEGRITY").is_ok()
+            || std::env::var("SCRIBA_MCP_MODE").is_ok();
+        if !skip_integrity {
+            let ok: bool = self
+                .conn
+                .prepare("PRAGMA integrity_check")
+                .and_then(|mut stmt| {
+                    stmt.query_row([], |row| {
+                        let r: String = row.get(0)?;
+                        Ok(r == "ok")
+                    })
                 })
-            })
-            .unwrap_or(true); // don't block initialization if pragma not available
-        if !ok {
-            // Try to rebuild FTS as this is a common source of corruption-like errors
-            if self.rebuild_transcripts_fts().is_ok() {
-                let _ = self.conn.execute("PRAGMA optimize", []);
+                .unwrap_or(true); // don't block initialization if pragma not available
+            if !ok {
+                // Try to rebuild FTS as this is a common source of corruption-like errors
+                if self.rebuild_transcripts_fts().is_ok() {
+                    let _ = self.conn.execute("PRAGMA optimize", []);
+                }
             }
         }
         Ok(())
@@ -239,6 +243,47 @@ impl Database {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
         }
+    }
+
+    pub fn get_recording(&self, id: i64) -> Result<Option<Recording>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM recordings WHERE id = ?1")?;
+
+        let recording_iter = stmt.query_map([id], |row| {
+            Ok(Recording {
+                id: Some(row.get(0)?),
+                directory_name: row.get(1)?,
+                display_name: row.get(2)?,
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+                duration_seconds: row.get(5)?,
+                file_size_bytes: row.get(6)?,
+                audio_format: row.get(7)?,
+                sample_rate: row.get(8)?,
+                channels: row.get(9)?,
+                has_transcript: row.get(10)?,
+                transcript_status: row.get(11)?,
+                language_code: row.get(12)?,
+                model_used: row.get(13)?,
+                tags: row.get(14)?,
+                summary: row.get(15)?,
+                key_points: row.get(16)?,
+                action_items: row.get(17)?,
+                speakers: row.get(18)?,
+                sentiment_score: row.get(19)?,
+                search_index: row.get(20)?,
+                categories: row.get(21)?,
+                confidence_score: row.get(22)?,
+                audio_path: row.get(23)?,
+                transcript_path: row.get(24)?,
+            })
+        })?;
+
+        for recording in recording_iter {
+            return Ok(Some(recording?));
+        }
+        Ok(None)
     }
 
     pub fn list_recordings(
