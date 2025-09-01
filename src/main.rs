@@ -3,6 +3,7 @@ use scriba::audio::{AudioFormat, CompressionSettings};
 use scriba::config::{LocalModelSize, ScribaConfig, TranscriptionMode};
 use scriba::core::WorkflowManager;
 use scriba::dashboard::Dashboard;
+use scriba::mcp::run_mcp_server;
 use std::path::PathBuf;
 use structopt::StructOpt;
 
@@ -108,6 +109,8 @@ enum Command {
         #[structopt(long = "verbose", help = "Show detailed health information")]
         verbose: bool,
     },
+    /// Run the Model Context Protocol (MCP) server over stdio
+    Mcp,
 }
 
 #[derive(Debug, StructOpt)]
@@ -330,6 +333,10 @@ async fn main() -> Result<()> {
                     }
 
                     Ok(())
+                }
+                Command::Mcp => {
+                    // Run MCP server on stdio
+                    run_mcp_server().await
                 }
             }
         }

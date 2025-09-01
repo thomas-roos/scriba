@@ -4,6 +4,7 @@ pub mod core;
 pub mod dashboard;
 pub mod database;
 pub mod errors;
+pub mod mcp;
 pub mod record;
 pub mod transcribe;
 pub mod utils;

@@ -1,3 +1,23 @@
+Scriba 0.12.0 — MCP Server Integration for AI Assistants
+
+Highlights
+
+- **MCP Server**: Added Model Context Protocol server integration for seamless access to transcripts from Claude Desktop and other MCP clients via `scriba mcp` command.
+- **AI Assistant Tools**: Four specialized tools for transcript access: list_transcripts, get_transcript, search_transcripts, and get_recording_info with full JSON schema validation.
+- **Production-Ready**: Optimized MCP server with startup database initialization, professional logging, and proper JSON-RPC 2.0 implementation.
+- **Claude Desktop Integration**: Complete setup guide and configuration for immediate use with Claude Desktop AI assistant.
+
+Changelog
+
+- feat(mcp): add Model Context Protocol server with STDIO transport
+- feat(mcp): implement list_transcripts, get_transcript, search_transcripts, get_recording_info tools
+- feat(database): add get_recording method for MCP server support
+- feat(cli): add mcp subcommand to start MCP server
+- docs(mcp): add Claude Desktop integration guide
+- docs: update README with MCP server documentation and usage examples
+
+---
+
 Scriba 0.11.1 — Unified Core, Smoother UX, Reliable Builds
 
 Highlights
