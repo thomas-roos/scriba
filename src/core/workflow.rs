@@ -11,6 +11,8 @@ use super::recording::{record_audio, RecordOptions};
 use super::transcription::transcribe_audio;
 use super::types::{ManagedRecording, RecordingConfig, RecordingMode};
 use crate::database::{Database, Recording};
+use crate::enrichment::EnrichmentService;
+use crate::entities::EntityLinker;
 use crate::utils::{generate_recording_name, BASE_PATH};
 use chrono::Utc;
 
@@ -253,9 +255,183 @@ impl WorkflowManager {
             .join(&recording.directory_name)
             .join("transcript.txt");
         if transcript_path.exists() {
-            recording.transcript_path = Some(transcript_path);
+            recording.transcript_path = Some(transcript_path.clone());
+
+            // Run enrichment if enabled
+            if self.config.enrichment.enabled {
+                if let Err(e) = self
+                    .enrich_recording(&recording.directory_name, &transcript_path, verbose)
+                    .await
+                {
+                    if verbose {
+                        eprintln!("⚠️ Enrichment failed (non-fatal): {}", e);
+                    }
+                }
+            }
         }
         Ok(recording)
+    }
+
+    /// Enrich a recording with AI-extracted metadata.
+    pub async fn enrich_recording(
+        &mut self,
+        directory_name: &str,
+        transcript_path: &Path,
+        verbose: bool,
+    ) -> Result<()> {
+        let config = &self.config.enrichment;
+
+        if verbose {
+            println!("🧠 Starting knowledge extraction...");
+        }
+
+        // Read transcript content
+        let transcript_content = std::fs::read_to_string(transcript_path)
+            .context("Failed to read transcript for enrichment")?;
+
+        if transcript_content.trim().is_empty() {
+            if verbose {
+                println!("⚠️ Transcript is empty, skipping enrichment");
+            }
+            return Ok(());
+        }
+
+        // Create enrichment service
+        let service = EnrichmentService::new(&config.ollama_endpoint, &config.ollama_model);
+
+        // Check if Ollama is available
+        if let Err(e) = service.health_check().await {
+            return Err(anyhow::anyhow!(
+                "Ollama not available for enrichment: {}. Make sure Ollama is running with model '{}'.",
+                e,
+                config.ollama_model
+            ));
+        }
+
+        if verbose {
+            println!("  📊 Extracting metadata from transcript...");
+        }
+
+        // Extract metadata
+        let extraction = service
+            .extract(&transcript_content)
+            .await
+            .context("Failed to extract metadata from transcript")?;
+
+        if verbose {
+            println!("  ✅ Extracted: title='{}', {} topics, {} people, {} organizations",
+                extraction.title,
+                extraction.topics.len(),
+                extraction.people.len(),
+                extraction.organizations.len()
+            );
+        }
+
+        // Get recording from database
+        let recording = self.db_manager.db.get_recording_by_directory(directory_name)?
+            .ok_or_else(|| anyhow::anyhow!("Recording not found: {}", directory_name))?;
+        let recording_id = recording.id
+            .ok_or_else(|| anyhow::anyhow!("Recording has no ID"))?;
+
+        // Update recording with enrichment data
+        let key_points_json = if extraction.key_points.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&extraction.key_points)?)
+        };
+
+        let action_items_json = if extraction.action_items.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&extraction.action_items)?)
+        };
+
+        // Only set display_name if not already set
+        let display_name = if recording.display_name.is_none() {
+            Some(extraction.title.as_str())
+        } else {
+            None
+        };
+
+        self.db_manager.db.update_recording_enrichment(
+            recording_id,
+            display_name,
+            Some(&extraction.summary),
+            key_points_json.as_deref(),
+            action_items_json.as_deref(),
+        )?;
+
+        // Update transcript with topics and entities
+        let topics_json = if extraction.topics.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&extraction.topics)?)
+        };
+
+        // Combine people and organizations into entities JSON
+        let entities: Vec<serde_json::Value> = extraction
+            .people
+            .iter()
+            .map(|p| serde_json::json!({"type": "person", "name": p.name, "context": p.context}))
+            .chain(
+                extraction
+                    .organizations
+                    .iter()
+                    .map(|o| serde_json::json!({"type": "organization", "name": o.name, "context": o.context})),
+            )
+            .collect();
+
+        let entities_json = if entities.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&entities)?)
+        };
+
+        self.db_manager.db.update_transcript_enrichment(
+            recording_id,
+            entities_json.as_deref(),
+            topics_json.as_deref(),
+        )?;
+
+        // Process entity linking
+        if verbose {
+            println!("  🔗 Linking entities...");
+        }
+
+        let linker = EntityLinker::new(service, config.auto_link_threshold);
+        let report = linker
+            .process_extraction(&mut self.db_manager.db, recording_id, &extraction)
+            .await?;
+
+        if verbose {
+            println!(
+                "  ✅ Entity linking complete: {} linked, {} created, {} unlinked",
+                report.linked_existing, report.created_new, report.unlinked
+            );
+            println!("✅ Knowledge extraction complete!");
+        }
+
+        Ok(())
+    }
+
+    /// Enrich an existing recording (for manual enrichment or re-enrichment).
+    pub async fn enrich_existing_recording(
+        &mut self,
+        directory_name: &str,
+        verbose: bool,
+    ) -> Result<()> {
+        let recording_dir = BASE_PATH.join(directory_name);
+        let transcript_path = recording_dir.join("transcript.txt");
+
+        if !transcript_path.exists() {
+            return Err(anyhow::anyhow!(
+                "No transcript found for recording: {}",
+                directory_name
+            ));
+        }
+
+        self.enrich_recording(directory_name, &transcript_path, verbose)
+            .await
     }
 
     /// Unified transcription workflow that works with any ManagedRecording (verbose).
@@ -451,6 +627,16 @@ impl WorkflowManager {
             warnings.push(
                 "No whisper models directory found - local transcription may fail".to_string(),
             );
+        }
+
+        // Check enrichment/Ollama availability
+        if self.config.enrichment.enabled {
+            // We can't await here since health_check is not async, so we just note the config
+            warnings.push(format!(
+                "Enrichment enabled - requires Ollama at {} with model '{}'",
+                self.config.enrichment.ollama_endpoint,
+                self.config.enrichment.ollama_model
+            ));
         }
 
         let status = if issues.is_empty() {

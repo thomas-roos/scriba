@@ -60,6 +60,59 @@ pub struct Tag {
     pub usage_count: i64,
 }
 
+/// An entity (person, organization, etc.) in the knowledge base.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Entity {
+    pub id: Option<i64>,
+    pub entity_type: String,
+    pub canonical_name: String,
+    pub aliases: Option<String>,    // JSON array
+    pub context: Option<String>,
+    pub metadata: Option<String>,   // JSON object
+    pub mention_count: i64,
+    pub first_seen_at: Option<DateTime<Utc>>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A mention of an entity in a recording.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityMentionRecord {
+    pub id: Option<i64>,
+    pub entity_id: Option<i64>,
+    pub recording_id: i64,
+    pub mention_text: String,
+    pub context_snippet: Option<String>,
+    pub confidence: f64,
+    pub linked_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Entity {
+    /// Parse aliases from JSON string.
+    pub fn aliases_list(&self) -> Vec<String> {
+        self.aliases
+            .as_ref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Set aliases from a list.
+    pub fn set_aliases(&mut self, aliases: Vec<String>) {
+        self.aliases = Some(serde_json::to_string(&aliases).unwrap_or_default());
+    }
+
+    /// Add an alias if not already present.
+    pub fn add_alias(&mut self, alias: &str) {
+        let mut aliases = self.aliases_list();
+        if !aliases.iter().any(|a| a.eq_ignore_ascii_case(alias)) {
+            aliases.push(alias.to_string());
+            self.set_aliases(aliases);
+        }
+    }
+}
+
 /// Aggregated statistics for recordings.
 #[derive(Debug)]
 pub struct RecordingStats {

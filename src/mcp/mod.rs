@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::database::{Database, Recording, Transcript};
+use crate::database::{Database, Entity, EntityMentionRecord, Recording, Transcript};
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -61,6 +61,28 @@ struct SearchTranscriptsParams {
     limit: Option<i64>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ListEntitiesParams {
+    /// Filter by entity type: "person", "organization", or null for all
+    entity_type: Option<String>,
+    /// Maximum number of items to return
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct GetEntityParams {
+    /// Entity ID to fetch
+    entity_id: Option<i64>,
+    /// Entity name to fetch (case-insensitive)
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SearchByEntityParams {
+    /// Entity ID to search recordings for
+    entity_id: i64,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 struct RecordingInfo {
     id: Option<i64>,
@@ -72,6 +94,12 @@ struct RecordingInfo {
     transcript_status: Option<String>,
     language_code: Option<String>,
     model_used: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_points: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action_items: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -83,12 +111,45 @@ struct TranscriptInfo {
     word_count: Option<i64>,
     character_count: Option<i64>,
     language_detected: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entities: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    topics: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct SearchResult {
     recording: RecordingInfo,
     transcript: TranscriptInfo,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct EntityInfo {
+    id: Option<i64>,
+    entity_type: String,
+    canonical_name: String,
+    aliases: Option<Vec<String>>,
+    context: Option<String>,
+    mention_count: i64,
+    first_seen_at: Option<String>,
+    last_seen_at: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct EntityMentionInfo {
+    id: Option<i64>,
+    entity_id: Option<i64>,
+    recording_id: i64,
+    mention_text: String,
+    context_snippet: Option<String>,
+    confidence: f64,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct EntityDetailInfo {
+    entity: EntityInfo,
+    mentions: Vec<EntityMentionInfo>,
+    recordings: Vec<RecordingInfo>,
 }
 
 fn make_error(code: i64, message: impl Into<String>, data: Option<Value>) -> JsonRpcError {
@@ -103,18 +164,18 @@ fn make_error(code: i64, message: impl Into<String>, data: Option<Value>) -> Jso
 async fn read_json_message(reader: &mut BufReader<tokio::io::Stdin>) -> Result<Option<String>> {
     let mut line = String::new();
     let bytes_read = reader.read_line(&mut line).await?;
-    
+
     if bytes_read == 0 {
         return Ok(None); // EOF
     }
-    
+
     // Remove trailing newline
     let trimmed = line.trim_end().to_string();
     if trimmed.is_empty() {
         // Skip empty lines
         return Ok(Some(String::new()));
     }
-    
+
     Ok(Some(trimmed))
 }
 
@@ -157,6 +218,9 @@ fn recording_to_info(recording: &Recording) -> RecordingInfo {
         transcript_status: Some(recording.transcript_status.clone()),
         language_code: Some(recording.language_code.clone()),
         model_used: Some(recording.model_used.clone()),
+        summary: recording.summary.clone(),
+        key_points: recording.key_points.as_ref().and_then(|s| serde_json::from_str(s).ok()),
+        action_items: recording.action_items.as_ref().and_then(|s| serde_json::from_str(s).ok()),
     }
 }
 
@@ -169,6 +233,32 @@ fn transcript_to_info(transcript: &Transcript) -> TranscriptInfo {
         word_count: transcript.word_count,
         character_count: transcript.character_count,
         language_detected: transcript.language_detected.clone(),
+        entities: transcript.entities.as_ref().and_then(|s| serde_json::from_str(s).ok()),
+        topics: transcript.topics.as_ref().and_then(|s| serde_json::from_str(s).ok()),
+    }
+}
+
+fn entity_to_info(entity: &Entity) -> EntityInfo {
+    EntityInfo {
+        id: entity.id,
+        entity_type: entity.entity_type.clone(),
+        canonical_name: entity.canonical_name.clone(),
+        aliases: entity.aliases.as_ref().and_then(|s| serde_json::from_str(s).ok()),
+        context: entity.context.clone(),
+        mention_count: entity.mention_count,
+        first_seen_at: entity.first_seen_at.map(|dt| dt.to_rfc3339()),
+        last_seen_at: entity.last_seen_at.map(|dt| dt.to_rfc3339()),
+    }
+}
+
+fn mention_to_info(mention: &EntityMentionRecord) -> EntityMentionInfo {
+    EntityMentionInfo {
+        id: mention.id,
+        entity_id: mention.entity_id,
+        recording_id: mention.recording_id,
+        mention_text: mention.mention_text.clone(),
+        context_snippet: mention.context_snippet.clone(),
+        confidence: mention.confidence,
     }
 }
 
@@ -208,15 +298,42 @@ fn tool_schema_get_recording_info() -> Value {
     })
 }
 
+fn tool_schema_list_entities() -> Value {
+    let schema = schemars::schema_for!(ListEntitiesParams);
+    json!({
+        "name": "list_entities",
+        "description": "List all known entities (people, organizations) with their context and mention counts. Use this to discover who and what has been discussed across recordings.",
+        "inputSchema": schema
+    })
+}
+
+fn tool_schema_get_entity() -> Value {
+    let schema = schemars::schema_for!(GetEntityParams);
+    json!({
+        "name": "get_entity",
+        "description": "Get full details about a specific entity including all mentions across recordings and accumulated context.",
+        "inputSchema": schema
+    })
+}
+
+fn tool_schema_search_by_entity() -> Value {
+    let schema = schemars::schema_for!(SearchByEntityParams);
+    json!({
+        "name": "search_by_entity",
+        "description": "Find all recordings that mention a specific entity. Returns recordings with context about how the entity was mentioned.",
+        "inputSchema": schema
+    })
+}
+
 async fn handle_initialize(id: Option<Value>, params: Option<Value>) -> Value {
     let mut protocol_version = "2024-11-05".to_string();
-    
+
     if let Some(Value::Object(p)) = params {
         if let Some(Value::String(v)) = p.get("protocolVersion") {
             protocol_version = v.clone();
         }
     }
-    
+
     // Accept any protocol version for compatibility
     let result = json!({
         "protocolVersion": protocol_version,
@@ -238,7 +355,7 @@ async fn handle_initialize(id: Option<Value>, params: Option<Value>) -> Value {
             "logging": {}
         }
     });
-    
+
     response_ok(id, result)
 }
 
@@ -248,6 +365,9 @@ async fn handle_tools_list(id: Option<Value>) -> Value {
         tool_schema_get_transcript(),
         tool_schema_search_transcripts(),
         tool_schema_get_recording_info(),
+        tool_schema_list_entities(),
+        tool_schema_get_entity(),
+        tool_schema_search_by_entity(),
     ];
     response_ok(id, json!({"tools": tools}))
 }
@@ -385,6 +505,121 @@ async fn handle_tools_call(id: Option<Value>, params: Option<Value>) -> Value {
                 "isError": false
             }))
         }
+        "list_entities" => {
+            let params: ListEntitiesParams = match serde_json::from_value(args) {
+                Ok(p) => p,
+                Err(e) => return response_err(id, make_error(-32602, format!("Invalid params: {}", e), None)),
+            };
+
+            let entities = match db.list_entities(params.entity_type.as_deref(), params.limit) {
+                Ok(list) => list,
+                Err(e) => return response_err(id, make_error(-32000, format!("DB error: {}", e), None)),
+            };
+
+            let entity_infos: Vec<_> = entities.iter().map(entity_to_info).collect();
+
+            response_ok(id, json!({
+                "content": [{
+                    "type": "text",
+                    "text": serde_json::to_string_pretty(&entity_infos).unwrap()
+                }],
+                "isError": false
+            }))
+        }
+        "get_entity" => {
+            let params: GetEntityParams = match serde_json::from_value(args) {
+                Ok(p) => p,
+                Err(e) => return response_err(id, make_error(-32602, format!("Invalid params: {}", e), None)),
+            };
+
+            let entity = if let Some(entity_id) = params.entity_id {
+                match db.get_entity(entity_id) {
+                    Ok(Some(e)) => e,
+                    Ok(None) => return response_err(id, make_error(404, "Entity not found", None)),
+                    Err(e) => return response_err(id, make_error(-32000, format!("DB error: {}", e), None)),
+                }
+            } else if let Some(name) = params.name {
+                match db.get_entity_by_name(&name) {
+                    Ok(Some(e)) => e,
+                    Ok(None) => return response_err(id, make_error(404, "Entity not found", None)),
+                    Err(e) => return response_err(id, make_error(-32000, format!("DB error: {}", e), None)),
+                }
+            } else {
+                return response_err(id, make_error(-32602, "Provide entity_id or name", None));
+            };
+
+            let entity_id = entity.id.unwrap();
+
+            // Get mentions for this entity
+            let mentions = match db.get_mentions_for_entity(entity_id) {
+                Ok(m) => m,
+                Err(e) => return response_err(id, make_error(-32000, format!("DB error: {}", e), None)),
+            };
+
+            // Get recordings for this entity
+            let recordings = match db.get_recordings_for_entity(entity_id) {
+                Ok(r) => r,
+                Err(e) => return response_err(id, make_error(-32000, format!("DB error: {}", e), None)),
+            };
+
+            let detail = EntityDetailInfo {
+                entity: entity_to_info(&entity),
+                mentions: mentions.iter().map(mention_to_info).collect(),
+                recordings: recordings.iter().map(recording_to_info).collect(),
+            };
+
+            response_ok(id, json!({
+                "content": [{
+                    "type": "text",
+                    "text": serde_json::to_string_pretty(&detail).unwrap()
+                }],
+                "isError": false
+            }))
+        }
+        "search_by_entity" => {
+            let params: SearchByEntityParams = match serde_json::from_value(args) {
+                Ok(p) => p,
+                Err(e) => return response_err(id, make_error(-32602, format!("Invalid params: {}", e), None)),
+            };
+
+            // Get entity details
+            let entity = match db.get_entity(params.entity_id) {
+                Ok(Some(e)) => e,
+                Ok(None) => return response_err(id, make_error(404, "Entity not found", None)),
+                Err(e) => return response_err(id, make_error(-32000, format!("DB error: {}", e), None)),
+            };
+
+            // Get recordings for this entity
+            let recordings = match db.get_recordings_for_entity(params.entity_id) {
+                Ok(r) => r,
+                Err(e) => return response_err(id, make_error(-32000, format!("DB error: {}", e), None)),
+            };
+
+            // Get mentions to provide context
+            let mentions = match db.get_mentions_for_entity(params.entity_id) {
+                Ok(m) => m,
+                Err(e) => return response_err(id, make_error(-32000, format!("DB error: {}", e), None)),
+            };
+
+            let result = json!({
+                "entity": entity_to_info(&entity),
+                "recording_count": recordings.len(),
+                "recordings": recordings.iter().map(recording_to_info).collect::<Vec<_>>(),
+                "mention_contexts": mentions.iter().map(|m| json!({
+                    "recording_id": m.recording_id,
+                    "mention_text": m.mention_text,
+                    "context_snippet": m.context_snippet
+                })).collect::<Vec<_>>()
+            });
+
+            response_ok(id, json!({
+                "content": [{
+                    "type": "text",
+                    "text": serde_json::to_string_pretty(&result).unwrap()
+                }],
+                "isError": false
+            }))
+        }
         other => response_err(
             id,
             make_error(-32601, format!("Unknown tool: {}", other), None),
@@ -409,7 +644,7 @@ pub async fn run_mcp_server() -> Result<()> {
         if line.is_empty() {
             continue; // Skip empty lines
         }
-        
+
         let req: JsonRpcRequest = match serde_json::from_str::<JsonRpcRequest>(&line) {
             Ok(v) => {
                 // Validate JSON-RPC version
