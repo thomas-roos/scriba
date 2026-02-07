@@ -332,9 +332,21 @@ impl WorkflowManager {
             .await
             .context("Failed to extract metadata from transcript")?;
 
+        // Replace transcript spellings with canonical names in title and summary
+        let mut title = extraction.title.clone();
+        let mut summary = extraction.summary.clone();
+        for (entity, _) in extraction.all_entities() {
+            if let Some(canonical) = &entity.resolved_to {
+                if entity.name != *canonical {
+                    title = title.replace(&entity.name, canonical);
+                    summary = summary.replace(&entity.name, canonical);
+                }
+            }
+        }
+
         if verbose {
             println!("  ✅ Extracted: title='{}', {} topics, {} people, {} organizations",
-                extraction.title,
+                title,
                 extraction.topics.len(),
                 extraction.people.len(),
                 extraction.organizations.len()
@@ -360,12 +372,10 @@ impl WorkflowManager {
             Some(serde_json::to_string(&extraction.action_items)?)
         };
 
-        let display_name = Some(extraction.title.as_str());
-
         self.db_manager.db.update_recording_enrichment(
             recording_id,
-            display_name,
-            Some(&extraction.summary),
+            Some(title.as_str()),
+            Some(summary.as_str()),
             key_points_json.as_deref(),
             action_items_json.as_deref(),
         )?;
