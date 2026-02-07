@@ -332,14 +332,16 @@ impl WorkflowManager {
             .await
             .context("Failed to extract metadata from transcript")?;
 
-        // Replace transcript spellings with canonical names in title and summary
+        // Replace transcript spellings with canonical names everywhere
         let mut title = extraction.title.clone();
         let mut summary = extraction.summary.clone();
+        let mut corrected_transcript = transcript_content.clone();
         for (entity, _) in extraction.all_entities() {
             if let Some(canonical) = &entity.resolved_to {
                 if entity.name != *canonical {
                     title = title.replace(&entity.name, canonical);
                     summary = summary.replace(&entity.name, canonical);
+                    corrected_transcript = corrected_transcript.replace(&entity.name, canonical);
                 }
             }
         }
@@ -417,6 +419,15 @@ impl WorkflowManager {
             entities_json.as_deref(),
             topics_json.as_deref(),
         )?;
+
+        // Update transcript with corrected names (both DB and file on disk)
+        if corrected_transcript != transcript_content {
+            self.db_manager.db.upsert_transcript(recording_id, &corrected_transcript)?;
+            let _ = std::fs::write(transcript_path, &corrected_transcript);
+            if verbose {
+                println!("  ✏️ Transcript updated with canonical entity names");
+            }
+        }
 
         // Process entity linking — entities are already resolved by the LLM
         if verbose {
