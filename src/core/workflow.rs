@@ -784,6 +784,10 @@ fn sync_world_to_entities(db: &mut Database, world: &WorldData) -> Result<()> {
                 {
                     registry.update_entity_context(entity_id, &person.relationship)?;
                 }
+                // Sync aliases from world
+                for alias in &person.aliases {
+                    registry.add_entity_alias(entity_id, alias)?;
+                }
             }
             None => {
                 let ctx = if person.relationship.is_empty() {
@@ -791,7 +795,12 @@ fn sync_world_to_entities(db: &mut Database, world: &WorldData) -> Result<()> {
                 } else {
                     Some(person.relationship.as_str())
                 };
-                registry.create_entity("person", &person.name, ctx)?;
+                let entity = registry.create_entity("person", &person.name, ctx)?;
+                if let Some(entity_id) = entity.id {
+                    for alias in &person.aliases {
+                        registry.add_entity_alias(entity_id, alias)?;
+                    }
+                }
             }
         }
     }

@@ -143,7 +143,7 @@ The JSON schema (include only fields with new content):
     {{"name": "org name", "description": "what they do", "aliases": ["misspellings"]}}
   ],
   "people": [
-    {{"name": "person name", "relationship": "who they are to the owner"}}
+    {{"name": "person name", "relationship": "who they are to the owner", "aliases": ["alternate spellings"]}}
   ],
   "interests": ["only genuinely new recurring interests"],
   "projects": [
@@ -192,7 +192,7 @@ Return a JSON object matching this EXACT schema:
     {{"name": "org name", "description": "what they do", "aliases": ["known misspellings"]}}
   ],
   "people": [
-    {{"name": "person name", "relationship": "who they are to the owner"}}
+    {{"name": "person name", "relationship": "who they are to the owner", "aliases": ["alternate spellings"]}}
   ],
   "interests": [],
   "projects": [],

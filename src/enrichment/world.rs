@@ -49,6 +49,8 @@ pub struct PersonInfo {
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub relationship: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
 }
 
 /// A project the owner is working on.
@@ -141,15 +143,27 @@ impl WorldData {
             }
         }
 
-        // People: add new, update relationship only if richer
+        // People: add new, update relationship only if richer.
+        // Also skip new people whose name is already an alias of an existing person.
         for new_person in &changes.people {
+            let new_name_lower = new_person.name.to_lowercase();
+
+            // Find existing person by name OR by alias
             if let Some(existing) = self.people.iter_mut().find(|p| {
-                p.name.to_lowercase() == new_person.name.to_lowercase()
+                p.name.to_lowercase() == new_name_lower
+                    || p.aliases.iter().any(|a| a.to_lowercase() == new_name_lower)
             }) {
-                if !new_person.relationship.is_empty()
+                // Only update relationship if name matches exactly (not alias match)
+                if existing.name.to_lowercase() == new_name_lower
+                    && !new_person.relationship.is_empty()
                     && new_person.relationship.len() > existing.relationship.len()
                 {
                     existing.relationship = new_person.relationship.clone();
+                }
+                for alias in &new_person.aliases {
+                    if !existing.aliases.iter().any(|a| a.to_lowercase() == alias.to_lowercase()) {
+                        existing.aliases.push(alias.clone());
+                    }
                 }
             } else {
                 self.people.push(new_person.clone());
@@ -338,6 +352,7 @@ mod tests {
             people: vec![PersonInfo {
                 name: "Gerardo".to_string(),
                 relationship: "co-founder, CFO".to_string(),
+                ..Default::default()
             }],
             interests: vec!["cybersecurity".to_string()],
             projects: vec![],
@@ -357,6 +372,7 @@ mod tests {
             people: vec![PersonInfo {
                 name: "Alice".to_string(),
                 relationship: "colleague".to_string(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -365,6 +381,7 @@ mod tests {
             people: vec![PersonInfo {
                 name: "Bob".to_string(),
                 relationship: "partner".to_string(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -380,6 +397,7 @@ mod tests {
             people: vec![PersonInfo {
                 name: "Alice".to_string(),
                 relationship: "colleague and team lead at Exein".to_string(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -389,6 +407,7 @@ mod tests {
             people: vec![PersonInfo {
                 name: "Alice".to_string(),
                 relationship: "team lead".to_string(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -402,6 +421,7 @@ mod tests {
             people: vec![PersonInfo {
                 name: "Alice".to_string(),
                 relationship: "colleague, team lead at Exein, expert in embedded systems".to_string(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -416,6 +436,7 @@ mod tests {
             people: vec![PersonInfo {
                 name: "Alice".to_string(),
                 relationship: String::new(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -424,6 +445,7 @@ mod tests {
             people: vec![PersonInfo {
                 name: "Alice".to_string(),
                 relationship: "team lead".to_string(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -477,6 +499,34 @@ mod tests {
         assert_eq!(world.organizations[0].name, "Exein");
         // Description should NOT be updated since the match was by alias, not name
         assert_eq!(world.organizations[0].description, "cybersecurity scaleup");
+    }
+
+    #[test]
+    fn test_merge_skips_person_that_is_alias_of_existing() {
+        let mut world = WorldData {
+            people: vec![PersonInfo {
+                name: "Giulia".to_string(),
+                relationship: "Giovanni's girlfriend".to_string(),
+                aliases: vec!["Julia".to_string()],
+            }],
+            ..Default::default()
+        };
+
+        // LLM tries to add "Julia" as a separate person — should be skipped
+        let changes = WorldData {
+            people: vec![PersonInfo {
+                name: "Julia".to_string(),
+                relationship: "Giovanni's girlfriend, works at Saatchi".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        world.merge(&changes);
+        assert_eq!(world.people.len(), 1);
+        assert_eq!(world.people[0].name, "Giulia");
+        // Relationship should NOT be updated since the match was by alias
+        assert_eq!(world.people[0].relationship, "Giovanni's girlfriend");
     }
 
     #[test]
