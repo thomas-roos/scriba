@@ -391,12 +391,18 @@ impl WorkflowManager {
         let entities: Vec<serde_json::Value> = extraction
             .people
             .iter()
-            .map(|p| serde_json::json!({"type": "person", "name": p.name, "context": p.context}))
+            .map(|p| {
+                let name = p.resolved_to.as_deref().unwrap_or(&p.name);
+                serde_json::json!({"type": "person", "name": name, "context": p.context})
+            })
             .chain(
                 extraction
                     .organizations
                     .iter()
-                    .map(|o| serde_json::json!({"type": "organization", "name": o.name, "context": o.context})),
+                    .map(|o| {
+                        let name = o.resolved_to.as_deref().unwrap_or(&o.name);
+                        serde_json::json!({"type": "organization", "name": name, "context": o.context})
+                    }),
             )
             .collect();
 
