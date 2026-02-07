@@ -61,6 +61,42 @@ pub struct ScribaConfig {
     pub audio_settings: AudioSettings,
     /// Stores the last used API key to preserve it when switching modes.
     pub last_api_key: Option<String>,
+    /// Knowledge extraction and enrichment settings.
+    #[serde(default)]
+    pub enrichment: EnrichmentConfig,
+}
+
+/// Configuration for knowledge extraction and enrichment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichmentConfig {
+    /// Whether automatic enrichment is enabled after transcription.
+    pub enabled: bool,
+    /// Ollama API endpoint URL.
+    pub ollama_endpoint: String,
+    /// Ollama model to use for extraction.
+    pub ollama_model: String,
+    /// Confidence threshold for automatic entity linking (0.0-1.0).
+    pub auto_link_threshold: f32,
+    /// Whether to evolve the world description after each enrichment.
+    /// The world is Scriba's evolving understanding of its owner.
+    #[serde(default = "default_evolve_world")]
+    pub evolve_world: bool,
+}
+
+fn default_evolve_world() -> bool {
+    true
+}
+
+impl Default for EnrichmentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ollama_endpoint: "http://localhost:11434".to_string(),
+            ollama_model: "llama3.2".to_string(),
+            auto_link_threshold: 0.8,
+            evolve_world: true,
+        }
+    }
 }
 
 /// Audio recording settings.
@@ -85,6 +121,7 @@ impl Default for ScribaConfig {
                 speech_optimized: true,
             },
             last_api_key: None,
+            enrichment: EnrichmentConfig::default(),
         }
     }
 }

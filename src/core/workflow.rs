@@ -11,6 +11,9 @@ use super::recording::{record_audio, RecordOptions};
 use super::transcription::transcribe_audio;
 use super::types::{ManagedRecording, RecordingConfig, RecordingMode};
 use crate::database::{Database, Recording};
+use crate::enrichment::{EnrichmentService, WorldContext, WorldData, append_new_facts};
+use crate::enrichment::world::{OrgInfo, PersonInfo, ProjectInfo};
+use crate::entities::{EntityLinker, EntityRegistry};
 use crate::utils::{generate_recording_name, BASE_PATH};
 use chrono::Utc;
 
@@ -253,9 +256,275 @@ impl WorkflowManager {
             .join(&recording.directory_name)
             .join("transcript.txt");
         if transcript_path.exists() {
-            recording.transcript_path = Some(transcript_path);
+            recording.transcript_path = Some(transcript_path.clone());
+
+            // Run enrichment if enabled
+            if self.config.enrichment.enabled {
+                if let Err(e) = self
+                    .enrich_recording(&recording.directory_name, &transcript_path, verbose)
+                    .await
+                {
+                    if verbose {
+                        eprintln!("⚠️ Enrichment failed (non-fatal): {}", e);
+                    }
+                }
+            }
         }
         Ok(recording)
+    }
+
+    /// Enrich a recording with AI-extracted metadata.
+    pub async fn enrich_recording(
+        &mut self,
+        directory_name: &str,
+        transcript_path: &Path,
+        verbose: bool,
+    ) -> Result<()> {
+        let config = &self.config.enrichment;
+
+        if verbose {
+            println!("🧠 Starting knowledge extraction...");
+        }
+
+        // Read transcript content
+        let transcript_content = std::fs::read_to_string(transcript_path)
+            .context("Failed to read transcript for enrichment")?;
+
+        if transcript_content.trim().is_empty() {
+            if verbose {
+                println!("⚠️ Transcript is empty, skipping enrichment");
+            }
+            return Ok(());
+        }
+
+        // Create enrichment service
+        let service = EnrichmentService::new(&config.ollama_endpoint, &config.ollama_model);
+
+        // Check if Ollama is available
+        if let Err(e) = service.health_check().await {
+            return Err(anyhow::anyhow!(
+                "Ollama not available for enrichment: {}. Make sure Ollama is running with model '{}'.",
+                e,
+                config.ollama_model
+            ));
+        }
+
+        if verbose {
+            println!("  📊 Extracting metadata from transcript...");
+        }
+
+        // Load world context (Scriba's understanding of the owner)
+        let world = WorldContext::load().unwrap_or_default();
+        let world_content = if world.has_content() {
+            if verbose {
+                println!("  🌍 Using world context for extraction");
+            }
+            Some(world.content.clone())
+        } else {
+            None
+        };
+
+        // Extract metadata with world context — the LLM resolves entities inline
+        let extraction = service
+            .extract_with_full_context(
+                &transcript_content,
+                world_content.as_deref(),
+            )
+            .await
+            .context("Failed to extract metadata from transcript")?;
+
+        // Replace transcript spellings with canonical names everywhere
+        let mut title = extraction.title.clone();
+        let mut summary = extraction.summary.clone();
+        let mut corrected_transcript = transcript_content.clone();
+        for (entity, _) in extraction.all_entities() {
+            if let Some(canonical) = &entity.resolved_to {
+                if entity.name != *canonical {
+                    title = title.replace(&entity.name, canonical);
+                    summary = summary.replace(&entity.name, canonical);
+                    corrected_transcript = corrected_transcript.replace(&entity.name, canonical);
+                }
+            }
+        }
+
+        if verbose {
+            println!("  ✅ Extracted: title='{}', {} topics, {} people, {} organizations",
+                title,
+                extraction.topics.len(),
+                extraction.people.len(),
+                extraction.organizations.len()
+            );
+        }
+
+        // Get recording from database
+        let recording = self.db_manager.db.get_recording_by_directory(directory_name)?
+            .ok_or_else(|| anyhow::anyhow!("Recording not found: {}", directory_name))?;
+        let recording_id = recording.id
+            .ok_or_else(|| anyhow::anyhow!("Recording has no ID"))?;
+
+        // Update recording with enrichment data
+        let key_points_json = if extraction.key_points.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&extraction.key_points)?)
+        };
+
+        let action_items_json = if extraction.action_items.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&extraction.action_items)?)
+        };
+
+        self.db_manager.db.update_recording_enrichment(
+            recording_id,
+            Some(title.as_str()),
+            Some(summary.as_str()),
+            key_points_json.as_deref(),
+            action_items_json.as_deref(),
+        )?;
+
+        // Update transcript with topics and entities
+        let topics_json = if extraction.topics.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&extraction.topics)?)
+        };
+
+        // Combine people and organizations into entities JSON
+        let entities: Vec<serde_json::Value> = extraction
+            .people
+            .iter()
+            .map(|p| {
+                let name = p.resolved_to.as_deref().unwrap_or(&p.name);
+                serde_json::json!({"type": "person", "name": name, "context": p.context})
+            })
+            .chain(
+                extraction
+                    .organizations
+                    .iter()
+                    .map(|o| {
+                        let name = o.resolved_to.as_deref().unwrap_or(&o.name);
+                        serde_json::json!({"type": "organization", "name": name, "context": o.context})
+                    }),
+            )
+            .collect();
+
+        let entities_json = if entities.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&entities)?)
+        };
+
+        self.db_manager.db.update_transcript_enrichment(
+            recording_id,
+            entities_json.as_deref(),
+            topics_json.as_deref(),
+        )?;
+
+        // Update transcript with corrected names (both DB and file on disk)
+        if corrected_transcript != transcript_content {
+            self.db_manager.db.upsert_transcript(recording_id, &corrected_transcript)?;
+            let _ = std::fs::write(transcript_path, &corrected_transcript);
+            if verbose {
+                println!("  ✏️ Transcript updated with canonical entity names");
+            }
+        }
+
+        // Process entity linking — entities are already resolved by the LLM
+        if verbose {
+            println!("  🔗 Linking entities...");
+        }
+
+        let linker = EntityLinker::new();
+        let report = linker
+            .process_extraction(&mut self.db_manager.db, recording_id, &extraction)?;
+
+        if verbose {
+            println!(
+                "  ✅ Entity linking complete: {} linked, {} created",
+                report.linked_existing, report.created_new
+            );
+        }
+
+        // Evolve world: LLM produces a delta, we apply it to entities first,
+        // then rebuild world.md from entities (entities are the source of truth).
+        if config.evolve_world && world.has_content() {
+            if verbose {
+                println!("  🌍 Evolving world understanding...");
+            }
+
+            // Get current world JSON for the evolution prompt
+            let world_json = if let Some(data) = world.parsed() {
+                data.to_json().unwrap_or_default()
+            } else {
+                // Migrate legacy world to structured format
+                if verbose {
+                    println!("  🔄 Migrating world to structured format...");
+                }
+                match service.extract_world_seed(&world.content).await {
+                    Ok(data) => data.to_json().unwrap_or_default(),
+                    Err(_) => world.content.clone(),
+                }
+            };
+
+            match service
+                .evolve_world(&world_json, &transcript_content, &extraction)
+                .await
+            {
+                Ok(Some(delta)) => {
+                    // Apply delta to entities (source of truth)
+                    if let Err(e) = apply_world_delta_to_entities(&mut self.db_manager.db, &delta) {
+                        if verbose {
+                            eprintln!("  ⚠️ Failed to apply delta to entities: {}", e);
+                        }
+                    }
+                    // Rebuild world.md from entities
+                    if let Err(e) = rebuild_world_from_entities(&self.db_manager.db) {
+                        if verbose {
+                            eprintln!("  ⚠️ Failed to rebuild world: {}", e);
+                        }
+                    } else if verbose {
+                        println!("  ✅ World description updated");
+                    }
+                }
+                Ok(None) => {
+                    if verbose {
+                        println!("  ⚠️ No new changes from this recording");
+                    }
+                }
+                Err(e) => {
+                    if verbose {
+                        eprintln!("  ⚠️ Failed to evolve world (non-fatal): {}", e);
+                    }
+                }
+            }
+        }
+
+        if verbose {
+            println!("✅ Knowledge extraction complete!");
+        }
+
+        Ok(())
+    }
+
+    /// Enrich an existing recording (for manual enrichment or re-enrichment).
+    pub async fn enrich_existing_recording(
+        &mut self,
+        directory_name: &str,
+        verbose: bool,
+    ) -> Result<()> {
+        let recording_dir = BASE_PATH.join(directory_name);
+        let transcript_path = recording_dir.join("transcript.txt");
+
+        if !transcript_path.exists() {
+            return Err(anyhow::anyhow!(
+                "No transcript found for recording: {}",
+                directory_name
+            ));
+        }
+
+        self.enrich_recording(directory_name, &transcript_path, verbose)
+            .await
     }
 
     /// Unified transcription workflow that works with any ManagedRecording (verbose).
@@ -453,6 +722,16 @@ impl WorkflowManager {
             );
         }
 
+        // Check enrichment/Ollama availability
+        if self.config.enrichment.enabled {
+            // We can't await here since health_check is not async, so we just note the config
+            warnings.push(format!(
+                "Enrichment enabled - requires Ollama at {} with model '{}'",
+                self.config.enrichment.ollama_endpoint,
+                self.config.enrichment.ollama_model
+            ));
+        }
+
         let status = if issues.is_empty() {
             HealthStatusLevel::Healthy
         } else {
@@ -465,6 +744,168 @@ impl WorkflowManager {
             warnings,
         })
     }
+}
+
+/// Rebuild world.md entirely from the entity database.
+///
+/// Entities are the source of truth. The world file is a derived view
+/// used to give the LLM context during extraction.
+pub fn rebuild_world_from_entities(db: &Database) -> Result<()> {
+    let all_entities = db.list_entities(None, None)?;
+
+    let mut world = WorldData::default();
+
+    for entity in &all_entities {
+        let aliases = entity.aliases_list();
+        let context = entity.context.clone().unwrap_or_default();
+
+        match entity.entity_type.as_str() {
+            "person" => {
+                // Check if this is the owner
+                let is_owner = context.contains("Owner of this Scriba instance");
+
+                if is_owner {
+                    world.owner.name = entity.canonical_name.clone();
+                    world.owner.aliases = aliases;
+                    // Parse role and organization from context
+                    // Context format: "Owner of this Scriba instance. CTO at Exein"
+                    let parts: Vec<&str> = context.splitn(2, '.').collect();
+                    if parts.len() > 1 {
+                        let role_part = parts[1].trim();
+                        if let Some(at_idx) = role_part.find(" at ") {
+                            world.owner.role = role_part[..at_idx].to_string();
+                            world.owner.organization = role_part[at_idx + 4..].to_string();
+                        } else {
+                            world.owner.role = role_part.to_string();
+                        }
+                    }
+                } else {
+                    world.people.push(PersonInfo {
+                        name: entity.canonical_name.clone(),
+                        relationship: context,
+                        aliases,
+                    });
+                }
+            }
+            "organization" => {
+                world.organizations.push(OrgInfo {
+                    name: entity.canonical_name.clone(),
+                    description: context,
+                    aliases,
+                });
+            }
+            "project" => {
+                world.projects.push(ProjectInfo {
+                    name: entity.canonical_name.clone(),
+                    description: context,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Preserve interests and beliefs from existing world (no entity backing)
+    if let Ok(current_world) = WorldContext::load() {
+        if let Some(current_data) = current_world.parsed() {
+            world.interests = current_data.interests;
+            world.beliefs = current_data.beliefs;
+            // Preserve owner location if not derivable from entities
+            if world.owner.location.is_empty() {
+                world.owner.location = current_data.owner.location;
+            }
+        }
+    }
+
+    let mut world_ctx = WorldContext::load().unwrap_or_default();
+    world_ctx.update_data(&world)?;
+
+    Ok(())
+}
+
+/// Apply a world evolution delta directly to the entity database.
+///
+/// Instead of merging into world.md first, we apply changes to entities
+/// (the source of truth), then rebuild the world from them.
+fn apply_world_delta_to_entities(db: &mut Database, delta: &WorldData) -> Result<()> {
+    let mut registry = EntityRegistry::new(db);
+
+    // Apply owner changes
+    if !delta.owner.name.is_empty() {
+        if let Some(entity) = registry.get_entity_by_name(&delta.owner.name)? {
+            let entity_id = entity.id.unwrap();
+            for alias in &delta.owner.aliases {
+                registry.add_entity_alias(entity_id, alias)?;
+            }
+        }
+    }
+
+    // Apply people changes
+    for person in &delta.people {
+        if person.name.is_empty() {
+            continue;
+        }
+        match registry.get_entity_by_name(&person.name)? {
+            Some(entity) => {
+                let entity_id = entity.id.unwrap();
+                if !person.relationship.is_empty() {
+                    let mut existing_ctx = entity.context.unwrap_or_default();
+                    append_new_facts(&mut existing_ctx, &person.relationship);
+                    registry.update_entity_context(entity_id, &existing_ctx)?;
+                }
+                for alias in &person.aliases {
+                    registry.add_entity_alias(entity_id, alias)?;
+                }
+            }
+            None => {
+                let ctx = if person.relationship.is_empty() {
+                    None
+                } else {
+                    Some(person.relationship.as_str())
+                };
+                let new_entity = registry.create_entity("person", &person.name, ctx)?;
+                if let Some(entity_id) = new_entity.id {
+                    for alias in &person.aliases {
+                        registry.add_entity_alias(entity_id, alias)?;
+                    }
+                }
+            }
+        }
+    }
+
+    // Apply organization changes
+    for org in &delta.organizations {
+        if org.name.is_empty() {
+            continue;
+        }
+        match registry.get_entity_by_name(&org.name)? {
+            Some(entity) => {
+                let entity_id = entity.id.unwrap();
+                if !org.description.is_empty() {
+                    let mut existing_ctx = entity.context.unwrap_or_default();
+                    append_new_facts(&mut existing_ctx, &org.description);
+                    registry.update_entity_context(entity_id, &existing_ctx)?;
+                }
+                for alias in &org.aliases {
+                    registry.add_entity_alias(entity_id, alias)?;
+                }
+            }
+            None => {
+                let ctx = if org.description.is_empty() {
+                    None
+                } else {
+                    Some(org.description.as_str())
+                };
+                let new_entity = registry.create_entity("organization", &org.name, ctx)?;
+                if let Some(entity_id) = new_entity.id {
+                    for alias in &org.aliases {
+                        registry.add_entity_alias(entity_id, alias)?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Health status for workflow manager.

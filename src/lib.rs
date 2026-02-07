@@ -9,6 +9,8 @@
 
 pub mod core;
 pub mod database;
+pub mod enrichment;
+pub mod entities;
 pub mod errors;
 pub mod mcp;
 pub mod tui;
@@ -16,8 +18,10 @@ pub mod utils;
 
 // Re-export commonly used types for backward compatibility and convenience
 pub use core::{
-    AudioEncoder, AudioFormat, CompressionSettings, LocalModelSize, ScribaConfig,
+    AudioEncoder, AudioFormat, CompressionSettings, EnrichmentConfig, LocalModelSize, ScribaConfig,
     TranscriptionMode, WorkflowManager,
 };
-pub use database::{Database, Recording, RecordingStats, Transcript};
+pub use database::{Database, Entity, Recording, RecordingStats, Transcript};
+pub use enrichment::{EnrichmentService, ExtractionResult, OllamaClient};
+pub use entities::{EntityLinker, EntityRegistry};
 pub use tui::Dashboard;

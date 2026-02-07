@@ -6,7 +6,7 @@ use dirs::home_dir;
 use rusqlite::{params, Connection, Row};
 use std::path::PathBuf;
 
-use super::models::{Recording, RecordingStats, Transcript};
+use super::models::{Entity, EntityMentionRecord, Recording, RecordingStats, Transcript};
 
 /// Maps a SQLite row to a Recording struct.
 /// This eliminates the duplicate mapping code that was in 4+ places.
@@ -631,6 +631,406 @@ impl Database {
         if shm_path.exists() {
             std::fs::remove_file(&shm_path).ok();
         }
+
+        Ok(())
+    }
+
+    // =========================================================================
+    // Entity Operations
+    // =========================================================================
+
+    /// Insert a new entity into the database.
+    pub fn insert_entity(&mut self, entity: &Entity) -> Result<i64> {
+        let sql = r#"
+            INSERT INTO entities (
+                entity_type, canonical_name, aliases, context, metadata,
+                mention_count, first_seen_at, last_seen_at, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#;
+
+        self.conn.execute(
+            sql,
+            params![
+                entity.entity_type,
+                entity.canonical_name,
+                entity.aliases,
+                entity.context,
+                entity.metadata,
+                entity.mention_count,
+                entity.first_seen_at,
+                entity.last_seen_at,
+                entity.created_at,
+                entity.updated_at,
+            ],
+        )?;
+
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get an entity by ID.
+    pub fn get_entity(&self, id: i64) -> Result<Option<Entity>> {
+        let sql = "SELECT * FROM entities WHERE id = ?1";
+        let mut stmt = self.conn.prepare(sql)?;
+
+        let mut rows = stmt.query_map([id], |row| {
+            Ok(Entity {
+                id: Some(row.get(0)?),
+                entity_type: row.get(1)?,
+                canonical_name: row.get(2)?,
+                aliases: row.get(3)?,
+                context: row.get(4)?,
+                metadata: row.get(5)?,
+                mention_count: row.get(6)?,
+                first_seen_at: row.get(7)?,
+                last_seen_at: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        })?;
+
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Get an entity by canonical name (case-insensitive).
+    pub fn get_entity_by_name(&self, name: &str) -> Result<Option<Entity>> {
+        let sql = "SELECT * FROM entities WHERE LOWER(canonical_name) = LOWER(?1)";
+        let mut stmt = self.conn.prepare(sql)?;
+
+        let mut rows = stmt.query_map([name], |row| {
+            Ok(Entity {
+                id: Some(row.get(0)?),
+                entity_type: row.get(1)?,
+                canonical_name: row.get(2)?,
+                aliases: row.get(3)?,
+                context: row.get(4)?,
+                metadata: row.get(5)?,
+                mention_count: row.get(6)?,
+                first_seen_at: row.get(7)?,
+                last_seen_at: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        })?;
+
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all entities, optionally filtered by type.
+    pub fn list_entities(&self, entity_type: Option<&str>, limit: Option<i64>) -> Result<Vec<Entity>> {
+        let sql = match (entity_type, limit) {
+            (Some(t), Some(l)) => format!(
+                "SELECT * FROM entities WHERE entity_type = '{}' ORDER BY mention_count DESC, canonical_name LIMIT {}",
+                t, l
+            ),
+            (Some(t), None) => format!(
+                "SELECT * FROM entities WHERE entity_type = '{}' ORDER BY mention_count DESC, canonical_name",
+                t
+            ),
+            (None, Some(l)) => format!(
+                "SELECT * FROM entities ORDER BY mention_count DESC, canonical_name LIMIT {}",
+                l
+            ),
+            (None, None) => "SELECT * FROM entities ORDER BY mention_count DESC, canonical_name".to_string(),
+        };
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Entity {
+                id: Some(row.get(0)?),
+                entity_type: row.get(1)?,
+                canonical_name: row.get(2)?,
+                aliases: row.get(3)?,
+                context: row.get(4)?,
+                metadata: row.get(5)?,
+                mention_count: row.get(6)?,
+                first_seen_at: row.get(7)?,
+                last_seen_at: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        })?;
+
+        let mut entities = Vec::new();
+        for row in rows {
+            entities.push(row?);
+        }
+        Ok(entities)
+    }
+
+    /// Update an entity.
+    pub fn update_entity(&mut self, entity: &Entity) -> Result<()> {
+        let sql = r#"
+            UPDATE entities SET
+                entity_type = ?1, canonical_name = ?2, aliases = ?3, context = ?4,
+                metadata = ?5, mention_count = ?6, first_seen_at = ?7, last_seen_at = ?8,
+                updated_at = ?9
+            WHERE id = ?10
+        "#;
+
+        self.conn.execute(
+            sql,
+            params![
+                entity.entity_type,
+                entity.canonical_name,
+                entity.aliases,
+                entity.context,
+                entity.metadata,
+                entity.mention_count,
+                entity.first_seen_at,
+                entity.last_seen_at,
+                Utc::now(),
+                entity.id,
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    /// Delete an entity.
+    pub fn delete_entity(&mut self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM entities WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Increment entity mention count and update last_seen_at.
+    pub fn increment_entity_mention(&mut self, id: i64) -> Result<()> {
+        let sql = r#"
+            UPDATE entities SET
+                mention_count = mention_count + 1,
+                last_seen_at = ?1,
+                updated_at = ?1
+            WHERE id = ?2
+        "#;
+
+        self.conn.execute(sql, params![Utc::now(), id])?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // Entity Mention Operations
+    // =========================================================================
+
+    /// Insert a new entity mention.
+    pub fn insert_entity_mention(&mut self, mention: &EntityMentionRecord) -> Result<i64> {
+        let sql = r#"
+            INSERT INTO entity_mentions (
+                entity_id, recording_id, mention_text, context_snippet,
+                confidence, linked_at, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#;
+
+        self.conn.execute(
+            sql,
+            params![
+                mention.entity_id,
+                mention.recording_id,
+                mention.mention_text,
+                mention.context_snippet,
+                mention.confidence,
+                mention.linked_at,
+                mention.created_at,
+            ],
+        )?;
+
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get all mentions for a recording.
+    pub fn get_mentions_for_recording(&self, recording_id: i64) -> Result<Vec<EntityMentionRecord>> {
+        let sql = "SELECT * FROM entity_mentions WHERE recording_id = ?1 ORDER BY id";
+        let mut stmt = self.conn.prepare(sql)?;
+
+        let rows = stmt.query_map([recording_id], |row| {
+            Ok(EntityMentionRecord {
+                id: Some(row.get(0)?),
+                entity_id: row.get(1)?,
+                recording_id: row.get(2)?,
+                mention_text: row.get(3)?,
+                context_snippet: row.get(4)?,
+                confidence: row.get(5)?,
+                linked_at: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+
+        let mut mentions = Vec::new();
+        for row in rows {
+            mentions.push(row?);
+        }
+        Ok(mentions)
+    }
+
+    /// Get all mentions for an entity.
+    pub fn get_mentions_for_entity(&self, entity_id: i64) -> Result<Vec<EntityMentionRecord>> {
+        let sql = "SELECT * FROM entity_mentions WHERE entity_id = ?1 ORDER BY created_at DESC";
+        let mut stmt = self.conn.prepare(sql)?;
+
+        let rows = stmt.query_map([entity_id], |row| {
+            Ok(EntityMentionRecord {
+                id: Some(row.get(0)?),
+                entity_id: row.get(1)?,
+                recording_id: row.get(2)?,
+                mention_text: row.get(3)?,
+                context_snippet: row.get(4)?,
+                confidence: row.get(5)?,
+                linked_at: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+
+        let mut mentions = Vec::new();
+        for row in rows {
+            mentions.push(row?);
+        }
+        Ok(mentions)
+    }
+
+    /// Get unlinked mentions (entity_id is NULL).
+    pub fn get_unlinked_mentions(&self, limit: Option<i64>) -> Result<Vec<EntityMentionRecord>> {
+        let sql = match limit {
+            Some(l) => format!(
+                "SELECT * FROM entity_mentions WHERE entity_id IS NULL ORDER BY created_at DESC LIMIT {}",
+                l
+            ),
+            None => "SELECT * FROM entity_mentions WHERE entity_id IS NULL ORDER BY created_at DESC".to_string(),
+        };
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok(EntityMentionRecord {
+                id: Some(row.get(0)?),
+                entity_id: row.get(1)?,
+                recording_id: row.get(2)?,
+                mention_text: row.get(3)?,
+                context_snippet: row.get(4)?,
+                confidence: row.get(5)?,
+                linked_at: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+
+        let mut mentions = Vec::new();
+        for row in rows {
+            mentions.push(row?);
+        }
+        Ok(mentions)
+    }
+
+    /// Link a mention to an entity.
+    pub fn link_mention_to_entity(
+        &mut self,
+        mention_id: i64,
+        entity_id: i64,
+        confidence: f64,
+    ) -> Result<()> {
+        let sql = r#"
+            UPDATE entity_mentions SET
+                entity_id = ?1, confidence = ?2, linked_at = ?3
+            WHERE id = ?4
+        "#;
+
+        self.conn
+            .execute(sql, params![entity_id, confidence, Utc::now(), mention_id])?;
+        Ok(())
+    }
+
+    /// Unlink a mention from its entity.
+    pub fn unlink_mention(&mut self, mention_id: i64) -> Result<()> {
+        let sql = "UPDATE entity_mentions SET entity_id = NULL, linked_at = NULL WHERE id = ?1";
+        self.conn.execute(sql, params![mention_id])?;
+        Ok(())
+    }
+
+    /// Reassign all mentions from one entity to another.
+    /// Used when merging entities.
+    pub fn reassign_mentions(&mut self, from_entity_id: i64, to_entity_id: i64) -> Result<usize> {
+        let sql = r#"
+            UPDATE entity_mentions SET
+                entity_id = ?1,
+                linked_at = ?2
+            WHERE entity_id = ?3
+        "#;
+
+        let count = self
+            .conn
+            .execute(sql, params![to_entity_id, Utc::now(), from_entity_id])?;
+        Ok(count)
+    }
+
+    /// Get recordings that mention a specific entity.
+    pub fn get_recordings_for_entity(&self, entity_id: i64) -> Result<Vec<Recording>> {
+        let sql = r#"
+            SELECT DISTINCT r.* FROM recordings r
+            JOIN entity_mentions em ON r.id = em.recording_id
+            WHERE em.entity_id = ?1
+            ORDER BY r.created_at DESC
+        "#;
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([entity_id], row_to_recording)?;
+
+        let mut recordings = Vec::new();
+        for row in rows {
+            recordings.push(row?);
+        }
+        Ok(recordings)
+    }
+
+    // =========================================================================
+    // Enrichment Updates
+    // =========================================================================
+
+    /// Update recording with enrichment data (summary, key_points, action_items).
+    pub fn update_recording_enrichment(
+        &mut self,
+        recording_id: i64,
+        display_name: Option<&str>,
+        summary: Option<&str>,
+        key_points: Option<&str>,
+        action_items: Option<&str>,
+    ) -> Result<()> {
+        let sql = r#"
+            UPDATE recordings SET
+                display_name = COALESCE(?1, display_name),
+                summary = ?2,
+                key_points = ?3,
+                action_items = ?4,
+                updated_at = ?5
+            WHERE id = ?6
+        "#;
+
+        self.conn.execute(
+            sql,
+            params![display_name, summary, key_points, action_items, Utc::now(), recording_id],
+        )?;
+
+        Ok(())
+    }
+
+    /// Update transcript with enrichment data (entities, topics).
+    pub fn update_transcript_enrichment(
+        &mut self,
+        recording_id: i64,
+        entities: Option<&str>,
+        topics: Option<&str>,
+    ) -> Result<()> {
+        let sql = r#"
+            UPDATE transcripts SET
+                entities = ?1,
+                topics = ?2,
+                updated_at = ?3
+            WHERE recording_id = ?4
+        "#;
+
+        self.conn
+            .execute(sql, params![entities, topics, Utc::now(), recording_id])?;
 
         Ok(())
     }
