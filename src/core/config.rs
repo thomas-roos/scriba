@@ -77,6 +77,14 @@ pub struct EnrichmentConfig {
     pub ollama_model: String,
     /// Confidence threshold for automatic entity linking (0.0-1.0).
     pub auto_link_threshold: f32,
+    /// Whether to evolve the world description after each enrichment.
+    /// The world is Scriba's evolving understanding of its owner.
+    #[serde(default = "default_evolve_world")]
+    pub evolve_world: bool,
+}
+
+fn default_evolve_world() -> bool {
+    true
 }
 
 impl Default for EnrichmentConfig {
@@ -86,6 +94,7 @@ impl Default for EnrichmentConfig {
             ollama_endpoint: "http://localhost:11434".to_string(),
             ollama_model: "llama3.2".to_string(),
             auto_link_threshold: 0.8,
+            evolve_world: true,
         }
     }
 }

@@ -65,33 +65,6 @@ impl<'a> EntityRegistry<'a> {
         self.db.list_entities(entity_type, limit)
     }
 
-    /// Find entities that might match a mention text.
-    /// Checks canonical name and aliases (case-insensitive).
-    pub fn find_candidate_entities(&self, mention_text: &str) -> Result<Vec<Entity>> {
-        let all_entities = self.db.list_entities(None, None)?;
-        let mention_lower = mention_text.to_lowercase();
-
-        let candidates: Vec<Entity> = all_entities
-            .into_iter()
-            .filter(|e| {
-                // Check canonical name
-                if e.canonical_name.to_lowercase().contains(&mention_lower)
-                    || mention_lower.contains(&e.canonical_name.to_lowercase())
-                {
-                    return true;
-                }
-
-                // Check aliases
-                let aliases = e.aliases_list();
-                aliases
-                    .iter()
-                    .any(|a| a.to_lowercase() == mention_lower || mention_lower.contains(&a.to_lowercase()))
-            })
-            .collect();
-
-        Ok(candidates)
-    }
-
     /// Update an entity's context.
     pub fn update_entity_context(&mut self, id: i64, new_context: &str) -> Result<()> {
         if let Some(mut entity) = self.db.get_entity(id)? {
@@ -106,6 +79,80 @@ impl<'a> EntityRegistry<'a> {
         if let Some(mut entity) = self.db.get_entity(id)? {
             entity.add_alias(alias);
             self.db.update_entity(&entity)?;
+        }
+        Ok(())
+    }
+
+    /// Remove an alias from an entity.
+    pub fn remove_entity_alias(&mut self, id: i64, alias: &str) -> Result<()> {
+        if let Some(mut entity) = self.db.get_entity(id)? {
+            entity.remove_alias(alias);
+            self.db.update_entity(&entity)?;
+        }
+        Ok(())
+    }
+
+    /// Rename an entity (old name becomes an alias automatically).
+    pub fn rename_entity(&mut self, id: i64, new_name: &str) -> Result<()> {
+        if let Some(mut entity) = self.db.get_entity(id)? {
+            // Add old name as alias (if different)
+            if entity.canonical_name.to_lowercase() != new_name.to_lowercase() {
+                let old_name = entity.canonical_name.clone();
+                entity.add_alias(&old_name);
+            }
+            entity.canonical_name = new_name.to_string();
+            self.db.update_entity(&entity)?;
+        }
+        Ok(())
+    }
+
+    /// Merge one entity into another.
+    /// Source entity's name, aliases, mentions, and context are merged into target.
+    /// Source entity is deleted after merge.
+    pub fn merge_entities(&mut self, source_id: i64, target_id: i64) -> Result<()> {
+        let source = self.db.get_entity(source_id)?;
+        let target = self.db.get_entity(target_id)?;
+
+        if let (Some(source), Some(mut target)) = (source, target) {
+            // Add source name and aliases to target
+            target.add_alias(&source.canonical_name);
+            for alias in source.aliases_list() {
+                target.add_alias(&alias);
+            }
+
+            // Combine contexts
+            if let Some(src_ctx) = &source.context {
+                let new_ctx = match &target.context {
+                    Some(tgt_ctx) => format!("{} {}", tgt_ctx, src_ctx),
+                    None => src_ctx.clone(),
+                };
+                target.context = Some(new_ctx);
+            }
+
+            // Update mention counts
+            target.mention_count += source.mention_count;
+
+            // Update first_seen_at to earliest
+            if let (Some(src_first), Some(tgt_first)) = (source.first_seen_at, target.first_seen_at)
+            {
+                if src_first < tgt_first {
+                    target.first_seen_at = Some(src_first);
+                }
+            }
+
+            // Update last_seen_at to latest
+            if let (Some(src_last), Some(tgt_last)) = (source.last_seen_at, target.last_seen_at) {
+                if src_last > tgt_last {
+                    target.last_seen_at = Some(src_last);
+                }
+            }
+
+            // Move all mentions to target
+            self.db.reassign_mentions(source_id, target_id)?;
+
+            // Update target and delete source
+            self.db.update_entity(&target)?;
+            self.db.delete_entity(source_id)?;
         }
         Ok(())
     }

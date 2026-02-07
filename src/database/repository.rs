@@ -948,6 +948,22 @@ impl Database {
         Ok(())
     }
 
+    /// Reassign all mentions from one entity to another.
+    /// Used when merging entities.
+    pub fn reassign_mentions(&mut self, from_entity_id: i64, to_entity_id: i64) -> Result<usize> {
+        let sql = r#"
+            UPDATE entity_mentions SET
+                entity_id = ?1,
+                linked_at = ?2
+            WHERE entity_id = ?3
+        "#;
+
+        let count = self
+            .conn
+            .execute(sql, params![to_entity_id, Utc::now(), from_entity_id])?;
+        Ok(count)
+    }
+
     /// Get recordings that mention a specific entity.
     pub fn get_recordings_for_entity(&self, entity_id: i64) -> Result<Vec<Recording>> {
         let sql = r#"

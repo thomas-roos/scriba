@@ -11,8 +11,8 @@ use super::recording::{record_audio, RecordOptions};
 use super::transcription::transcribe_audio;
 use super::types::{ManagedRecording, RecordingConfig, RecordingMode};
 use crate::database::{Database, Recording};
-use crate::enrichment::EnrichmentService;
-use crate::entities::EntityLinker;
+use crate::enrichment::{EnrichmentService, WorldContext, WorldData};
+use crate::entities::{EntityLinker, EntityRegistry};
 use crate::utils::{generate_recording_name, BASE_PATH};
 use chrono::Utc;
 
@@ -312,9 +312,23 @@ impl WorkflowManager {
             println!("  📊 Extracting metadata from transcript...");
         }
 
-        // Extract metadata
+        // Load world context (Scriba's understanding of the owner)
+        let mut world = WorldContext::load().unwrap_or_default();
+        let world_content = if world.has_content() {
+            if verbose {
+                println!("  🌍 Using world context for extraction");
+            }
+            Some(world.content.clone())
+        } else {
+            None
+        };
+
+        // Extract metadata with world context — the LLM resolves entities inline
         let extraction = service
-            .extract(&transcript_content)
+            .extract_with_full_context(
+                &transcript_content,
+                world_content.as_deref(),
+            )
             .await
             .context("Failed to extract metadata from transcript")?;
 
@@ -346,12 +360,7 @@ impl WorkflowManager {
             Some(serde_json::to_string(&extraction.action_items)?)
         };
 
-        // Only set display_name if not already set
-        let display_name = if recording.display_name.is_none() {
-            Some(extraction.title.as_str())
-        } else {
-            None
-        };
+        let display_name = Some(extraction.title.as_str());
 
         self.db_manager.db.update_recording_enrichment(
             recording_id,
@@ -393,21 +402,94 @@ impl WorkflowManager {
             topics_json.as_deref(),
         )?;
 
-        // Process entity linking
+        // Process entity linking — entities are already resolved by the LLM
         if verbose {
             println!("  🔗 Linking entities...");
         }
 
-        let linker = EntityLinker::new(service, config.auto_link_threshold);
+        let linker = EntityLinker::new();
         let report = linker
-            .process_extraction(&mut self.db_manager.db, recording_id, &extraction)
-            .await?;
+            .process_extraction(&mut self.db_manager.db, recording_id, &extraction)?;
 
         if verbose {
             println!(
-                "  ✅ Entity linking complete: {} linked, {} created, {} unlinked",
-                report.linked_existing, report.created_new, report.unlinked
+                "  ✅ Entity linking complete: {} linked, {} created",
+                report.linked_existing, report.created_new
             );
+        }
+
+        // Evolve world description if enabled and world exists
+        if config.evolve_world && world.has_content() {
+            if verbose {
+                println!("  🌍 Evolving world understanding...");
+            }
+
+            // Migrate legacy (non-JSON) world to structured format first
+            let mut world_data = if let Some(data) = world.parsed() {
+                data
+            } else {
+                if verbose {
+                    println!("  🔄 Migrating world to structured format...");
+                }
+                match service.extract_world_seed(&world.content).await {
+                    Ok(data) => data,
+                    Err(e) => {
+                        if verbose {
+                            eprintln!("  ⚠️ Could not migrate world: {}", e);
+                        }
+                        WorldData::default()
+                    }
+                }
+            };
+
+            match service
+                .evolve_world(
+                    &world_data.to_json().unwrap_or_default(),
+                    &transcript_content,
+                    &extraction,
+                )
+                .await
+            {
+                Ok(Some(delta)) => {
+                    world_data.merge(&delta);
+                    if let Err(e) = world.update_data(&world_data) {
+                        if verbose {
+                            eprintln!("  ⚠️ Failed to save world update: {}", e);
+                        }
+                    } else if verbose {
+                        println!("  ✅ World description updated");
+                    }
+                }
+                Ok(None) => {
+                    // Delta parse failed, but if we migrated, still save the migration
+                    if let Err(e) = world.update_data(&world_data) {
+                        if verbose {
+                            eprintln!("  ⚠️ Failed to save world: {}", e);
+                        }
+                    } else if verbose {
+                        println!("  ⚠️ No new changes from this recording");
+                    }
+                }
+                Err(e) => {
+                    if verbose {
+                        eprintln!("  ⚠️ Failed to evolve world (non-fatal): {}", e);
+                    }
+                }
+            }
+        }
+
+        // Sync world entities to database (ensures DB stays in sync with world)
+        if world.has_content() {
+            if let Some(world_data) = world.parsed() {
+                if let Err(e) = sync_world_to_entities(&mut self.db_manager.db, &world_data) {
+                    if verbose {
+                        eprintln!("  ⚠️ Failed to sync world to entities: {}", e);
+                    }
+                }
+            }
+        }
+
+        if verbose {
             println!("✅ Knowledge extraction complete!");
         }
 
@@ -651,6 +733,104 @@ impl WorkflowManager {
             warnings,
         })
     }
+}
+
+/// Sync world entities to the database.
+///
+/// For each person and organization in the world, ensure a corresponding
+/// entity exists in the database. Updates context if the world has richer info.
+fn sync_world_to_entities(db: &mut Database, world: &WorldData) -> Result<()> {
+    let mut registry = EntityRegistry::new(db);
+
+    // Sync owner as a person entity
+    if !world.owner.name.is_empty() {
+        let owner_context = format!(
+            "Owner of this Scriba instance. {} at {}",
+            world.owner.role, world.owner.organization
+        );
+        match registry.get_entity_by_name(&world.owner.name)? {
+            Some(entity) => {
+                let entity_id = entity.id.unwrap();
+                // Update context if world has richer info
+                if owner_context.len() > entity.context.as_ref().map(|c| c.len()).unwrap_or(0) {
+                    registry.update_entity_context(entity_id, &owner_context)?;
+                }
+                // Sync aliases from world
+                for alias in &world.owner.aliases {
+                    registry.add_entity_alias(entity_id, alias)?;
+                }
+            }
+            None => {
+                let entity = registry.create_entity("person", &world.owner.name, Some(&owner_context))?;
+                if let Some(entity_id) = entity.id {
+                    for alias in &world.owner.aliases {
+                        registry.add_entity_alias(entity_id, alias)?;
+                    }
+                }
+            }
+        }
+    }
+
+    // Sync people
+    for person in &world.people {
+        if person.name.is_empty() {
+            continue;
+        }
+        match registry.get_entity_by_name(&person.name)? {
+            Some(entity) => {
+                let entity_id = entity.id.unwrap();
+                if !person.relationship.is_empty()
+                    && person.relationship.len() > entity.context.as_ref().map(|c| c.len()).unwrap_or(0)
+                {
+                    registry.update_entity_context(entity_id, &person.relationship)?;
+                }
+            }
+            None => {
+                let ctx = if person.relationship.is_empty() {
+                    None
+                } else {
+                    Some(person.relationship.as_str())
+                };
+                registry.create_entity("person", &person.name, ctx)?;
+            }
+        }
+    }
+
+    // Sync organizations
+    for org in &world.organizations {
+        if org.name.is_empty() {
+            continue;
+        }
+        match registry.get_entity_by_name(&org.name)? {
+            Some(entity) => {
+                let entity_id = entity.id.unwrap();
+                if !org.description.is_empty()
+                    && org.description.len() > entity.context.as_ref().map(|c| c.len()).unwrap_or(0)
+                {
+                    registry.update_entity_context(entity_id, &org.description)?;
+                }
+                // Sync aliases from world
+                for alias in &org.aliases {
+                    registry.add_entity_alias(entity_id, alias)?;
+                }
+            }
+            None => {
+                let ctx = if org.description.is_empty() {
+                    None
+                } else {
+                    Some(org.description.as_str())
+                };
+                let entity = registry.create_entity("organization", &org.name, ctx)?;
+                if let Some(entity_id) = entity.id {
+                    for alias in &org.aliases {
+                        registry.add_entity_alias(entity_id, alias)?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Health status for workflow manager.

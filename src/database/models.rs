@@ -111,6 +111,16 @@ impl Entity {
             self.set_aliases(aliases);
         }
     }
+
+    /// Remove an alias if present.
+    pub fn remove_alias(&mut self, alias: &str) {
+        let aliases: Vec<String> = self
+            .aliases_list()
+            .into_iter()
+            .filter(|a| !a.eq_ignore_ascii_case(alias))
+            .collect();
+        self.set_aliases(aliases);
+    }
 }
 
 /// Aggregated statistics for recordings.

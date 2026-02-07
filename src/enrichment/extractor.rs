@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ollama::OllamaClient;
 use super::prompts;
+use super::world::WorldData;
 
 /// Result of extracting metadata from a transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,25 +33,10 @@ pub struct ExtractedEntity {
     pub name: String,
     /// Context about this entity from the transcript.
     pub context: String,
-}
-
-/// A mention of an entity with surrounding context.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EntityMention {
-    /// The text of the mention as it appears in the transcript.
-    pub mention_text: String,
-    /// Surrounding context (~100 chars around the mention).
-    pub context_snippet: String,
-    /// Type of entity: "person" or "organization".
-    pub entity_type: String,
-}
-
-/// Result of entity linking check.
-#[derive(Debug, Clone, Deserialize)]
-pub struct LinkingResult {
-    pub is_match: bool,
-    pub confidence: f32,
-    pub reasoning: String,
+    /// If this entity matches a known entity from the world, the canonical name.
+    /// None means this is a genuinely new entity.
+    #[serde(default)]
+    pub resolved_to: Option<String>,
 }
 
 /// Result of context update.
@@ -60,7 +46,39 @@ pub struct ContextUpdateResult {
     pub new_facts: Vec<String>,
 }
 
+/// Entity extracted from world description.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorldEntityPerson {
+    pub name: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub context: String,
+    #[serde(default)]
+    pub is_owner: bool,
+}
+
+/// Organization extracted from world description.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorldEntityOrganization {
+    pub name: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub context: String,
+}
+
+/// Result of extracting entities from world description.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorldEntityExtractionResult {
+    #[serde(default)]
+    pub people: Vec<WorldEntityPerson>,
+    #[serde(default)]
+    pub organizations: Vec<WorldEntityOrganization>,
+}
+
 /// Service for extracting knowledge from transcripts using LLM.
+#[derive(Clone)]
 pub struct EnrichmentService {
     client: OllamaClient,
 }
@@ -103,35 +121,6 @@ impl EnrichmentService {
         Ok(result)
     }
 
-    /// Check if a mention matches a known entity.
-    pub async fn check_entity_match(
-        &self,
-        mention_text: &str,
-        mention_context: &str,
-        entity_name: &str,
-        entity_type: &str,
-        entity_context: &str,
-    ) -> Result<LinkingResult> {
-        let prompt = prompts::build_entity_linking_prompt(
-            mention_text,
-            mention_context,
-            entity_name,
-            entity_type,
-            entity_context,
-        );
-
-        let response = self
-            .client
-            .generate(&prompt)
-            .await
-            .context("Failed to check entity match")?;
-
-        let result: LinkingResult =
-            serde_json::from_str(&response).context("Failed to parse linking result")?;
-
-        Ok(result)
-    }
-
     /// Update entity context with new mentions.
     pub async fn update_entity_context(
         &self,
@@ -159,6 +148,134 @@ impl EnrichmentService {
         Ok(result)
     }
 
+    /// Extract metadata with world context.
+    ///
+    /// The world context contains everything the LLM needs: owner profile,
+    /// known people, organizations, etc. The LLM resolves entity mentions
+    /// inline against the world.
+    pub async fn extract_with_full_context(
+        &self,
+        transcript: &str,
+        world_context: Option<&str>,
+    ) -> Result<ExtractionResult> {
+        let prompt =
+            prompts::build_full_context_extraction_prompt(transcript, world_context);
+
+        let response = self
+            .client
+            .generate(&prompt)
+            .await
+            .context("Failed to generate full-context extraction")?;
+
+        // Parse the JSON response
+        let result: ExtractionResult =
+            serde_json::from_str(&response).context("Failed to parse extraction result")?;
+
+        Ok(result)
+    }
+
+    /// Evolve the world by extracting a conservative JSON delta from a new recording.
+    ///
+    /// Returns the parsed delta as `WorldData`. The caller is responsible for
+    /// merging it into the existing world via `WorldData::merge()`.
+    /// Returns `None` if the LLM response couldn't be parsed (non-fatal).
+    pub async fn evolve_world(
+        &self,
+        current_world: &str,
+        transcript: &str,
+        extraction: &ExtractionResult,
+    ) -> Result<Option<WorldData>> {
+        let extraction_summary = format!(
+            "Title: {}\nSummary: {}\nTopics: {}\nPeople: {}\nOrganizations: {}",
+            extraction.title,
+            extraction.summary,
+            extraction.topics.join(", "),
+            extraction
+                .people
+                .iter()
+                .map(|p| format!("{} ({})", p.name, p.context))
+                .collect::<Vec<_>>()
+                .join(", "),
+            extraction
+                .organizations
+                .iter()
+                .map(|o| format!("{} ({})", o.name, o.context))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        let prompt =
+            prompts::build_world_evolution_prompt(current_world, transcript, &extraction_summary);
+
+        let response = self
+            .client
+            .generate(&prompt)
+            .await
+            .context("Failed to evolve world description")?;
+
+        // Clean up LLM response
+        let cleaned = response
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
+        // Parse as WorldData delta
+        match WorldData::from_json(cleaned) {
+            Ok(delta) => Ok(Some(delta)),
+            Err(e) => {
+                eprintln!("  Warning: could not parse world evolution response as JSON: {}", e);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Extract entities from a world description.
+    ///
+    /// This is used when initializing the world to automatically create
+    /// entities mentioned in the owner's description.
+    pub async fn extract_world_entities(
+        &self,
+        world_content: &str,
+    ) -> Result<WorldEntityExtractionResult> {
+        let prompt = prompts::build_world_entity_extraction_prompt(world_content);
+
+        let response = self
+            .client
+            .generate(&prompt)
+            .await
+            .context("Failed to extract entities from world description")?;
+
+        // Parse the JSON response
+        let result: WorldEntityExtractionResult = serde_json::from_str(&response)
+            .context("Failed to parse world entity extraction result")?;
+
+        Ok(result)
+    }
+
+    /// Extract a structured world profile from a free-form seed description.
+    ///
+    /// Used during `world init` to convert the user's narrative into structured JSON.
+    pub async fn extract_world_seed(&self, seed_content: &str) -> Result<WorldData> {
+        let prompt = prompts::build_world_seed_extraction_prompt(seed_content);
+
+        let response = self
+            .client
+            .generate(&prompt)
+            .await
+            .context("Failed to extract world seed")?;
+
+        let cleaned = response
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
+        WorldData::from_json(cleaned).context("Failed to parse world seed extraction result")
+    }
+
     /// Get the underlying Ollama client.
     pub fn client(&self) -> &OllamaClient {
         &self.client
@@ -166,35 +283,14 @@ impl EnrichmentService {
 }
 
 impl ExtractionResult {
-    /// Convert people to entity mentions.
-    pub fn people_mentions(&self) -> Vec<EntityMention> {
-        self.people
+    /// Get all extracted entities (people + organizations) with their type.
+    pub fn all_entities(&self) -> Vec<(&ExtractedEntity, &str)> {
+        let mut entities: Vec<(&ExtractedEntity, &str)> = self.people
             .iter()
-            .map(|p| EntityMention {
-                mention_text: p.name.clone(),
-                context_snippet: p.context.clone(),
-                entity_type: "person".to_string(),
-            })
-            .collect()
-    }
-
-    /// Convert organizations to entity mentions.
-    pub fn organization_mentions(&self) -> Vec<EntityMention> {
-        self.organizations
-            .iter()
-            .map(|o| EntityMention {
-                mention_text: o.name.clone(),
-                context_snippet: o.context.clone(),
-                entity_type: "organization".to_string(),
-            })
-            .collect()
-    }
-
-    /// Get all entity mentions (people + organizations).
-    pub fn all_mentions(&self) -> Vec<EntityMention> {
-        let mut mentions = self.people_mentions();
-        mentions.extend(self.organization_mentions());
-        mentions
+            .map(|p| (p, "person"))
+            .collect();
+        entities.extend(self.organizations.iter().map(|o| (o, "organization")));
+        entities
     }
 }
 
@@ -219,10 +315,28 @@ mod tests {
         assert_eq!(result.topics.len(), 2);
         assert_eq!(result.people.len(), 1);
         assert_eq!(result.people[0].name, "John");
+        assert!(result.people[0].resolved_to.is_none());
     }
 
     #[test]
-    fn test_entity_mentions_conversion() {
+    fn test_extraction_result_with_resolved_to() {
+        let json = r#"{
+            "title": "Test",
+            "summary": "Test",
+            "topics": [],
+            "people": [{"name": "Gerardo", "context": "discussing budget", "resolved_to": "Gerardo Gagliardo"}],
+            "organizations": [{"name": "Exane", "context": "their product", "resolved_to": "Exein"}],
+            "key_points": [],
+            "action_items": []
+        }"#;
+
+        let result: ExtractionResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.people[0].resolved_to.as_deref(), Some("Gerardo Gagliardo"));
+        assert_eq!(result.organizations[0].resolved_to.as_deref(), Some("Exein"));
+    }
+
+    #[test]
+    fn test_all_entities() {
         let result = ExtractionResult {
             title: "Test".to_string(),
             summary: "Test summary".to_string(),
@@ -230,18 +344,21 @@ mod tests {
             people: vec![ExtractedEntity {
                 name: "John".to_string(),
                 context: "Engineer".to_string(),
+                resolved_to: None,
             }],
             organizations: vec![ExtractedEntity {
                 name: "Acme".to_string(),
                 context: "Company".to_string(),
+                resolved_to: Some("Acme Corp".to_string()),
             }],
             key_points: vec![],
             action_items: vec![],
         };
 
-        let mentions = result.all_mentions();
-        assert_eq!(mentions.len(), 2);
-        assert_eq!(mentions[0].entity_type, "person");
-        assert_eq!(mentions[1].entity_type, "organization");
+        let entities = result.all_entities();
+        assert_eq!(entities.len(), 2);
+        assert_eq!(entities[0].1, "person");
+        assert_eq!(entities[1].1, "organization");
+        assert_eq!(entities[1].0.resolved_to.as_deref(), Some("Acme Corp"));
     }
 }

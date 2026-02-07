@@ -2,7 +2,7 @@ use crate::core::{
     CompressionSettings, LocalModelSize, RecordOptions, ScribaConfig, TranscriptionMode,
     WorkflowManager, record_audio,
 };
-use crate::database::{Database, Recording, RecordingStats};
+use crate::database::{Database, Entity, Recording, RecordingStats};
 use crate::utils::generate_recording_name;
 use anyhow::Result;
 use crossterm::{
@@ -74,6 +74,16 @@ pub struct Dashboard {
     file_dialog_stage: FileDialogStage, // Current stage of file import process
     is_retranscribing: bool,            // Track if current transcription is a re-transcription
     is_importing: bool,                 // Track if current task is import+transcribe
+    // Entity view state
+    entities: Vec<Entity>,
+    entity_table_state: TableState,
+    selected_entity: Option<Entity>,
+    show_entity_detail: bool,
+    // Transcript enrichment data
+    transcript_summary: Option<String>,
+    transcript_key_points: Option<Vec<String>>,
+    transcript_topics: Option<Vec<String>>,
+    transcript_entities: Option<Vec<(String, String)>>, // (name, type)
 }
 
 #[derive(Debug, PartialEq)]
@@ -81,6 +91,7 @@ enum DashboardView {
     Main,
     Help,
     Settings,
+    Entities,
 }
 
 #[derive(Debug, PartialEq)]
@@ -151,6 +162,16 @@ impl Dashboard {
             file_dialog_stage: FileDialogStage::FilePath,
             is_retranscribing: false,
             is_importing: false,
+            // Entity view state
+            entities: Vec::new(),
+            entity_table_state: TableState::default(),
+            selected_entity: None,
+            show_entity_detail: false,
+            // Transcript enrichment data
+            transcript_summary: None,
+            transcript_key_points: None,
+            transcript_topics: None,
+            transcript_entities: None,
         })
     }
 
@@ -410,6 +431,10 @@ impl Dashboard {
             return self.handle_settings_keys(key_code).await;
         }
 
+        if self.current_view == DashboardView::Entities {
+            return self.handle_entities_keys(key_code).await;
+        }
+
         if self.show_transcript {
             return self.handle_transcript_keys(key_code).await;
         }
@@ -427,6 +452,11 @@ impl Dashboard {
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 self.current_view = DashboardView::Settings;
                 self.settings_selection = 0;
+            }
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                self.load_entities()?;
+                self.current_view = DashboardView::Entities;
+                self.entity_table_state.select(Some(0));
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 return Ok(DashboardAction::RecordAndTranscribe);
@@ -523,6 +553,77 @@ impl Dashboard {
         Ok(())
     }
 
+    fn load_entities(&mut self) -> Result<()> {
+        self.entities = self.db.list_entities(None, None)?;
+        if !self.entities.is_empty() && self.entity_table_state.selected().is_none() {
+            self.entity_table_state.select(Some(0));
+        }
+        Ok(())
+    }
+
+    async fn handle_entities_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
+        if self.show_entity_detail {
+            // Handle keys in entity detail popup
+            match key_code {
+                KeyCode::Esc => {
+                    self.show_entity_detail = false;
+                    self.selected_entity = None;
+                }
+                _ => {}
+            }
+            return Ok(DashboardAction::Continue);
+        }
+
+        match key_code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.current_view = DashboardView::Main;
+                self.show_entity_detail = false;
+                self.selected_entity = None;
+            }
+            KeyCode::Up => {
+                let i = match self.entity_table_state.selected() {
+                    Some(i) => {
+                        if i == 0 {
+                            self.entities.len().saturating_sub(1)
+                        } else {
+                            i - 1
+                        }
+                    }
+                    None => 0,
+                };
+                self.entity_table_state.select(Some(i));
+            }
+            KeyCode::Down => {
+                let i = match self.entity_table_state.selected() {
+                    Some(i) => {
+                        if i >= self.entities.len().saturating_sub(1) {
+                            0
+                        } else {
+                            i + 1
+                        }
+                    }
+                    None => 0,
+                };
+                self.entity_table_state.select(Some(i));
+            }
+            KeyCode::Enter => {
+                // Show entity detail popup
+                if let Some(idx) = self.entity_table_state.selected() {
+                    if let Some(entity) = self.entities.get(idx) {
+                        self.selected_entity = Some(entity.clone());
+                        self.show_entity_detail = true;
+                    }
+                }
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                // Refresh entities
+                self.load_entities()?;
+            }
+            _ => {}
+        }
+        Ok(DashboardAction::Continue)
+    }
+
     async fn handle_search_input(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
         match key_code {
             KeyCode::Esc => {
@@ -598,12 +699,14 @@ impl Dashboard {
 
     async fn show_selected_transcript(&mut self) -> Result<()> {
         if let Some(selected) = self.table_state.selected() {
-            if let Some(recording) = self.recordings.get(selected) {
+            if let Some(recording) = self.recordings.get(selected).cloned() {
                 if recording.has_transcript {
-                    match self.load_transcript_content(recording) {
+                    match self.load_transcript_content(&recording) {
                         Ok(content) => {
                             self.transcript_content = content;
                             self.show_transcript = true;
+                            // Load enrichment data
+                            self.load_enrichment_data(&recording);
                         }
                         Err(e) => {
                             self.message = format!("❌ Failed to load transcript: {}", e);
@@ -619,6 +722,47 @@ impl Dashboard {
             }
         }
         Ok(())
+    }
+
+    fn load_enrichment_data(&mut self, recording: &Recording) {
+        // Load summary and key points from recording
+        self.transcript_summary = recording.summary.clone();
+        self.transcript_key_points = recording
+            .key_points
+            .as_ref()
+            .and_then(|s| serde_json::from_str(s).ok());
+
+        // Load topics and entities from transcript
+        if let Some(id) = recording.id {
+            if let Ok(Some(transcript)) = self.db.get_transcript_by_recording_id(id) {
+                self.transcript_topics = transcript
+                    .topics
+                    .as_ref()
+                    .and_then(|s| serde_json::from_str(s).ok());
+
+                // Parse entities JSON: [{"name": "...", "type": "..."}]
+                self.transcript_entities = transcript.entities.as_ref().and_then(|s| {
+                    let parsed: Result<Vec<serde_json::Value>, _> = serde_json::from_str(s);
+                    parsed.ok().map(|entities| {
+                        entities
+                            .iter()
+                            .filter_map(|e| {
+                                let name = e.get("name")?.as_str()?.to_string();
+                                let entity_type = e.get("type")?.as_str()?.to_string();
+                                Some((name, entity_type))
+                            })
+                            .collect()
+                    })
+                });
+            }
+        }
+    }
+
+    fn clear_enrichment_data(&mut self) {
+        self.transcript_summary = None;
+        self.transcript_key_points = None;
+        self.transcript_topics = None;
+        self.transcript_entities = None;
     }
 
     async fn play_selected_recording(&mut self) -> Result<()> {
@@ -1044,6 +1188,7 @@ impl Dashboard {
                 self.show_transcript = false;
                 self.transcript_content.clear();
                 self.transcript_scroll_offset = 0;
+                self.clear_enrichment_data();
                 Ok(DashboardAction::Continue)
             }
             _ => {
@@ -1479,6 +1624,7 @@ impl Dashboard {
             DashboardView::Main => self.render_main_dashboard(f),
             DashboardView::Help => self.render_help(f, f.size()),
             DashboardView::Settings => self.render_settings(f, f.size()),
+            DashboardView::Entities => self.render_entities_view(f, f.size()),
         }
     }
 
@@ -1752,7 +1898,7 @@ impl Dashboard {
         let controls = if self.search_mode {
             "ESC: Cancel | ENTER: Search | Type to search..."
         } else {
-            "↑↓: Navigate | [/]: Pages | ENTER: Transcript | P: Play | D/Del: Delete | /: Search | R/A/T: Quick Actions | S: Settings | H: Help | Q: Quit"
+            "↑↓: Navigate | [/]: Pages | ENTER: Transcript | P: Play | D/Del: Delete | /: Search | R/A/T: Actions | E: Entities | S: Settings | H: Help | Q: Quit"
         };
 
         let controls_paragraph = Paragraph::new(controls)
@@ -2010,6 +2156,265 @@ impl Dashboard {
         f.render_widget(settings_paragraph, popup_area);
     }
 
+    fn render_entities_view(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
+        // Main layout: Header + Content + Footer
+        let main_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),  // Header
+                Constraint::Min(10),    // Entity table
+                Constraint::Length(3),  // Footer
+            ])
+            .split(area);
+
+        // Header
+        let header = Paragraph::new("🧠 KNOWLEDGE BASE - ENTITIES")
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .style(Style::default().fg(Color::Cyan)),
+            );
+        f.render_widget(header, main_chunks[0]);
+
+        // Entity table
+        let header_cells = ["ID", "Type", "Name", "Aliases", "Context", "Mentions"]
+            .iter()
+            .map(|h| {
+                Cell::from(*h).style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            });
+
+        let header_row = Row::new(header_cells)
+            .style(Style::default())
+            .height(1)
+            .bottom_margin(1);
+
+        let rows: Vec<Row> = self
+            .entities
+            .iter()
+            .map(|entity| {
+                let aliases = entity.aliases_list().join(", ");
+                let aliases_display = if aliases.is_empty() {
+                    "-".to_string()
+                } else if aliases.len() > 20 {
+                    format!("{}...", &aliases[..17])
+                } else {
+                    aliases
+                };
+
+                let context_display = entity
+                    .context
+                    .as_ref()
+                    .map(|c| {
+                        if c.len() > 30 {
+                            format!("{}...", &c[..27])
+                        } else {
+                            c.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+
+                let type_color = match entity.entity_type.as_str() {
+                    "person" => Color::Green,
+                    "organization" => Color::Blue,
+                    _ => Color::Gray,
+                };
+
+                let cells = vec![
+                    Cell::from(entity.id.unwrap_or(0).to_string()),
+                    Cell::from(entity.entity_type.clone()).style(Style::default().fg(type_color)),
+                    Cell::from(entity.canonical_name.clone())
+                        .style(Style::default().add_modifier(Modifier::BOLD)),
+                    Cell::from(aliases_display).style(Style::default().fg(Color::Gray)),
+                    Cell::from(context_display).style(Style::default().fg(Color::Gray)),
+                    Cell::from(entity.mention_count.to_string())
+                        .style(Style::default().fg(Color::Yellow)),
+                ];
+
+                Row::new(cells).height(1).bottom_margin(0)
+            })
+            .collect();
+
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(4),   // ID
+                Constraint::Length(12),  // Type
+                Constraint::Length(20),  // Name
+                Constraint::Length(22),  // Aliases
+                Constraint::Min(20),     // Context
+                Constraint::Length(8),   // Mentions
+            ],
+        )
+        .header(header_row)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .style(Style::default().fg(Color::Cyan))
+                .title(format!("Entities ({} total)", self.entities.len())),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+        f.render_stateful_widget(table, main_chunks[1], &mut self.entity_table_state);
+
+        // Footer
+        let footer = Paragraph::new("↑↓: Navigate | Enter: View Details | R: Refresh | Esc/Q: Back to Main")
+            .style(Style::default().fg(Color::White))
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .style(Style::default().fg(Color::Blue))
+                    .title("Controls"),
+            );
+        f.render_widget(footer, main_chunks[2]);
+
+        // Entity detail popup
+        if self.show_entity_detail {
+            self.render_entity_detail_popup(f, area);
+        }
+    }
+
+    fn render_entity_detail_popup(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        let popup_area = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(10),
+                Constraint::Percentage(80),
+                Constraint::Percentage(10),
+            ])
+            .split(area)[1];
+
+        let popup_area = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(10),
+                Constraint::Percentage(80),
+                Constraint::Percentage(10),
+            ])
+            .split(popup_area)[1];
+
+        f.render_widget(Clear, popup_area);
+
+        if let Some(entity) = &self.selected_entity {
+            let aliases = entity.aliases_list().join(", ");
+            let aliases_display = if aliases.is_empty() {
+                "-".to_string()
+            } else {
+                aliases
+            };
+
+            let context_display = entity
+                .context
+                .as_ref()
+                .map(|c| c.clone())
+                .unwrap_or_else(|| "(no context)".to_string());
+
+            let type_icon = match entity.entity_type.as_str() {
+                "person" => "👤",
+                "organization" => "🏢",
+                _ => "📌",
+            };
+
+            let content = vec![
+                Line::from(vec![
+                    Span::styled(
+                        format!("{} ", type_icon),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled(
+                        &entity.canonical_name,
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Type: ", Style::default().fg(Color::Green)),
+                    Span::styled(
+                        &entity.entity_type,
+                        Style::default().fg(Color::White),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("ID: ", Style::default().fg(Color::Green)),
+                    Span::styled(
+                        entity.id.unwrap_or(0).to_string(),
+                        Style::default().fg(Color::White),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Mentions: ", Style::default().fg(Color::Green)),
+                    Span::styled(
+                        entity.mention_count.to_string(),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Aliases: ", Style::default().fg(Color::Green)),
+                    Span::styled(
+                        aliases_display,
+                        Style::default().fg(Color::Gray),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    "Context:",
+                    Style::default().fg(Color::Green),
+                )]),
+                Line::from(vec![Span::styled(
+                    context_display,
+                    Style::default().fg(Color::White),
+                )]),
+                Line::from(""),
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    "Use CLI to edit: scriba entity rename/alias/update",
+                    Style::default().fg(Color::Gray),
+                )]),
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    "Press ESC to close",
+                    Style::default().fg(Color::Blue),
+                )]),
+            ];
+
+            let detail_paragraph = Paragraph::new(content)
+                .style(Style::default().fg(Color::White))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!("Entity Details - {}", entity.canonical_name))
+                        .title_style(
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                        .border_style(Style::default().fg(Color::Cyan)),
+                )
+                .wrap(Wrap { trim: true });
+
+            f.render_widget(detail_paragraph, popup_area);
+        }
+    }
+
     fn render_message_popup(&self, f: &mut Frame, area: ratatui::layout::Rect) {
         let popup_area = Layout::default()
             .direction(Direction::Vertical)
@@ -2048,26 +2453,153 @@ impl Dashboard {
         let popup_area = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Percentage(10),
-                Constraint::Percentage(80),
-                Constraint::Percentage(10),
+                Constraint::Percentage(5),
+                Constraint::Percentage(90),
+                Constraint::Percentage(5),
             ])
             .split(area)[1];
 
         let popup_area = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(5),
-                Constraint::Percentage(90),
-                Constraint::Percentage(5),
+                Constraint::Percentage(3),
+                Constraint::Percentage(94),
+                Constraint::Percentage(3),
             ])
             .split(popup_area)[1];
 
         f.render_widget(Clear, popup_area);
 
+        // Check if we have enrichment data
+        let has_enrichment = self.transcript_summary.is_some()
+            || self.transcript_topics.is_some()
+            || self.transcript_entities.is_some();
+
+        if has_enrichment {
+            // Split popup into enrichment header and transcript content
+            let content_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(self.calculate_enrichment_height()),
+                    Constraint::Min(5),
+                ])
+                .split(popup_area);
+
+            // Render enrichment section
+            self.render_enrichment_section(f, content_chunks[0]);
+
+            // Render transcript in remaining space
+            self.render_transcript_content(f, content_chunks[1]);
+        } else {
+            // No enrichment, render transcript only
+            self.render_transcript_content(f, popup_area);
+        }
+    }
+
+    fn calculate_enrichment_height(&self) -> u16 {
+        let mut height: u16 = 2; // Border
+
+        if self.transcript_summary.is_some() {
+            height += 3; // Summary label + content + spacing
+        }
+        if self.transcript_topics.is_some() {
+            height += 2; // Topics line + spacing
+        }
+        if self.transcript_entities.is_some() {
+            height += 2; // Entities line + spacing
+        }
+        if self.transcript_key_points.as_ref().map_or(false, |kp| !kp.is_empty()) {
+            height += 3; // Key points label + first point + spacing
+        }
+
+        height.min(12) // Cap at reasonable size
+    }
+
+    fn render_enrichment_section(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        let mut lines: Vec<Line> = Vec::new();
+
+        // Summary
+        if let Some(summary) = &self.transcript_summary {
+            lines.push(Line::from(vec![
+                Span::styled("📋 Summary: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(summary, Style::default().fg(Color::White)),
+            ]));
+            lines.push(Line::from(""));
+        }
+
+        // Topics
+        if let Some(topics) = &self.transcript_topics {
+            if !topics.is_empty() {
+                let topic_spans: Vec<Span> = std::iter::once(
+                    Span::styled("🏷️ Topics: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                )
+                .chain(topics.iter().enumerate().flat_map(|(i, topic)| {
+                    let mut spans = vec![Span::styled(
+                        format!("[{}]", topic),
+                        Style::default().fg(Color::Cyan),
+                    )];
+                    if i < topics.len() - 1 {
+                        spans.push(Span::raw(" "));
+                    }
+                    spans
+                }))
+                .collect();
+                lines.push(Line::from(topic_spans));
+            }
+        }
+
+        // Entities
+        if let Some(entities) = &self.transcript_entities {
+            if !entities.is_empty() {
+                let entity_spans: Vec<Span> = std::iter::once(
+                    Span::styled("👥 Entities: ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+                )
+                .chain(entities.iter().enumerate().flat_map(|(i, (name, etype))| {
+                    let color = match etype.as_str() {
+                        "person" => Color::Green,
+                        "organization" => Color::Blue,
+                        _ => Color::Gray,
+                    };
+                    let mut spans = vec![Span::styled(name, Style::default().fg(color))];
+                    if i < entities.len() - 1 {
+                        spans.push(Span::raw(", "));
+                    }
+                    spans
+                }))
+                .collect();
+                lines.push(Line::from(entity_spans));
+            }
+        }
+
+        // Key points (just first one to save space)
+        if let Some(key_points) = &self.transcript_key_points {
+            if !key_points.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled("💡 Key: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(&key_points[0], Style::default().fg(Color::White)),
+                ]));
+            }
+        }
+
+        let enrichment = Paragraph::new(lines)
+            .style(Style::default().fg(Color::White))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Green))
+                    .title("🧠 Knowledge Extract")
+                    .title_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            )
+            .wrap(Wrap { trim: true });
+
+        f.render_widget(enrichment, area);
+    }
+
+    fn render_transcript_content(&self, f: &mut Frame, area: ratatui::layout::Rect) {
         // Calculate available height and width for content (subtract borders)
-        let content_height = popup_area.height.saturating_sub(2) as usize;
-        let content_width = popup_area.width.saturating_sub(4) as usize; // Account for borders and padding
+        let content_height = area.height.saturating_sub(2) as usize;
+        let content_width = area.width.saturating_sub(4) as usize;
 
         // Handle text wrapping for very long lines
         let wrapped_lines = self.wrap_text_to_lines(&self.transcript_content, content_width);
@@ -2080,9 +2612,11 @@ impl Dashboard {
             let end = std::cmp::min(actual_offset + content_height, total_lines);
 
             let visible_lines = wrapped_lines[actual_offset..end].join("\n");
-            let scroll_info = format!("📝 Transcript [Line {}/{}] - ↑↓/b/f/g/G: scroll, C: copy, T: re-transcribe, ESC: close",
-                                    actual_offset + 1,
-                                    total_lines);
+            let scroll_info = format!(
+                "📝 Transcript [{}/{}] - ↑↓: scroll, C: copy, T: re-transcribe, ESC: close",
+                actual_offset + 1,
+                total_lines
+            );
             (visible_lines, scroll_info)
         } else {
             (
@@ -2099,9 +2633,9 @@ impl Dashboard {
                     .style(Style::default().fg(Color::Cyan))
                     .title(scroll_info),
             )
-            .scroll((0, 0)); // Disable internal scrolling and wrapping since we handle it manually
+            .scroll((0, 0));
 
-        f.render_widget(para, popup_area);
+        f.render_widget(para, area);
     }
 
     fn render_delete_confirmation_popup(&self, f: &mut Frame, area: ratatui::layout::Rect) {
