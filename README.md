@@ -13,6 +13,9 @@ Modern CLI and TUI to record audio and transcribe it locally using Whisper via w
 - 🏷️ **Model Tracking** - See which transcription model was used for each recording
 - 🔄 **Re-transcription** - Easily re-transcribe with different models from transcript view
 - 📁 **External Audio Import** - Import and transcribe external audio files (from the dashboard or CLI)
+- 🧠 **Knowledge Extraction** - LLM-powered enrichment extracts summaries, topics, and entities from transcripts via Ollama
+- 🌍 **World Context** - Persistent knowledge graph tracks people, organizations, and projects across recordings
+- 🏷️ **Entity Management** - Edit, delete, and merge entities from the TUI with automatic world sync
 - 🤖 **MCP Server Integration** - Connect with Claude Desktop and other MCP clients to access transcripts via AI assistants
 
 ## 🚀 Quick Start
@@ -45,6 +48,12 @@ scriba record --api-key $OPENAI_API_KEY
 scriba transcribe /path/to/audio/file.mp3 -n "My call" --model large
 scriba transcribe /path/to/audio/file.wav --api-key $OPENAI_API_KEY
 
+# Initialize world context (first time)
+scriba world init
+
+# Enrich a recording with LLM (requires Ollama)
+scriba enrich <recording_name>
+
 # Run as MCP server for Claude Desktop integration
 scriba mcp
 ```
@@ -62,6 +71,8 @@ scriba mcp
 | **P** | Play recording |
 | **/** | Search transcripts |
 | **D** | Delete recording |
+| **E** | Entity management view |
+| **S** | Settings |
 | **H** | Show help |
 
 ### Transcript View
@@ -69,6 +80,16 @@ scriba mcp
 |-----|--------|
 | **T** | Re-transcribe with current model |
 | **C** | Copy transcript to clipboard |
+| **Esc** | Return to dashboard |
+
+### Entity View
+| Key | Action |
+|-----|--------|
+| **E** | Edit selected entity (name, type, context) |
+| **D** | Delete entity |
+| **M** | Merge entity into another |
+| **Enter** | View entity details |
+| **R** | Refresh entity list |
 | **Esc** | Return to dashboard |
 
 ## 🗂️ File Organization
@@ -79,7 +100,8 @@ All recordings are stored in `~/scriba_recordings/`:
 ├── 2025-08-26_14-30-25_meeting/
 │   ├── recording.mp3
 │   └── transcript.txt
-└── scriba.db
+├── world.md          # Knowledge graph (auto-managed)
+└── scriba.db         # Recordings, entities, mentions
 ```
 
 ## 🔧 Requirements
@@ -88,6 +110,7 @@ All recordings are stored in `~/scriba_recordings/`:
 - **CMake** - Required to build whisper-rs (`brew install cmake` on macOS)
 - **FFmpeg** - For audio compression and resampling (`brew install ffmpeg`)
 - **Audio system** - Microphone for recording, speakers for playback
+- **Ollama** (optional) - For knowledge extraction and enrichment (see setup below)
 
 ### Modes and Model Selection
 - Local mode uses Whisper models: `--model tiny|base|small|medium|large|turbo`.
@@ -121,6 +144,54 @@ Scriba includes a Model Context Protocol (MCP) server that allows AI assistants 
 - **get_transcript** - Retrieve full transcript content by ID or name
 - **search_transcripts** - Full-text search across all transcripts
 - **get_recording_info** - Get detailed recording metadata
+
+## 🧠 Knowledge Extraction (Ollama)
+
+Scriba can extract summaries, topics, and entities from your transcripts using a local LLM via Ollama. This is entirely optional — Scriba works fine without it.
+
+### Setup
+
+```bash
+# 1. Install Ollama
+brew install ollama
+
+# 2. Start the Ollama server
+ollama serve
+
+# 3. Pull a model (llama3.2 is the default, mistral recommended for better results)
+ollama pull llama3.2
+# or
+ollama pull mistral
+```
+
+### First Run
+
+```bash
+# Seed your world context — tell Scriba who you are
+scriba world init
+# Follow the prompt, e.g.: "I'm Giovanni, CTO of Exein, a cybersecurity startup."
+
+# Enrich a recording
+scriba enrich <recording_name>
+```
+
+After enrichment, Scriba builds a knowledge graph of people, organizations, and projects mentioned across your recordings. View and manage entities from the TUI with `E`.
+
+### Configuration
+
+The enrichment model is configurable in `~/scriba_recordings/config.json`:
+
+```json
+{
+  "enrichment": {
+    "enabled": true,
+    "ollama_endpoint": "http://localhost:11434",
+    "ollama_model": "llama3.2"
+  }
+}
+```
+
+If Ollama is not running when you record or enrich, Scriba will skip enrichment gracefully and continue normally.
 
 ## 🎯 Key Benefits
 

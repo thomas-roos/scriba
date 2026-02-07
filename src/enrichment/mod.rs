@@ -10,11 +10,11 @@ mod context;
 mod extractor;
 mod ollama;
 mod prompts;
-mod world;
+pub mod world;
 
 pub use extractor::{
     EnrichmentService, ExtractedEntity, ExtractionResult,
     WorldEntityExtractionResult, WorldEntityOrganization, WorldEntityPerson,
 };
 pub use ollama::{OllamaClient, OllamaError};
-pub use world::{WorldContext, WorldData};
+pub use world::{WorldContext, WorldData, append_new_facts};

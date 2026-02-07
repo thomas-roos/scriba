@@ -1,3 +1,51 @@
+Scriba 0.14.0 — Knowledge Extraction & Entity Management
+
+Highlights
+
+- **Knowledge Extraction**: Ollama LLM integration for automatic transcript enrichment — extracts summaries, key points, topics, and entities from recordings.
+- **World Context**: Persistent knowledge graph (`world.md`) tracks people, organizations, and projects across all recordings, evolving as new transcripts are processed.
+- **LLM-Driven Entity Linking**: Entities are resolved against world context by the LLM itself, producing accurate canonical names without fuzzy matching.
+- **Entities as Source of Truth**: Entity database drives the world — `world.md` is rebuilt from entities after every change, not the other way around.
+- **TUI Entity Management**: Full CRUD for entities directly from the dashboard — edit name/type/context (`E`), delete (`D`), and merge entities (`M`) with alias and context combination.
+- **Non-Blocking Transcription**: Transcription runs in the background with an inline spinner in the recordings table. Browse, edit entities, and view transcripts while transcription completes.
+- **Smart Fact Accumulation**: World evolution appends new facts rather than replacing existing knowledge, with sentence-level deduplication.
+- **Improved Delete Popup**: Clean, consistent confirmation dialogs for both recordings and entities.
+
+Changelog
+
+- feat(enrichment): add Ollama LLM client and enrichment service with extraction + world evolution
+- feat(enrichment): add world context system with seed, merge, and delta application
+- feat(enrichment): LLM-driven entity extraction with `resolved_to` field for canonical linking
+- feat(entities): entity registry with rename, merge, delete, alias management, and type update
+- feat(workflow): `rebuild_world_from_entities()` — entities drive world.md content
+- feat(workflow): `apply_world_delta_to_entities()` — LLM deltas applied to entity DB first
+- feat(workflow): `enrich_recording()` orchestration with extraction, linking, and world evolution
+- feat(tui): entity management view with edit/delete/merge and EntityMode state machine
+- feat(tui): non-blocking background transcription with inline status spinner
+- feat(tui): auto-dismissing footer notifications for transcription completion
+- refactor(tui): consistent delete confirmation popups for recordings and entities
+- refactor(enrichment): extract `append_new_facts()` for sentence-level fact dedup
+- refactor(workflow): remove `sync_world_to_entities()` in favor of entities-first flow
+
+New Module Structure
+```
+src/
+├── enrichment/     # LLM integration
+│   ├── extractor.rs, ollama.rs, prompts.rs
+│   ├── world.rs, context.rs
+├── entities/       # Entity management
+│   ├── linker.rs, registry.rs
+```
+
+Notes
+
+- Requires a running Ollama instance (`ollama serve`) with a model pulled (default: `llama3.2`, recommended: `mistral`).
+- World context is stored at `~/scriba_recordings/world.md` as structured JSON.
+- Use `scriba world init` to seed initial knowledge, then `scriba enrich <recording>` to process transcripts.
+- Entity edits in the TUI automatically rebuild `world.md` to stay in sync.
+
+---
+
 Scriba 0.13.0 — Modular Architecture Refactoring
 
 Highlights

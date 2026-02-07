@@ -92,6 +92,15 @@ impl<'a> EntityRegistry<'a> {
         Ok(())
     }
 
+    /// Update an entity's type.
+    pub fn update_entity_type(&mut self, id: i64, new_type: &str) -> Result<()> {
+        if let Some(mut entity) = self.db.get_entity(id)? {
+            entity.entity_type = new_type.to_string();
+            self.db.update_entity(&entity)?;
+        }
+        Ok(())
+    }
+
     /// Rename an entity (old name becomes an alias automatically).
     pub fn rename_entity(&mut self, id: i64, new_name: &str) -> Result<()> {
         if let Some(mut entity) = self.db.get_entity(id)? {

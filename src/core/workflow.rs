@@ -11,7 +11,8 @@ use super::recording::{record_audio, RecordOptions};
 use super::transcription::transcribe_audio;
 use super::types::{ManagedRecording, RecordingConfig, RecordingMode};
 use crate::database::{Database, Recording};
-use crate::enrichment::{EnrichmentService, WorldContext, WorldData};
+use crate::enrichment::{EnrichmentService, WorldContext, WorldData, append_new_facts};
+use crate::enrichment::world::{OrgInfo, PersonInfo, ProjectInfo};
 use crate::entities::{EntityLinker, EntityRegistry};
 use crate::utils::{generate_recording_name, BASE_PATH};
 use chrono::Utc;
@@ -313,7 +314,7 @@ impl WorkflowManager {
         }
 
         // Load world context (Scriba's understanding of the owner)
-        let mut world = WorldContext::load().unwrap_or_default();
+        let world = WorldContext::load().unwrap_or_default();
         let world_content = if world.has_content() {
             if verbose {
                 println!("  🌍 Using world context for extraction");
@@ -445,72 +446,55 @@ impl WorkflowManager {
             );
         }
 
-        // Evolve world description if enabled and world exists
+        // Evolve world: LLM produces a delta, we apply it to entities first,
+        // then rebuild world.md from entities (entities are the source of truth).
         if config.evolve_world && world.has_content() {
             if verbose {
                 println!("  🌍 Evolving world understanding...");
             }
 
-            // Migrate legacy (non-JSON) world to structured format first
-            let mut world_data = if let Some(data) = world.parsed() {
-                data
+            // Get current world JSON for the evolution prompt
+            let world_json = if let Some(data) = world.parsed() {
+                data.to_json().unwrap_or_default()
             } else {
+                // Migrate legacy world to structured format
                 if verbose {
                     println!("  🔄 Migrating world to structured format...");
                 }
                 match service.extract_world_seed(&world.content).await {
-                    Ok(data) => data,
-                    Err(e) => {
-                        if verbose {
-                            eprintln!("  ⚠️ Could not migrate world: {}", e);
-                        }
-                        WorldData::default()
-                    }
+                    Ok(data) => data.to_json().unwrap_or_default(),
+                    Err(_) => world.content.clone(),
                 }
             };
 
             match service
-                .evolve_world(
-                    &world_data.to_json().unwrap_or_default(),
-                    &transcript_content,
-                    &extraction,
-                )
+                .evolve_world(&world_json, &transcript_content, &extraction)
                 .await
             {
                 Ok(Some(delta)) => {
-                    world_data.merge(&delta);
-                    if let Err(e) = world.update_data(&world_data) {
+                    // Apply delta to entities (source of truth)
+                    if let Err(e) = apply_world_delta_to_entities(&mut self.db_manager.db, &delta) {
                         if verbose {
-                            eprintln!("  ⚠️ Failed to save world update: {}", e);
+                            eprintln!("  ⚠️ Failed to apply delta to entities: {}", e);
+                        }
+                    }
+                    // Rebuild world.md from entities
+                    if let Err(e) = rebuild_world_from_entities(&self.db_manager.db) {
+                        if verbose {
+                            eprintln!("  ⚠️ Failed to rebuild world: {}", e);
                         }
                     } else if verbose {
                         println!("  ✅ World description updated");
                     }
                 }
                 Ok(None) => {
-                    // Delta parse failed, but if we migrated, still save the migration
-                    if let Err(e) = world.update_data(&world_data) {
-                        if verbose {
-                            eprintln!("  ⚠️ Failed to save world: {}", e);
-                        }
-                    } else if verbose {
+                    if verbose {
                         println!("  ⚠️ No new changes from this recording");
                     }
                 }
                 Err(e) => {
                     if verbose {
                         eprintln!("  ⚠️ Failed to evolve world (non-fatal): {}", e);
-                    }
-                }
-            }
-        }
-
-        // Sync world entities to database (ensures DB stays in sync with world)
-        if world.has_content() {
-            if let Some(world_data) = world.parsed() {
-                if let Err(e) = sync_world_to_entities(&mut self.db_manager.db, &world_data) {
-                    if verbose {
-                        eprintln!("  ⚠️ Failed to sync world to entities: {}", e);
                     }
                 }
             }
@@ -762,56 +746,112 @@ impl WorkflowManager {
     }
 }
 
-/// Sync world entities to the database.
+/// Rebuild world.md entirely from the entity database.
 ///
-/// For each person and organization in the world, ensure a corresponding
-/// entity exists in the database. Updates context if the world has richer info.
-fn sync_world_to_entities(db: &mut Database, world: &WorldData) -> Result<()> {
-    let mut registry = EntityRegistry::new(db);
+/// Entities are the source of truth. The world file is a derived view
+/// used to give the LLM context during extraction.
+pub fn rebuild_world_from_entities(db: &Database) -> Result<()> {
+    let all_entities = db.list_entities(None, None)?;
 
-    // Sync owner as a person entity
-    if !world.owner.name.is_empty() {
-        let owner_context = format!(
-            "Owner of this Scriba instance. {} at {}",
-            world.owner.role, world.owner.organization
-        );
-        match registry.get_entity_by_name(&world.owner.name)? {
-            Some(entity) => {
-                let entity_id = entity.id.unwrap();
-                // Update context if world has richer info
-                if owner_context.len() > entity.context.as_ref().map(|c| c.len()).unwrap_or(0) {
-                    registry.update_entity_context(entity_id, &owner_context)?;
-                }
-                // Sync aliases from world
-                for alias in &world.owner.aliases {
-                    registry.add_entity_alias(entity_id, alias)?;
+    let mut world = WorldData::default();
+
+    for entity in &all_entities {
+        let aliases = entity.aliases_list();
+        let context = entity.context.clone().unwrap_or_default();
+
+        match entity.entity_type.as_str() {
+            "person" => {
+                // Check if this is the owner
+                let is_owner = context.contains("Owner of this Scriba instance");
+
+                if is_owner {
+                    world.owner.name = entity.canonical_name.clone();
+                    world.owner.aliases = aliases;
+                    // Parse role and organization from context
+                    // Context format: "Owner of this Scriba instance. CTO at Exein"
+                    let parts: Vec<&str> = context.splitn(2, '.').collect();
+                    if parts.len() > 1 {
+                        let role_part = parts[1].trim();
+                        if let Some(at_idx) = role_part.find(" at ") {
+                            world.owner.role = role_part[..at_idx].to_string();
+                            world.owner.organization = role_part[at_idx + 4..].to_string();
+                        } else {
+                            world.owner.role = role_part.to_string();
+                        }
+                    }
+                } else {
+                    world.people.push(PersonInfo {
+                        name: entity.canonical_name.clone(),
+                        relationship: context,
+                        aliases,
+                    });
                 }
             }
-            None => {
-                let entity = registry.create_entity("person", &world.owner.name, Some(&owner_context))?;
-                if let Some(entity_id) = entity.id {
-                    for alias in &world.owner.aliases {
-                        registry.add_entity_alias(entity_id, alias)?;
-                    }
-                }
+            "organization" => {
+                world.organizations.push(OrgInfo {
+                    name: entity.canonical_name.clone(),
+                    description: context,
+                    aliases,
+                });
+            }
+            "project" => {
+                world.projects.push(ProjectInfo {
+                    name: entity.canonical_name.clone(),
+                    description: context,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Preserve interests and beliefs from existing world (no entity backing)
+    if let Ok(current_world) = WorldContext::load() {
+        if let Some(current_data) = current_world.parsed() {
+            world.interests = current_data.interests;
+            world.beliefs = current_data.beliefs;
+            // Preserve owner location if not derivable from entities
+            if world.owner.location.is_empty() {
+                world.owner.location = current_data.owner.location;
             }
         }
     }
 
-    // Sync people
-    for person in &world.people {
+    let mut world_ctx = WorldContext::load().unwrap_or_default();
+    world_ctx.update_data(&world)?;
+
+    Ok(())
+}
+
+/// Apply a world evolution delta directly to the entity database.
+///
+/// Instead of merging into world.md first, we apply changes to entities
+/// (the source of truth), then rebuild the world from them.
+fn apply_world_delta_to_entities(db: &mut Database, delta: &WorldData) -> Result<()> {
+    let mut registry = EntityRegistry::new(db);
+
+    // Apply owner changes
+    if !delta.owner.name.is_empty() {
+        if let Some(entity) = registry.get_entity_by_name(&delta.owner.name)? {
+            let entity_id = entity.id.unwrap();
+            for alias in &delta.owner.aliases {
+                registry.add_entity_alias(entity_id, alias)?;
+            }
+        }
+    }
+
+    // Apply people changes
+    for person in &delta.people {
         if person.name.is_empty() {
             continue;
         }
         match registry.get_entity_by_name(&person.name)? {
             Some(entity) => {
                 let entity_id = entity.id.unwrap();
-                if !person.relationship.is_empty()
-                    && person.relationship.len() > entity.context.as_ref().map(|c| c.len()).unwrap_or(0)
-                {
-                    registry.update_entity_context(entity_id, &person.relationship)?;
+                if !person.relationship.is_empty() {
+                    let mut existing_ctx = entity.context.unwrap_or_default();
+                    append_new_facts(&mut existing_ctx, &person.relationship);
+                    registry.update_entity_context(entity_id, &existing_ctx)?;
                 }
-                // Sync aliases from world
                 for alias in &person.aliases {
                     registry.add_entity_alias(entity_id, alias)?;
                 }
@@ -822,8 +862,8 @@ fn sync_world_to_entities(db: &mut Database, world: &WorldData) -> Result<()> {
                 } else {
                     Some(person.relationship.as_str())
                 };
-                let entity = registry.create_entity("person", &person.name, ctx)?;
-                if let Some(entity_id) = entity.id {
+                let new_entity = registry.create_entity("person", &person.name, ctx)?;
+                if let Some(entity_id) = new_entity.id {
                     for alias in &person.aliases {
                         registry.add_entity_alias(entity_id, alias)?;
                     }
@@ -832,20 +872,19 @@ fn sync_world_to_entities(db: &mut Database, world: &WorldData) -> Result<()> {
         }
     }
 
-    // Sync organizations
-    for org in &world.organizations {
+    // Apply organization changes
+    for org in &delta.organizations {
         if org.name.is_empty() {
             continue;
         }
         match registry.get_entity_by_name(&org.name)? {
             Some(entity) => {
                 let entity_id = entity.id.unwrap();
-                if !org.description.is_empty()
-                    && org.description.len() > entity.context.as_ref().map(|c| c.len()).unwrap_or(0)
-                {
-                    registry.update_entity_context(entity_id, &org.description)?;
+                if !org.description.is_empty() {
+                    let mut existing_ctx = entity.context.unwrap_or_default();
+                    append_new_facts(&mut existing_ctx, &org.description);
+                    registry.update_entity_context(entity_id, &existing_ctx)?;
                 }
-                // Sync aliases from world
                 for alias in &org.aliases {
                     registry.add_entity_alias(entity_id, alias)?;
                 }
@@ -856,8 +895,8 @@ fn sync_world_to_entities(db: &mut Database, world: &WorldData) -> Result<()> {
                 } else {
                     Some(org.description.as_str())
                 };
-                let entity = registry.create_entity("organization", &org.name, ctx)?;
-                if let Some(entity_id) = entity.id {
+                let new_entity = registry.create_entity("organization", &org.name, ctx)?;
+                if let Some(entity_id) = new_entity.id {
                     for alias in &org.aliases {
                         registry.add_entity_alias(entity_id, alias)?;
                     }

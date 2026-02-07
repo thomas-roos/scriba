@@ -12,6 +12,22 @@ use crate::utils::BASE_PATH;
 
 const WORLD_FILENAME: &str = "world.md";
 
+/// Append only genuinely new sentences from `new_text` to `existing`.
+/// Splits on periods, checks each sentence against existing text (case-insensitive),
+/// and only appends sentences that aren't already present.
+pub fn append_new_facts(existing: &mut String, new_text: &str) {
+    if existing.is_empty() {
+        *existing = new_text.to_string();
+        return;
+    }
+    let existing_lower = existing.to_lowercase();
+    for sentence in new_text.split('.').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if !existing_lower.contains(&sentence.to_lowercase()) {
+            *existing = format!("{}. {}", existing.trim_end_matches('.'), sentence);
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Structured World Data
 // ─────────────────────────────────────────────────────────────────────────────
@@ -90,6 +106,7 @@ impl WorldData {
         serde_json::to_string_pretty(self).context("Failed to serialize world data")
     }
 
+
     /// Merge changes into this world data.
     ///
     /// This is conservative: it only adds new items and updates existing ones.
@@ -126,12 +143,11 @@ impl WorldData {
                 o.name.to_lowercase() == new_name_lower
                     || o.aliases.iter().any(|a| a.to_lowercase() == new_name_lower)
             }) {
-                // Only update description if it's richer (and the name matches exactly)
+                // Append new description info if genuinely new (and the name matches exactly)
                 if existing.name.to_lowercase() == new_name_lower
                     && !new_org.description.is_empty()
-                    && new_org.description.len() > existing.description.len()
                 {
-                    existing.description = new_org.description.clone();
+                    append_new_facts(&mut existing.description, &new_org.description);
                 }
                 for alias in &new_org.aliases {
                     if !existing.aliases.iter().any(|a| a.to_lowercase() == alias.to_lowercase()) {
@@ -153,12 +169,11 @@ impl WorldData {
                 p.name.to_lowercase() == new_name_lower
                     || p.aliases.iter().any(|a| a.to_lowercase() == new_name_lower)
             }) {
-                // Only update relationship if name matches exactly (not alias match)
+                // Append new relationship info if genuinely new (not alias match)
                 if existing.name.to_lowercase() == new_name_lower
                     && !new_person.relationship.is_empty()
-                    && new_person.relationship.len() > existing.relationship.len()
                 {
-                    existing.relationship = new_person.relationship.clone();
+                    append_new_facts(&mut existing.relationship, &new_person.relationship);
                 }
                 for alias in &new_person.aliases {
                     if !existing.aliases.iter().any(|a| a.to_lowercase() == alias.to_lowercase()) {
@@ -392,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_keeps_richer_person_relationship() {
+    fn test_merge_accumulates_person_relationship() {
         let mut world = WorldData {
             people: vec![PersonInfo {
                 name: "Alice".to_string(),
@@ -402,7 +417,7 @@ mod tests {
             ..Default::default()
         };
 
-        // Shorter description should not overwrite
+        // Duplicate info (substring) should not be appended
         let changes = WorldData {
             people: vec![PersonInfo {
                 name: "Alice".to_string(),
@@ -416,18 +431,18 @@ mod tests {
         assert_eq!(world.people.len(), 1);
         assert_eq!(world.people[0].relationship, "colleague and team lead at Exein");
 
-        // Longer description should overwrite
+        // Genuinely new info should be appended
         let changes2 = WorldData {
             people: vec![PersonInfo {
                 name: "Alice".to_string(),
-                relationship: "colleague, team lead at Exein, expert in embedded systems".to_string(),
+                relationship: "expert in embedded systems".to_string(),
                 ..Default::default()
             }],
             ..Default::default()
         };
 
         world.merge(&changes2);
-        assert_eq!(world.people[0].relationship, "colleague, team lead at Exein, expert in embedded systems");
+        assert_eq!(world.people[0].relationship, "colleague and team lead at Exein. expert in embedded systems");
     }
 
     #[test]
