@@ -1,8 +1,9 @@
 use crate::core::{
     CompressionSettings, LocalModelSize, RecordOptions, ScribaConfig, TranscriptionMode,
-    WorkflowManager, record_audio, rebuild_world_from_entities,
+    WorkflowManager, record_audio, rebuild_world_from_entities, initialize_world_from_seed,
 };
 use crate::database::{Database, Entity, Recording, RecordingStats};
+use crate::enrichment::{WorldContext, WorldData, WorldEntityExtractionResult};
 use crate::entities::EntityRegistry;
 use crate::utils::generate_recording_name;
 use anyhow::Result;
@@ -22,11 +23,6 @@ use ratatui::{
 use std::io;
 use tokio::sync::mpsc;
 
-const ASCII_ART: &str = r#" ███████  ██████ ██████  ██ ██████   █████
-██      ██      ██   ██ ██ ██   ██ ██   ██
-███████ ██      ██████  ██ ██████  ███████
-     ██ ██      ██   ██ ██ ██   ██ ██   ██
-███████  ██████ ██   ██ ██ ██████  ██   ██"#;
 use anyhow::Context;
 use dirs::home_dir;
 use std::path::PathBuf;
@@ -60,6 +56,7 @@ pub struct Dashboard {
     transcription_task: Option<tokio::task::JoinHandle<Result<(), anyhow::Error>>>, // Background transcription task
     transcribing_recording_name: Option<String>, // directory_name of recording being transcribed
     notification_message: Option<(String, usize)>, // (message, frames_remaining) — auto-dismiss
+    header_anim_frame: usize, // Main header owl animation counter
     recording_task: Option<tokio::task::JoinHandle<Result<String, anyhow::Error>>>, // Background recording task (returns recording name)
     recording_mode: Option<RecordingMode>, // Track if we should transcribe after recording
     recording_stop_tx: Option<mpsc::Sender<()>>, // Channel to stop recording
@@ -87,11 +84,25 @@ pub struct Dashboard {
     entity_edit_type: String,
     entity_edit_context: String,
     merge_source_entity: Option<Entity>,
+    // Add entity state
+    entity_add_name: String,
+    entity_add_type: String,
+    entity_add_context: String,
+    entity_add_aliases: String,
+    entity_add_field: EntityEditField,
+    // Owl world view state
+    owl_quip: String,
+    owl_quip_timer: usize,
+    owl_world_anim_frame: usize,
+    owl_world_mood: OwlWorldMood,
     // Transcript enrichment data
     transcript_summary: Option<String>,
     transcript_key_points: Option<Vec<String>>,
     transcript_topics: Option<Vec<String>>,
     transcript_entities: Option<Vec<(String, String)>>, // (name, type)
+
+    // Onboarding state
+    onboarding: Option<OnboardingState>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -100,7 +111,154 @@ enum DashboardView {
     Help,
     Settings,
     Entities,
+    Onboarding,
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Onboarding: Scriba the Owl
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, PartialEq)]
+enum OnboardingStep {
+    Entrance,
+    Intro,
+    AskName,
+    AskRole,
+    AskAliases,
+    Processing,
+    Confirmation,
+    Done,
+}
+
+struct OnboardingState {
+    step: OnboardingStep,
+    // Typewriter
+    full_text: String,
+    visible_chars: usize,
+    text_complete: bool,
+    // Animation
+    anim_frame: usize,
+    entrance_complete: bool,
+    // User inputs
+    user_name: String,
+    user_role: String,
+    user_aliases: String,
+    // Processing
+    processing_task: Option<tokio::task::JoinHandle<Result<Option<(WorldData, WorldEntityExtractionResult)>, anyhow::Error>>>,
+    processed_world: Option<WorldData>,
+    processed_entities: Option<WorldEntityExtractionResult>,
+    ollama_available: bool,
+    // Transition
+    transition_frame: usize,
+    transitioning: bool,
+    // Confirmation data (parsed from world)
+    confirm_owner: String,
+    confirm_role: String,
+    confirm_org: String,
+    confirm_people: String,
+}
+
+impl OnboardingState {
+    fn new() -> Self {
+        Self {
+            step: OnboardingStep::Entrance,
+            full_text: String::new(),
+            visible_chars: 0,
+            text_complete: false,
+            anim_frame: 0,
+            entrance_complete: false,
+            user_name: String::new(),
+            user_role: String::new(),
+            user_aliases: String::new(),
+            processing_task: None,
+            processed_world: None,
+            processed_entities: None,
+            ollama_available: true,
+            transition_frame: 0,
+            transitioning: false,
+            confirm_owner: String::new(),
+            confirm_role: String::new(),
+            confirm_org: String::new(),
+            confirm_people: String::new(),
+        }
+    }
+
+    fn set_step_text(&mut self, text: &str) {
+        self.full_text = text.to_string();
+        self.visible_chars = 0;
+        self.text_complete = false;
+    }
+
+    fn visible_text(&self) -> &str {
+        let end = self.visible_chars.min(self.full_text.len());
+        // Make sure we don't split a multi-byte char
+        let mut byte_end = 0;
+        for (i, (idx, _)) in self.full_text.char_indices().enumerate() {
+            if i >= end {
+                break;
+            }
+            byte_end = idx;
+        }
+        if end > 0 {
+            // Include the last char
+            if let Some((_, ch)) = self.full_text.char_indices().nth(end - 1) {
+                byte_end += ch.len_utf8();
+            }
+        }
+        &self.full_text[..byte_end]
+    }
+
+    fn tick_typewriter(&mut self) {
+        if !self.text_complete {
+            let char_count = self.full_text.chars().count();
+            self.visible_chars = (self.visible_chars + 4).min(char_count);
+            if self.visible_chars >= char_count {
+                self.text_complete = true;
+            }
+        }
+    }
+
+    fn complete_text(&mut self) {
+        self.visible_chars = self.full_text.chars().count();
+        self.text_complete = true;
+    }
+}
+
+// Owl animation frames
+const OWL_IDLE: [&str; 2] = [
+    // Normal
+    "   (o,o)\n   {`\"'}\n   -\"-\"-",
+    // Blink
+    "   (-,-)\n   {`\"'}\n   -\"-\"-",
+];
+
+// Entrance frames: owl flies in from right (position offset decreases)
+const OWL_FLYING: &str = "~(o,o)~";
+const OWL_APPROACH: &str = "(^,^)";
+const OWL_LANDED: &str = "   (o,o)\n   {`\"'}\n   -\"-\"-";
+
+// Thinking animation: 8 frames (played at 1/3 speed — one change every ~300ms)
+const OWL_THINKING: [&str; 8] = [
+    "   (o,o)  ?\n   {`\"'}\n   -\"-\"-",
+    "   (o,o)\n   {`~'}  ~\n   -\"-\"-",
+    "   (o,o)  !\n   {`\"'}\n   -\"-\"-",
+    "   (o,o)\n   {`~'}  ~~\n   -\"-\"-",
+    "   (-,-)  ?\n   {`\"'}\n   -\"-\"-",
+    "   (o,o)\n   {`~'}  ~~~\n   -\"-\"-",
+    "   (o,o)  !\n   {`\"'}\n   -\"-\"-",
+    "   (o,o)  ...\n   {`\"'}\n   -\"-\"-",
+];
+
+// Celebration: 4 frames
+const OWL_CELEBRATE: [&str; 4] = [
+    "  \\(^,^)/\n   {`\"'}\n   -\"-\"-",
+    "  /(^,^)\\\n   {`\"'}\n   -\"-\"-",
+    "  \\(^,^)/\n   {`\"'}\n   -\"-\"-",
+    "   (^,^)\n   {`\"'}\n   -\"-\"-",
+];
+
+// Sparkle characters for magic transition
+const SPARKLE_CHARS: [char; 5] = ['*', '+', '.', '~', ' '];
 
 #[derive(Debug, PartialEq)]
 enum FileDialogStage {
@@ -117,9 +275,17 @@ enum RecordingMode {
 enum EntityMode {
     Browse,
     Editing,
+    Adding,
     DeleteConfirm,
     MergeSelectTarget,
     MergeConfirm,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum OwlWorldMood {
+    Idle,
+    Thinking,
+    Celebrating,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -173,6 +339,7 @@ impl Dashboard {
             transcription_task: None,
             transcribing_recording_name: None,
             notification_message: None,
+            header_anim_frame: 0,
             recording_task: None,
             recording_mode: None,
             recording_stop_tx: None,
@@ -200,11 +367,25 @@ impl Dashboard {
             entity_edit_type: String::new(),
             entity_edit_context: String::new(),
             merge_source_entity: None,
+            // Add entity state
+            entity_add_name: String::new(),
+            entity_add_type: "person".to_string(),
+            entity_add_context: String::new(),
+            entity_add_aliases: String::new(),
+            entity_add_field: EntityEditField::Name,
+            // Owl world view state
+            owl_quip: String::new(),
+            owl_quip_timer: 0,
+            owl_world_anim_frame: 0,
+            owl_world_mood: OwlWorldMood::Idle,
             // Transcript enrichment data
             transcript_summary: None,
             transcript_key_points: None,
             transcript_topics: None,
             transcript_entities: None,
+
+            // Onboarding
+            onboarding: None,
         })
     }
 
@@ -219,6 +400,12 @@ impl Dashboard {
         // Load initial data
         self.load_recordings()?;
         self.load_stats()?;
+
+        // Check if onboarding is needed (no world.md exists)
+        if !WorldContext::exists() {
+            self.current_view = DashboardView::Onboarding;
+            self.onboarding = Some(OnboardingState::new());
+        }
 
         let result = self.run_app(&mut terminal).await;
 
@@ -356,6 +543,128 @@ impl Dashboard {
                 }
             }
 
+            // Onboarding tick logic
+            if let Some(ref mut ob) = self.onboarding {
+                ob.anim_frame = ob.anim_frame.wrapping_add(1);
+
+                match ob.step {
+                    OnboardingStep::Entrance => {
+                        // Auto-advance after 40 frames (~4s)
+                        if ob.anim_frame >= 40 {
+                            ob.entrance_complete = true;
+                            ob.step = OnboardingStep::Intro;
+                            ob.set_step_text(
+                                "Hoo hoo! I'm Scriba, your personal audio owl.\n\n\
+                                 I listen to your recordings, transcribe them,\n\
+                                 and remember everything -- names, places, topics.\n\
+                                 Think of me as your wise little note-taker\n\
+                                 with very large ears.\n\n\
+                                 Let me get to know you first!"
+                            );
+                        }
+                    }
+                    OnboardingStep::Intro | OnboardingStep::AskName | OnboardingStep::AskRole | OnboardingStep::AskAliases => {
+                        ob.tick_typewriter();
+                    }
+                    OnboardingStep::Processing => {
+                        ob.tick_typewriter();
+                        // Check if processing task completed
+                        if let Some(ref task) = ob.processing_task {
+                            if task.is_finished() {
+                                let completed = ob.processing_task.take().unwrap();
+                                match completed.await {
+                                    Ok(Ok(Some((world_data, entities)))) => {
+                                        // Fill confirmation data
+                                        ob.confirm_owner = world_data.owner.name.clone();
+                                        ob.confirm_role = world_data.owner.role.clone();
+                                        ob.confirm_org = world_data.owner.organization.clone();
+                                        let people_names: Vec<String> = world_data.people.iter()
+                                            .map(|p| p.name.clone()).collect();
+                                        ob.confirm_people = if people_names.is_empty() {
+                                            "(none detected)".to_string()
+                                        } else {
+                                            people_names.join(", ")
+                                        };
+                                        ob.processed_world = Some(world_data);
+                                        ob.processed_entities = Some(entities);
+                                        ob.ollama_available = true;
+                                        // Advance to confirmation
+                                        ob.step = OnboardingStep::Confirmation;
+                                        let text = format!(
+                                            "Here's what I've got:\n\n\
+                                             Owner: {}\n\
+                                             Role:  {}\n\
+                                             Org:   {}\n\
+                                             Known: {}\n\n\
+                                             Does that look right?",
+                                            ob.confirm_owner, ob.confirm_role, ob.confirm_org, ob.confirm_people
+                                        );
+                                        ob.set_step_text(&text);
+                                    }
+                                    Ok(Ok(None)) => {
+                                        // Ollama not available
+                                        ob.ollama_available = false;
+                                        ob.set_step_text(
+                                            "Hm, my brain (Ollama) seems to be sleeping.\n\n\
+                                             No worries -- I saved your info as-is.\n\
+                                             Set up Ollama later and I'll get much smarter!"
+                                        );
+                                    }
+                                    Ok(Err(_)) | Err(_) => {
+                                        ob.ollama_available = false;
+                                        ob.set_step_text(
+                                            "Hm, something went wrong with my brain.\n\n\
+                                             No worries -- I saved your info as-is.\n\
+                                             Set up Ollama later and I'll get much smarter!"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    OnboardingStep::Confirmation => {
+                        ob.tick_typewriter();
+                    }
+                    OnboardingStep::Done => {
+                        ob.tick_typewriter();
+                        // After text is complete and celebration plays (~3s), start transition
+                        if ob.text_complete && ob.anim_frame > 40 && !ob.transitioning {
+                            ob.transitioning = true;
+                            ob.transition_frame = 0;
+                        }
+                        if ob.transitioning {
+                            ob.transition_frame += 1;
+                            if ob.transition_frame > 30 {
+                                // Transition complete — go to main dashboard
+                                self.onboarding = None;
+                                self.current_view = DashboardView::Main;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Main header owl animation
+            if self.current_view == DashboardView::Main {
+                self.header_anim_frame = self.header_anim_frame.wrapping_add(1);
+            }
+
+            // World view tick logic (owl animation + quip timer)
+            if self.current_view == DashboardView::Entities {
+                self.owl_world_anim_frame = self.owl_world_anim_frame.wrapping_add(1);
+                if self.owl_quip_timer > 0 {
+                    self.owl_quip_timer -= 1;
+                    if self.owl_quip_timer == 0 {
+                        self.owl_world_mood = OwlWorldMood::Idle;
+                        self.set_owl_quip_for_browse();
+                    }
+                }
+                // Auto-reset celebrating mood
+                if self.owl_world_mood == OwlWorldMood::Celebrating && self.owl_quip_timer == 0 {
+                    self.owl_world_mood = OwlWorldMood::Idle;
+                }
+            }
+
             terminal.draw(|f| self.ui(f))?;
 
             if event::poll(Duration::from_millis(100))? {
@@ -411,6 +720,11 @@ impl Dashboard {
             }
             // The recording task will handle cleanup and completion
             return Ok(DashboardAction::Continue);
+        }
+
+        // Onboarding key handling
+        if self.current_view == DashboardView::Onboarding {
+            return self.handle_onboarding_keys(key_code).await;
         }
 
         if self.show_file_dialog {
@@ -484,10 +798,13 @@ impl Dashboard {
                 self.current_view = DashboardView::Settings;
                 self.settings_selection = 0;
             }
-            KeyCode::Char('e') | KeyCode::Char('E') => {
+            KeyCode::Char('w') | KeyCode::Char('W') => {
                 self.load_entities()?;
                 self.current_view = DashboardView::Entities;
                 self.entity_table_state.select(Some(0));
+                self.owl_world_anim_frame = 0;
+                self.owl_world_mood = OwlWorldMood::Idle;
+                self.set_owl_quip_for_browse();
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 return Ok(DashboardAction::RecordAndTranscribe);
@@ -645,8 +962,64 @@ impl Dashboard {
                             }
                         }
                     }
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        self.start_entity_add();
+                    }
                     KeyCode::Char('r') | KeyCode::Char('R') => {
                         self.load_entities()?;
+                    }
+                    _ => {}
+                }
+            }
+            EntityMode::Adding => {
+                match key_code {
+                    KeyCode::Esc => {
+                        self.entity_mode = EntityMode::Browse;
+                        self.owl_world_mood = OwlWorldMood::Idle;
+                        self.set_owl_quip_for_browse();
+                    }
+                    KeyCode::Tab | KeyCode::Down => {
+                        self.entity_add_field = match self.entity_add_field {
+                            EntityEditField::Name => EntityEditField::Type,
+                            EntityEditField::Type => EntityEditField::Context,
+                            EntityEditField::Context => EntityEditField::Name,
+                        };
+                    }
+                    KeyCode::BackTab | KeyCode::Up => {
+                        self.entity_add_field = match self.entity_add_field {
+                            EntityEditField::Name => EntityEditField::Context,
+                            EntityEditField::Type => EntityEditField::Name,
+                            EntityEditField::Context => EntityEditField::Type,
+                        };
+                    }
+                    KeyCode::Enter => {
+                        if self.entity_add_field == EntityEditField::Type {
+                            // Cycle type on Enter
+                            let current_idx = ENTITY_TYPES.iter().position(|t| *t == self.entity_add_type).unwrap_or(0);
+                            self.entity_add_type = ENTITY_TYPES[(current_idx + 1) % ENTITY_TYPES.len()].to_string();
+                        } else if !self.entity_add_name.trim().is_empty() {
+                            // Save if name is not empty
+                            self.save_entity_add()?;
+                            self.entity_mode = EntityMode::Browse;
+                        }
+                    }
+                    KeyCode::Char(' ') if self.entity_add_field == EntityEditField::Type => {
+                        let current_idx = ENTITY_TYPES.iter().position(|t| *t == self.entity_add_type).unwrap_or(0);
+                        self.entity_add_type = ENTITY_TYPES[(current_idx + 1) % ENTITY_TYPES.len()].to_string();
+                    }
+                    KeyCode::Backspace => {
+                        match self.entity_add_field {
+                            EntityEditField::Name => { self.entity_add_name.pop(); }
+                            EntityEditField::Type => {}
+                            EntityEditField::Context => { self.entity_add_context.pop(); }
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        match self.entity_add_field {
+                            EntityEditField::Name => self.entity_add_name.push(c),
+                            EntityEditField::Type => {}
+                            EntityEditField::Context => self.entity_add_context.push(c),
+                        }
                     }
                     _ => {}
                 }
@@ -786,6 +1159,9 @@ impl Dashboard {
                 self.entity_edit_context = entity.context.clone().unwrap_or_default();
                 self.entity_edit_field = EntityEditField::Name;
                 self.entity_mode = EntityMode::Editing;
+                self.owl_world_mood = OwlWorldMood::Thinking;
+                self.owl_quip = "Editing... I'm watching closely.".to_string();
+                self.owl_quip_timer = 0;
             }
         }
     }
@@ -828,6 +1204,7 @@ impl Dashboard {
             let _ = rebuild_world_from_entities(&self.db);
             self.load_entities()?;
             self.selected_entity = None;
+            self.set_owl_quip_action("Noted! Knowledge updated.");
         }
         Ok(())
     }
@@ -847,6 +1224,9 @@ impl Dashboard {
             }
         }
         self.selected_entity = None;
+        self.owl_quip = "Gone but not forgotten... well, actually forgotten.".to_string();
+        self.owl_quip_timer = 30;
+        self.owl_world_mood = OwlWorldMood::Idle;
         Ok(())
     }
 
@@ -864,6 +1244,70 @@ impl Dashboard {
 
         self.merge_source_entity = None;
         self.selected_entity = None;
+        self.set_owl_quip_action("Two become one. Efficient!");
+        Ok(())
+    }
+
+    fn set_owl_quip_for_browse(&mut self) {
+        let count = self.entities.len();
+        self.owl_quip = match count {
+            0 => "Nothing here yet... record something and I'll fill this up!".to_string(),
+            1..=3 => "Just getting started... record more!".to_string(),
+            4..=10 => "A growing world... I like it.".to_string(),
+            _ => "Hoo knows everyone around here!".to_string(),
+        };
+        self.owl_quip_timer = 0;
+    }
+
+    fn set_owl_quip_action(&mut self, quip: &str) {
+        self.owl_quip = quip.to_string();
+        self.owl_quip_timer = 30;
+        self.owl_world_mood = OwlWorldMood::Celebrating;
+    }
+
+    fn start_entity_add(&mut self) {
+        self.entity_add_name.clear();
+        self.entity_add_type = "person".to_string();
+        self.entity_add_context.clear();
+        self.entity_add_aliases.clear();
+        self.entity_add_field = EntityEditField::Name;
+        self.entity_mode = EntityMode::Adding;
+        self.owl_world_mood = OwlWorldMood::Thinking;
+        self.owl_quip = "Tell me about this new entry...".to_string();
+        self.owl_quip_timer = 0;
+    }
+
+    fn save_entity_add(&mut self) -> Result<()> {
+        if self.entity_add_name.trim().is_empty() {
+            return Ok(());
+        }
+        let mut registry = EntityRegistry::new(&mut self.db);
+        let entity = registry.create_entity(
+            self.entity_add_type.trim(),
+            self.entity_add_name.trim(),
+            if self.entity_add_context.trim().is_empty() {
+                None
+            } else {
+                Some(self.entity_add_context.trim())
+            },
+        )?;
+        // Add aliases if provided
+        if let Some(id) = entity.id {
+            for alias in self.entity_add_aliases.split(',') {
+                let alias = alias.trim();
+                if !alias.is_empty() {
+                    registry.add_entity_alias(id, alias)?;
+                }
+            }
+        }
+        drop(registry);
+        let _ = rebuild_world_from_entities(&self.db);
+        self.load_entities()?;
+        // Select the new entity (should be last or find by name)
+        if let Some(pos) = self.entities.iter().position(|e| e.canonical_name == self.entity_add_name.trim()) {
+            self.entity_table_state.select(Some(pos));
+        }
+        self.set_owl_quip_action("Hoo hoo! Welcome to the world!");
         Ok(())
     }
 
@@ -1841,6 +2285,7 @@ impl Dashboard {
             DashboardView::Help => self.render_help(f, f.size()),
             DashboardView::Settings => self.render_settings(f, f.size()),
             DashboardView::Entities => self.render_entities_view(f, f.size()),
+            DashboardView::Onboarding => self.render_onboarding(f, f.size()),
         }
     }
 
@@ -1871,7 +2316,7 @@ impl Dashboard {
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(8), // Header (increased for ASCII art)
+                Constraint::Length(5), // Header (owl + text)
                 Constraint::Min(6),    // Recordings Table
                 Constraint::Length(4), // Statistics
                 Constraint::Length(3), // Footer
@@ -1897,16 +2342,99 @@ impl Dashboard {
     }
 
     fn render_header(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let header_text = format!("{}\nv{} — Record. Transcribe. Understand.", ASCII_ART, env!("CARGO_PKG_VERSION"));
+        use ratatui::text::{Line, Span};
 
-        let header = Paragraph::new(header_text)
-            .style(
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: false })
+        let cycle = self.header_anim_frame % 250;
+        let is_flying = cycle >= 150 && cycle < 190;
+        let is_blink = !is_flying && (cycle % 40) < 3;
+
+        let yellow_bold = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        let gray = Style::default().fg(Color::DarkGray);
+
+        let lines = if is_flying {
+            // Flight phase: owl hops right of logo, flies across, bobs up and down
+            let fly_frame = cycle - 150; // 0..39
+            let inner_width = (area.width as usize).saturating_sub(2);
+            let logo_end = 28;
+            let flyable = inner_width.saturating_sub(logo_end + 7);
+
+            // Horizontal: out and back over 40 frames
+            let progress = if fly_frame < 20 {
+                fly_frame as f64 / 19.0
+            } else {
+                (40 - fly_frame) as f64 / 20.0
+            };
+            let eased = if progress < 0.5 {
+                2.0 * progress * progress
+            } else {
+                1.0 - (-2.0 * progress + 2.0).powi(2) / 2.0
+            };
+            let offset = (eased * flyable as f64) as usize;
+
+            // Vertical: bob between line 0 and 1 only
+            let vert = ((fly_frame as f64 / 8.0) * std::f64::consts::PI).sin();
+            let row = if vert > 0.0 { 0 } else { 1 };
+
+            let face = if fly_frame < 3 || fly_frame > 37 { "(o,o)" } else { "(^,^)" };
+            let owl_str = if fly_frame >= 3 && fly_frame <= 37 {
+                format!("~{}~", face)
+            } else {
+                format!(" {} ", face)
+            };
+            let gap = " ".repeat(offset);
+            let owl_span = Span::styled(format!("{}{}", gap, owl_str), yellow_bold);
+            let empty_span = Span::raw("");
+
+            // Build 3 lines: logo is always fixed, owl appears on the row it's bobbing to
+            let logo_lines = [
+                "         ╔═╗╔═╗╦═╗╦╔╗ ╔═╗",
+                "         ╚═╗║  ╠╦╝║╠╩╗╠═╣",
+                "         ╚═╝╚═╝╩╚═╩╚═╝╩ ╩",
+            ];
+
+            vec![
+                Line::from(vec![
+                    Span::styled(logo_lines[0], yellow_bold),
+                    if row == 0 { owl_span.clone() } else { empty_span.clone() },
+                ]),
+                Line::from(vec![
+                    Span::styled(logo_lines[1], yellow_bold),
+                    if row == 1 { owl_span.clone() } else { empty_span.clone() },
+                ]),
+                Line::from(vec![
+                    Span::styled(logo_lines[2], yellow_bold),
+                    Span::styled(
+                        " — hoo remembers everything",
+                        gray,
+                    ),
+                ]),
+            ]
+        } else {
+            // Idle: owl sits next to SCRIBA, blinks occasionally
+            let face = if is_blink { "(-,-)" } else { "(o,o)" };
+            vec![
+                Line::from(Span::styled(
+                    format!("  {}  ╔═╗╔═╗╦═╗╦╔╗ ╔═╗", face),
+                    yellow_bold,
+                )),
+                Line::from(Span::styled(
+                    "  {`\"'}  ╚═╗║  ╠╦╝║╠╩╗╠═╣",
+                    yellow_bold,
+                )),
+                Line::from(vec![
+                    Span::styled(
+                        "  -\"-\"-  ╚═╝╚═╝╩╚═╩╚═╝╩ ╩",
+                        yellow_bold,
+                    ),
+                    Span::styled(
+                        " — hoo remembers everything",
+                        gray,
+                    ),
+                ]),
+            ]
+        };
+
+        let header = Paragraph::new(lines)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -2145,9 +2673,9 @@ impl Dashboard {
         let controls = if self.search_mode {
             "ESC: Cancel | ENTER: Search | Type to search...".to_string()
         } else if self.transcribing_recording_name.is_some() {
-            "↑↓: Navigate | [/]: Pages | ENTER: Transcript | P: Play | D/Del: Delete | /: Search | R/A/T: Actions | E/S/H/Q  |  Transcribing...".to_string()
+            "↑↓: Navigate | [/]: Pages | ENTER: Transcript | P: Play | D/Del: Delete | /: Search | R/A/T: Actions | W/S/H/Q  |  Transcribing...".to_string()
         } else {
-            "↑↓: Navigate | [/]: Pages | ENTER: Transcript | P: Play | D/Del: Delete | /: Search | R/A/T: Actions | E: Entities | S: Settings | H: Help | Q: Quit".to_string()
+            "↑↓: Navigate | [/]: Pages | ENTER: Transcript | P: Play | D/Del: Delete | /: Search | R/A/T: Actions | W: World | S: Settings | H: Help | Q: Quit".to_string()
         };
 
         let controls_paragraph = Paragraph::new(controls)
@@ -2406,28 +2934,121 @@ impl Dashboard {
     }
 
     fn render_entities_view(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
+        use ratatui::text::{Line, Span};
+
         // Main layout: Header + Content + Footer
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),  // Header
-                Constraint::Min(10),    // Entity table
+                Constraint::Length(5),  // Header (owl + summary + quip)
+                Constraint::Min(8),     // Entity table
                 Constraint::Length(3),  // Footer
             ])
             .split(area);
 
-        // Header
-        let header = Paragraph::new("🧠 KNOWLEDGE BASE - ENTITIES")
-            .style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .alignment(Alignment::Center)
+        // Animated owl header — fixed-width face + separate thought bubble
+        let (owl_face, owl_body, owl_feet, thought) = match self.owl_world_mood {
+            OwlWorldMood::Idle => {
+                let face = if self.owl_world_anim_frame % 30 < 3 { "(-,-)" } else { "(o,o)" };
+                (face, "{`\"'}", "-\"-\"-", "")
+            }
+            OwlWorldMood::Thinking => {
+                let frame = (self.owl_world_anim_frame / 3) % 8;
+                let face = if frame == 4 { "(-,-)" } else { "(o,o)" };
+                let bubble = match frame {
+                    0 => "  ?",
+                    1 => "  ~",
+                    2 => "  !",
+                    3 => " ~~",
+                    4 => "  ?",
+                    5 => "~~~",
+                    6 => "  !",
+                    _ => "...",
+                };
+                let beak = if frame % 2 == 1 { "{`~'}" } else { "{`\"'}" };
+                (face, beak, "-\"-\"-", bubble)
+            }
+            OwlWorldMood::Celebrating => {
+                let frame = (self.owl_world_anim_frame / 2) % 4;
+                let face = match frame {
+                    0 | 2 => "(^,^)",
+                    _ => "(^,^)",
+                };
+                (face, "{`\"'}", "-\"-\"-", "")
+            }
+        };
+
+        // Build owner summary from entities
+        let owner_entity = self.entities.iter().find(|e| {
+            e.context.as_deref().unwrap_or("").contains("Owner of this Scriba instance")
+        });
+        let owner_summary = if let Some(owner) = owner_entity {
+            let ctx = owner.context.as_deref().unwrap_or("");
+            let role_part = ctx.splitn(2, '.').nth(1).unwrap_or("").trim();
+            if role_part.is_empty() {
+                owner.canonical_name.clone()
+            } else {
+                format!("{} | {}", owner.canonical_name, role_part)
+            }
+        } else {
+            "No owner set".to_string()
+        };
+
+        let people_count = self.entities.iter().filter(|e| {
+            e.entity_type == "person" && !e.context.as_deref().unwrap_or("").contains("Owner of this Scriba instance")
+        }).count();
+        let org_count = self.entities.iter().filter(|e| e.entity_type == "organization").count();
+        let project_count = self.entities.iter().filter(|e| e.entity_type == "project").count();
+
+        let mut counts = Vec::new();
+        if people_count > 0 { counts.push(format!("{} people", people_count)); }
+        if org_count > 0 { counts.push(format!("{} orgs", org_count)); }
+        if project_count > 0 { counts.push(format!("{} projects", project_count)); }
+        let counts_str = if counts.is_empty() { String::new() } else { format!(" | {}", counts.join(", ")) };
+
+        let header_lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("  {}  ", owl_face),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "SCRIBA'S WORLD",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}", thought),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    format!("  {}  ", owl_body),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    format!("{}{}", owner_summary, counts_str),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    format!("  {}  ", owl_feet),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    format!("\"{}\"", self.owl_quip),
+                    Style::default().fg(Color::Green),
+                ),
+            ]),
+        ];
+
+        let header = Paragraph::new(header_lines)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::Cyan)),
+                    .style(Style::default().fg(Color::Cyan))
+                    .border_type(ratatui::widgets::BorderType::Double),
             );
         f.render_widget(header, main_chunks[0]);
 
@@ -2538,7 +3159,8 @@ impl Dashboard {
 
         // Footer (changes based on entity mode)
         let footer_text = match self.entity_mode {
-            EntityMode::Browse => "↑↓: Navigate | Enter: Details | E: Edit | D: Delete | M: Merge | R: Refresh | Esc: Back".to_string(),
+            EntityMode::Browse => "↑↓: Navigate | Enter: Details | A: Add | E: Edit | D: Delete | M: Merge | R: Refresh | Esc: Back".to_string(),
+            EntityMode::Adding => "Tab/↑↓: Switch Field | Type chars | Space: Cycle Type | Enter: Save | Esc: Cancel".to_string(),
             EntityMode::Editing => "Tab/↑↓: Switch Field | Type chars | Space: Cycle Type | Esc: Save & Close".to_string(),
             EntityMode::DeleteConfirm => "Y: Confirm Delete | N/Esc: Cancel".to_string(),
             EntityMode::MergeSelectTarget => {
@@ -2563,6 +3185,9 @@ impl Dashboard {
         // Popups
         if self.show_entity_detail {
             self.render_entity_detail_popup(f, area);
+        }
+        if self.entity_mode == EntityMode::Adding {
+            self.render_entity_add_popup(f, area);
         }
         if self.entity_mode == EntityMode::Editing {
             self.render_entity_edit_popup(f, area);
@@ -2693,6 +3318,97 @@ impl Dashboard {
 
             f.render_widget(detail_paragraph, popup_area);
         }
+    }
+
+    fn render_entity_add_popup(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        let popup_area = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(15),
+                Constraint::Percentage(70),
+                Constraint::Percentage(15),
+            ])
+            .split(area)[1];
+        let popup_area = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(15),
+                Constraint::Percentage(70),
+                Constraint::Percentage(15),
+            ])
+            .split(popup_area)[1];
+
+        f.render_widget(Clear, popup_area);
+
+        let cursor = "\u{2588}";
+        let name_style = if self.entity_add_field == EntityEditField::Name {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let context_style = if self.entity_add_field == EntityEditField::Context {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+
+        let name_display = if self.entity_add_field == EntityEditField::Name {
+            format!("{}{}", self.entity_add_name, cursor)
+        } else if self.entity_add_name.is_empty() {
+            "(type a name)".to_string()
+        } else {
+            self.entity_add_name.clone()
+        };
+
+        let type_display: Vec<Span> = ENTITY_TYPES.iter().map(|t| {
+            if *t == self.entity_add_type {
+                Span::styled(format!(" [{}] ", t), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled(format!("  {}  ", t), Style::default().fg(Color::Gray))
+            }
+        }).collect();
+
+        let context_display = if self.entity_add_field == EntityEditField::Context {
+            format!("{}{}", self.entity_add_context, cursor)
+        } else if self.entity_add_context.is_empty() {
+            "(optional)".to_string()
+        } else {
+            self.entity_add_context.clone()
+        };
+
+        let content = vec![
+            Line::from(vec![
+                Span::styled("Name: ", Style::default().fg(Color::Green)),
+            ]),
+            Line::from(vec![Span::styled(name_display, name_style)]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Type: ", Style::default().fg(Color::Green)),
+            ]),
+            Line::from(type_display),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Context: ", Style::default().fg(Color::Green)),
+            ]),
+            Line::from(vec![Span::styled(context_display, context_style)]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Tab/↑↓: Switch Field | Space: Cycle Type | Enter: Save | Esc: Cancel", Style::default().fg(Color::DarkGray)),
+            ]),
+        ];
+
+        let add_paragraph = Paragraph::new(content)
+            .style(Style::default().fg(Color::White))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" ADD NEW ENTITY ")
+                    .title_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                    .border_style(Style::default().fg(Color::Yellow)),
+            )
+            .wrap(Wrap { trim: true });
+
+        f.render_widget(add_paragraph, popup_area);
     }
 
     fn render_entity_edit_popup(&self, f: &mut Frame, area: ratatui::layout::Rect) {
@@ -3708,5 +4424,688 @@ impl Dashboard {
             .wrap(Wrap { trim: true });
 
         f.render_widget(dialog_paragraph, popup_area);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Onboarding: Scriba the Owl
+    // ─────────────────────────────────────────────────────────────────────────
+
+    async fn handle_onboarding_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
+        let ob = match self.onboarding.as_mut() {
+            Some(ob) => ob,
+            None => return Ok(DashboardAction::Continue),
+        };
+
+        // Esc at any step → skip onboarding
+        if matches!(key_code, KeyCode::Esc) {
+            self.onboarding = None;
+            self.current_view = DashboardView::Main;
+            return Ok(DashboardAction::Continue);
+        }
+
+        match ob.step {
+            OnboardingStep::Entrance => {
+                // No key handling during entrance animation
+            }
+            OnboardingStep::Intro => {
+                if !ob.text_complete {
+                    // Any key completes typewriter
+                    ob.complete_text();
+                } else if matches!(key_code, KeyCode::Enter) {
+                    ob.step = OnboardingStep::AskName;
+                    ob.anim_frame = 0;
+                    ob.set_step_text(
+                        "So, who am I working for?\n\nWhat's your name?"
+                    );
+                }
+            }
+            OnboardingStep::AskName => {
+                if !ob.text_complete {
+                    ob.complete_text();
+                } else {
+                    match key_code {
+                        KeyCode::Enter => {
+                            if !ob.user_name.trim().is_empty() {
+                                ob.step = OnboardingStep::AskRole;
+                                ob.anim_frame = 0;
+                                let name = ob.user_name.clone();
+                                ob.set_step_text(&format!(
+                                    "{}! Great name. Love it.\n\n\
+                                     Now tell me about yourself --\n\
+                                     What do you do? What's your company?\n\
+                                     Who do you work with?\n\n\
+                                     Just write naturally, I'll figure it out.",
+                                    name
+                                ));
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            ob.user_name.push(c);
+                        }
+                        KeyCode::Backspace => {
+                            ob.user_name.pop();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            OnboardingStep::AskRole => {
+                if !ob.text_complete {
+                    ob.complete_text();
+                } else {
+                    match key_code {
+                        KeyCode::Enter => {
+                            if !ob.user_role.trim().is_empty() {
+                                ob.step = OnboardingStep::AskAliases;
+                                ob.anim_frame = 0;
+                                ob.set_step_text(
+                                    "Noted! One last thing --\n\n\
+                                     Any nicknames, company name variations, or\n\
+                                     words that get mangled in transcripts?\n\n\
+                                     (Press ENTER to skip)"
+                                );
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            ob.user_role.push(c);
+                        }
+                        KeyCode::Backspace => {
+                            ob.user_role.pop();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            OnboardingStep::AskAliases => {
+                if !ob.text_complete {
+                    ob.complete_text();
+                } else {
+                    match key_code {
+                        KeyCode::Enter => {
+                            // Enter with empty is OK (skip aliases)
+                            ob.step = OnboardingStep::Processing;
+                            ob.anim_frame = 0;
+                            ob.set_step_text("Let me digest all of that...");
+                            self.start_onboarding_processing();
+                        }
+                        KeyCode::Char(c) => {
+                            ob.user_aliases.push(c);
+                        }
+                        KeyCode::Backspace => {
+                            ob.user_aliases.pop();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            OnboardingStep::Processing => {
+                // If Ollama failed and text is complete, Enter advances
+                if ob.text_complete && ob.processing_task.is_none() && !ob.ollama_available {
+                    if matches!(key_code, KeyCode::Enter) {
+                        ob.step = OnboardingStep::Done;
+                        ob.anim_frame = 0;
+                        ob.set_step_text(
+                            "Your world is ready!\n\n\
+                             I'll remember all of this. Every recording\n\
+                             you make, I'll enrich with what I know about\n\
+                             you and your world.\n\n\
+                             Time to fly!"
+                        );
+                    }
+                }
+            }
+            OnboardingStep::Confirmation => {
+                if !ob.text_complete {
+                    ob.complete_text();
+                } else {
+                    match key_code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            ob.step = OnboardingStep::Done;
+                            ob.anim_frame = 0;
+                            ob.set_step_text(
+                                "Your world is ready!\n\n\
+                                 I'll remember all of this. Every recording\n\
+                                 you make, I'll enrich with what I know about\n\
+                                 you and your world.\n\n\
+                                 Time to fly!"
+                            );
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') => {
+                            // Go back to AskName with values preserved
+                            ob.step = OnboardingStep::AskName;
+                            ob.anim_frame = 0;
+                            ob.set_step_text(
+                                "So, who am I working for?\n\nWhat's your name?"
+                            );
+                            ob.complete_text(); // Show instantly
+                            // Delete the world.md that was created during processing
+                            let _ = std::fs::remove_file(WorldContext::file_path());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            OnboardingStep::Done => {
+                // Keys can speed up transition
+                if !ob.text_complete {
+                    ob.complete_text();
+                }
+            }
+        }
+
+        Ok(DashboardAction::Continue)
+    }
+
+    fn start_onboarding_processing(&mut self) {
+        let ob = match self.onboarding.as_mut() {
+            Some(ob) => ob,
+            None => return,
+        };
+
+        // Build seed content from user inputs
+        let mut seed = format!("My name is {}. ", ob.user_name.trim());
+        seed.push_str(ob.user_role.trim());
+        if !ob.user_aliases.trim().is_empty() {
+            seed.push_str(&format!(
+                "\nCommon misspellings or aliases: {}",
+                ob.user_aliases.trim()
+            ));
+        }
+
+        let config = self.config.clone();
+
+        ob.processing_task = Some(tokio::spawn(async move {
+            let mut db = Database::new()?;
+            initialize_world_from_seed(&mut db, &config, &seed).await
+        }));
+    }
+
+    fn render_onboarding(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        let ob = match &self.onboarding {
+            Some(ob) => ob,
+            None => return,
+        };
+
+        // Magic transition overlay
+        if ob.transitioning {
+            self.render_magic_transition(f, area, ob.transition_frame);
+            return;
+        }
+
+        // Full-screen onboarding box
+        let outer_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Double)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(Span::styled(
+                " SCRIBA ",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ))
+            .title_alignment(Alignment::Center);
+        f.render_widget(outer_block, area);
+
+        // Inner area (inside border)
+        let inner = ratatui::layout::Rect {
+            x: area.x + 2,
+            y: area.y + 1,
+            width: area.width.saturating_sub(4),
+            height: area.height.saturating_sub(2),
+        };
+
+        // Layout: Owl + Speech Bubble + Input + Step Dots + Footer
+        let content_width = 56u16.min(inner.width);
+        let h_offset = (inner.width.saturating_sub(content_width)) / 2;
+        let centered = ratatui::layout::Rect {
+            x: inner.x + h_offset,
+            y: inner.y,
+            width: content_width,
+            height: inner.height,
+        };
+
+        match ob.step {
+            OnboardingStep::Entrance => {
+                self.render_owl_entrance(f, centered, ob);
+            }
+            _ => {
+                // Vertical layout within centered area
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(4),  // Owl
+                        Constraint::Length(1),  // Spacer
+                        Constraint::Min(6),     // Speech bubble
+                        Constraint::Length(3),  // Footer
+                    ])
+                    .split(centered);
+
+                // Render owl
+                self.render_owl(f, chunks[0], ob);
+
+                // Render speech bubble + input
+                self.render_speech_bubble(f, chunks[2], ob);
+
+                // Render step dots + footer hint
+                self.render_onboarding_footer(f, chunks[3], ob);
+            }
+        }
+    }
+
+    fn render_owl_entrance(&self, f: &mut Frame, area: ratatui::layout::Rect, ob: &OnboardingState) {
+        // 40-frame entrance (~4s): sparkle trail → owl flies in → lands with flourish
+        let frame = ob.anim_frame.min(39);
+        let total_width = area.width as usize;
+        let center = total_width / 2;
+        let owl_y = area.y + area.height / 2;
+
+        // Phase 1 (frames 0-10): Sparkles gather on the right side, hinting something is coming
+        if frame <= 10 {
+            let density = (frame as f64 + 1.0) / 12.0;
+            let seed = frame * 4219;
+            let mut lines: Vec<Line> = Vec::new();
+            for y in 0..area.height {
+                let mut spans: Vec<Span> = Vec::new();
+                for x in 0..area.width {
+                    let hash = ((x as usize).wrapping_mul(37).wrapping_add(y as usize).wrapping_mul(13).wrapping_add(seed)) % 100;
+                    // Only sparkle in the right third of the screen
+                    let in_right_zone = (x as usize) > (total_width * 2 / 3);
+                    let threshold = (density * 100.0) as usize;
+                    if in_right_zone && hash < threshold {
+                        let ch = SPARKLE_CHARS[hash % 4]; // skip space
+                        let color = match hash % 3 {
+                            0 => Color::Yellow,
+                            1 => Color::Cyan,
+                            _ => Color::White,
+                        };
+                        spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
+                    } else {
+                        spans.push(Span::raw(" "));
+                    }
+                }
+                lines.push(Line::from(spans));
+            }
+            let p = Paragraph::new(lines);
+            f.render_widget(p, area);
+            return;
+        }
+
+        // Phase 2 (frames 11-32): Owl flies across with sparkle trail
+        if frame <= 32 {
+            let fly_progress = (frame - 11) as f64 / 21.0;
+            // Ease-out cubic for graceful deceleration
+            let eased = 1.0 - (1.0 - fly_progress).powi(3);
+            let start = total_width.saturating_sub(4);
+            let x_pos = start - ((start - center) as f64 * eased) as usize;
+            let x_pos = x_pos.min(total_width.saturating_sub(7));
+
+            // Vertical bob: slight sine wave during flight
+            let bob = ((fly_progress * std::f64::consts::PI * 3.0).sin() * 1.5) as i16;
+            let y_pos = (owl_y as i16 + bob).max(area.y as i16) as u16;
+
+            // Draw sparkle trail behind the owl
+            let trail_len = 8usize;
+            let seed = frame * 2311;
+            for t in 1..=trail_len {
+                let trail_x = x_pos + t * 2;
+                if trail_x < total_width {
+                    let age = t as f64 / trail_len as f64;
+                    let ch = if age < 0.3 { '*' } else if age < 0.6 { '+' } else { '.' };
+                    let color = if age < 0.4 { Color::Yellow } else { Color::DarkGray };
+                    // Slight vertical scatter for trail
+                    let scatter = ((seed + t) % 3) as i16 - 1;
+                    let ty = (y_pos as i16 + scatter).max(area.y as i16).min((area.y + area.height - 1) as i16) as u16;
+                    if trail_x < area.width as usize {
+                        let trail_area = ratatui::layout::Rect {
+                            x: area.x + trail_x as u16,
+                            y: ty,
+                            width: 1,
+                            height: 1,
+                        };
+                        let p = Paragraph::new(ch.to_string())
+                            .style(Style::default().fg(color));
+                        f.render_widget(p, trail_area);
+                    }
+                }
+            }
+
+            // Draw the owl
+            let owl_text = if fly_progress < 0.5 {
+                OWL_FLYING
+            } else if fly_progress < 0.85 {
+                OWL_APPROACH
+            } else {
+                OWL_APPROACH
+            };
+
+            let owl_area = ratatui::layout::Rect {
+                x: area.x + x_pos as u16,
+                y: y_pos,
+                width: (owl_text.len() as u16).min(area.width.saturating_sub(x_pos as u16)),
+                height: 1,
+            };
+            let p = Paragraph::new(owl_text)
+                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+            f.render_widget(p, owl_area);
+            return;
+        }
+
+        // Phase 3 (frames 33-39): Landed — owl settles with a little sparkle burst
+        let settle_frame = frame - 33;
+
+        // Sparkle burst around the landing spot (fades over frames)
+        if settle_frame < 5 {
+            let burst_density = (5 - settle_frame) as f64 / 8.0;
+            let seed = frame * 1571;
+            let burst_radius = 6u16;
+            let cx = (area.x + center as u16).saturating_sub(1);
+            let cy = owl_y;
+            for dy in 0..burst_radius {
+                for dx in 0..(burst_radius * 2) {
+                    let bx = cx.saturating_sub(burst_radius) + dx;
+                    let by = cy.saturating_sub(burst_radius / 2) + dy;
+                    if bx >= area.x && bx < area.x + area.width && by >= area.y && by < area.y + area.height {
+                        let hash = ((bx as usize).wrapping_mul(29).wrapping_add(by as usize).wrapping_mul(19).wrapping_add(seed)) % 100;
+                        let threshold = (burst_density * 100.0) as usize;
+                        if hash < threshold {
+                            let ch = SPARKLE_CHARS[hash % 4];
+                            let color = match hash % 3 { 0 => Color::Yellow, 1 => Color::Cyan, _ => Color::White };
+                            let spark_area = ratatui::layout::Rect { x: bx, y: by, width: 1, height: 1 };
+                            let p = Paragraph::new(ch.to_string()).style(Style::default().fg(color));
+                            f.render_widget(p, spark_area);
+                        }
+                    }
+                }
+            }
+        }
+
+        // The landed owl
+        let owl_area = ratatui::layout::Rect {
+            x: area.x + center.saturating_sub(4) as u16,
+            y: owl_y.saturating_sub(1),
+            width: 12.min(area.width),
+            height: 3,
+        };
+        let p = Paragraph::new(OWL_LANDED)
+            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+        f.render_widget(p, owl_area);
+    }
+
+    fn render_owl(&self, f: &mut Frame, area: ratatui::layout::Rect, ob: &OnboardingState) {
+        let owl_text = match ob.step {
+            OnboardingStep::Processing if ob.processing_task.is_some() => {
+                // Slow: one frame change every ~300ms
+                OWL_THINKING[(ob.anim_frame / 3) % 8]
+            }
+            OnboardingStep::Done if !ob.transitioning => {
+                // Slow celebration: one frame change every ~250ms
+                OWL_CELEBRATE[(ob.anim_frame / 2) % 4]
+            }
+            _ => {
+                // Idle with blink every ~30 frames
+                if ob.anim_frame % 30 < 2 {
+                    OWL_IDLE[1] // blink
+                } else {
+                    OWL_IDLE[0] // normal
+                }
+            }
+        };
+
+        // Center the owl
+        let owl_lines: Vec<&str> = owl_text.split('\n').collect();
+        let owl_width = owl_lines.iter().map(|l| l.len()).max().unwrap_or(0) as u16;
+        let x_offset = (area.width.saturating_sub(owl_width)) / 2;
+
+        let owl_area = ratatui::layout::Rect {
+            x: area.x + x_offset,
+            y: area.y,
+            width: owl_width + 4,
+            height: (owl_lines.len() as u16).min(area.height),
+        };
+
+        let p = Paragraph::new(owl_text)
+            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+        f.render_widget(p, owl_area);
+    }
+
+    fn render_speech_bubble(&self, f: &mut Frame, area: ratatui::layout::Rect, ob: &OnboardingState) {
+        let visible = ob.visible_text();
+
+        // Build content lines
+        let mut lines: Vec<Line> = visible
+            .split('\n')
+            .map(|l| Line::from(Span::styled(l, Style::default().fg(Color::Green))))
+            .collect();
+
+        // Add input field for input steps
+        let show_input = ob.text_complete && matches!(
+            ob.step,
+            OnboardingStep::AskName | OnboardingStep::AskRole | OnboardingStep::AskAliases
+        );
+
+        // Add confirmation choices
+        let show_choices = ob.text_complete && ob.step == OnboardingStep::Confirmation;
+
+        if show_choices {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("  [Y] Hoo yes!  ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled("  [N] Let me fix that", Style::default().fg(Color::Yellow)),
+            ]));
+        }
+
+        // Determine how much height for speech vs input
+        let speech_height = if show_input {
+            area.height.saturating_sub(4) // Leave room for input box
+        } else {
+            area.height
+        };
+
+        // Speech bubble
+        let speech_area = ratatui::layout::Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: speech_height,
+        };
+
+        let bubble = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(Span::styled(
+                        " SCRIBA ",
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    )),
+            )
+            .wrap(Wrap { trim: false });
+        f.render_widget(bubble, speech_area);
+
+        // Input field
+        if show_input {
+            let input_value = match ob.step {
+                OnboardingStep::AskName => &ob.user_name,
+                OnboardingStep::AskRole => &ob.user_role,
+                OnboardingStep::AskAliases => &ob.user_aliases,
+                _ => &ob.user_name,
+            };
+
+            let input_area = ratatui::layout::Rect {
+                x: area.x,
+                y: area.y + speech_height,
+                width: area.width,
+                height: 3,
+            };
+
+            let input_text = format!("{}_", input_value);
+            let input = Paragraph::new(input_text)
+                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Yellow))
+                        .title(Span::styled(
+                            " Your answer ",
+                            Style::default().fg(Color::Yellow),
+                        )),
+                );
+            f.render_widget(input, input_area);
+        }
+    }
+
+    fn render_onboarding_footer(&self, f: &mut Frame, area: ratatui::layout::Rect, ob: &OnboardingState) {
+        // Step indicator dots
+        let steps = [
+            OnboardingStep::Intro,
+            OnboardingStep::AskName,
+            OnboardingStep::AskRole,
+            OnboardingStep::AskAliases,
+            OnboardingStep::Processing,
+            OnboardingStep::Confirmation,
+            OnboardingStep::Done,
+        ];
+
+        let current_idx = match ob.step {
+            OnboardingStep::Entrance => 0,
+            OnboardingStep::Intro => 0,
+            OnboardingStep::AskName => 1,
+            OnboardingStep::AskRole => 2,
+            OnboardingStep::AskAliases => 3,
+            OnboardingStep::Processing => 4,
+            OnboardingStep::Confirmation => 5,
+            OnboardingStep::Done => 6,
+        };
+
+        let mut dots: Vec<Span> = Vec::new();
+        for (i, _) in steps.iter().enumerate() {
+            if i == current_idx {
+                dots.push(Span::styled(" @ ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)));
+            } else if i < current_idx {
+                dots.push(Span::styled(" O ", Style::default().fg(Color::Cyan)));
+            } else {
+                dots.push(Span::styled(" . ", Style::default().fg(Color::DarkGray)));
+            }
+        }
+
+        let hint = match ob.step {
+            OnboardingStep::Intro => {
+                if ob.text_complete { "ENTER: Continue" } else { "ENTER: Skip text" }
+            }
+            OnboardingStep::AskName | OnboardingStep::AskRole => {
+                "Type your answer, ENTER to continue"
+            }
+            OnboardingStep::AskAliases => {
+                "Type aliases, ENTER to continue (or skip)"
+            }
+            OnboardingStep::Processing => {
+                if ob.processing_task.is_some() { "" }
+                else if !ob.ollama_available { "ENTER: Continue" }
+                else { "" }
+            }
+            OnboardingStep::Confirmation => {
+                if ob.text_complete { "[Y] / [N]" } else { "" }
+            }
+            OnboardingStep::Done => "",
+            _ => "",
+        };
+
+        let mut footer_lines = vec![
+            Line::from(dots),
+        ];
+        if !hint.is_empty() {
+            footer_lines.push(Line::from(vec![
+                Span::styled("ESC: Skip  |  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(hint, Style::default().fg(Color::DarkGray)),
+            ]));
+        } else {
+            footer_lines.push(Line::from(Span::styled(
+                "ESC: Skip",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
+        let footer = Paragraph::new(footer_lines)
+            .alignment(Alignment::Center);
+        f.render_widget(footer, area);
+    }
+
+    fn render_magic_transition(&self, f: &mut Frame, area: ratatui::layout::Rect, frame: usize) {
+        if frame <= 10 {
+            // Sparkle scatter phase (builds up over ~1s)
+            let density = match frame {
+                0..=2 => 0.1,
+                3..=4 => 0.2,
+                5..=6 => 0.35,
+                7..=8 => 0.55,
+                _ => 0.8,
+            };
+
+            let mut lines: Vec<Line> = Vec::new();
+            let seed = frame * 7919;
+            for y in 0..area.height {
+                let mut spans: Vec<Span> = Vec::new();
+                for x in 0..area.width {
+                    let hash = ((x as usize).wrapping_mul(31).wrapping_add(y as usize).wrapping_mul(17).wrapping_add(seed)) % 100;
+                    let threshold = (density * 100.0) as usize;
+                    if hash < threshold {
+                        let ch_idx = (hash + frame) % SPARKLE_CHARS.len();
+                        let ch = SPARKLE_CHARS[ch_idx];
+                        let color = match (hash + frame) % 3 {
+                            0 => Color::Cyan,
+                            1 => Color::Yellow,
+                            _ => Color::White,
+                        };
+                        spans.push(Span::styled(
+                            ch.to_string(),
+                            Style::default().fg(color),
+                        ));
+                    } else {
+                        spans.push(Span::raw(" "));
+                    }
+                }
+                lines.push(Line::from(spans));
+            }
+            let p = Paragraph::new(lines);
+            f.render_widget(p, area);
+        } else if frame <= 14 {
+            // Flash frame — bright cyan
+            let flash_char = if frame <= 12 { "*" } else { "." };
+            let mut lines: Vec<Line> = Vec::new();
+            for _ in 0..area.height {
+                let line_str: String = std::iter::repeat(flash_char).take(area.width as usize).collect();
+                lines.push(Line::from(Span::styled(
+                    line_str,
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
+            let p = Paragraph::new(lines);
+            f.render_widget(p, area);
+        } else {
+            // Fade to empty — sparse sparkles fading out (~1.5s)
+            let density = match frame {
+                15..=17 => 0.2,
+                18..=20 => 0.12,
+                21..=23 => 0.06,
+                24..=26 => 0.02,
+                _ => 0.0,
+            };
+
+            let mut lines: Vec<Line> = Vec::new();
+            let seed = frame * 3571;
+            for y in 0..area.height {
+                let mut spans: Vec<Span> = Vec::new();
+                for x in 0..area.width {
+                    let hash = ((x as usize).wrapping_mul(31).wrapping_add(y as usize).wrapping_mul(17).wrapping_add(seed)) % 100;
+                    let threshold = (density * 100.0) as usize;
+                    if hash < threshold {
+                        spans.push(Span::styled(".", Style::default().fg(Color::DarkGray)));
+                    } else {
+                        spans.push(Span::raw(" "));
+                    }
+                }
+                lines.push(Line::from(spans));
+            }
+            let p = Paragraph::new(lines);
+            f.render_widget(p, area);
+        }
     }
 }
