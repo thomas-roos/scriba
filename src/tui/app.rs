@@ -56,6 +56,7 @@ pub struct Dashboard {
     transcription_task: Option<tokio::task::JoinHandle<Result<(), anyhow::Error>>>, // Background transcription task
     transcribing_recording_name: Option<String>, // directory_name of recording being transcribed
     notification_message: Option<(String, usize)>, // (message, frames_remaining) — auto-dismiss
+    header_anim_frame: usize, // Main header owl animation counter
     recording_task: Option<tokio::task::JoinHandle<Result<String, anyhow::Error>>>, // Background recording task (returns recording name)
     recording_mode: Option<RecordingMode>, // Track if we should transcribe after recording
     recording_stop_tx: Option<mpsc::Sender<()>>, // Channel to stop recording
@@ -83,6 +84,17 @@ pub struct Dashboard {
     entity_edit_type: String,
     entity_edit_context: String,
     merge_source_entity: Option<Entity>,
+    // Add entity state
+    entity_add_name: String,
+    entity_add_type: String,
+    entity_add_context: String,
+    entity_add_aliases: String,
+    entity_add_field: EntityEditField,
+    // Owl world view state
+    owl_quip: String,
+    owl_quip_timer: usize,
+    owl_world_anim_frame: usize,
+    owl_world_mood: OwlWorldMood,
     // Transcript enrichment data
     transcript_summary: Option<String>,
     transcript_key_points: Option<Vec<String>>,
@@ -263,9 +275,17 @@ enum RecordingMode {
 enum EntityMode {
     Browse,
     Editing,
+    Adding,
     DeleteConfirm,
     MergeSelectTarget,
     MergeConfirm,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum OwlWorldMood {
+    Idle,
+    Thinking,
+    Celebrating,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -319,6 +339,7 @@ impl Dashboard {
             transcription_task: None,
             transcribing_recording_name: None,
             notification_message: None,
+            header_anim_frame: 0,
             recording_task: None,
             recording_mode: None,
             recording_stop_tx: None,
@@ -346,6 +367,17 @@ impl Dashboard {
             entity_edit_type: String::new(),
             entity_edit_context: String::new(),
             merge_source_entity: None,
+            // Add entity state
+            entity_add_name: String::new(),
+            entity_add_type: "person".to_string(),
+            entity_add_context: String::new(),
+            entity_add_aliases: String::new(),
+            entity_add_field: EntityEditField::Name,
+            // Owl world view state
+            owl_quip: String::new(),
+            owl_quip_timer: 0,
+            owl_world_anim_frame: 0,
+            owl_world_mood: OwlWorldMood::Idle,
             // Transcript enrichment data
             transcript_summary: None,
             transcript_key_points: None,
@@ -612,6 +644,27 @@ impl Dashboard {
                 }
             }
 
+            // Main header owl animation
+            if self.current_view == DashboardView::Main {
+                self.header_anim_frame = self.header_anim_frame.wrapping_add(1);
+            }
+
+            // World view tick logic (owl animation + quip timer)
+            if self.current_view == DashboardView::Entities {
+                self.owl_world_anim_frame = self.owl_world_anim_frame.wrapping_add(1);
+                if self.owl_quip_timer > 0 {
+                    self.owl_quip_timer -= 1;
+                    if self.owl_quip_timer == 0 {
+                        self.owl_world_mood = OwlWorldMood::Idle;
+                        self.set_owl_quip_for_browse();
+                    }
+                }
+                // Auto-reset celebrating mood
+                if self.owl_world_mood == OwlWorldMood::Celebrating && self.owl_quip_timer == 0 {
+                    self.owl_world_mood = OwlWorldMood::Idle;
+                }
+            }
+
             terminal.draw(|f| self.ui(f))?;
 
             if event::poll(Duration::from_millis(100))? {
@@ -745,10 +798,13 @@ impl Dashboard {
                 self.current_view = DashboardView::Settings;
                 self.settings_selection = 0;
             }
-            KeyCode::Char('e') | KeyCode::Char('E') => {
+            KeyCode::Char('w') | KeyCode::Char('W') => {
                 self.load_entities()?;
                 self.current_view = DashboardView::Entities;
                 self.entity_table_state.select(Some(0));
+                self.owl_world_anim_frame = 0;
+                self.owl_world_mood = OwlWorldMood::Idle;
+                self.set_owl_quip_for_browse();
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 return Ok(DashboardAction::RecordAndTranscribe);
@@ -906,8 +962,64 @@ impl Dashboard {
                             }
                         }
                     }
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        self.start_entity_add();
+                    }
                     KeyCode::Char('r') | KeyCode::Char('R') => {
                         self.load_entities()?;
+                    }
+                    _ => {}
+                }
+            }
+            EntityMode::Adding => {
+                match key_code {
+                    KeyCode::Esc => {
+                        self.entity_mode = EntityMode::Browse;
+                        self.owl_world_mood = OwlWorldMood::Idle;
+                        self.set_owl_quip_for_browse();
+                    }
+                    KeyCode::Tab | KeyCode::Down => {
+                        self.entity_add_field = match self.entity_add_field {
+                            EntityEditField::Name => EntityEditField::Type,
+                            EntityEditField::Type => EntityEditField::Context,
+                            EntityEditField::Context => EntityEditField::Name,
+                        };
+                    }
+                    KeyCode::BackTab | KeyCode::Up => {
+                        self.entity_add_field = match self.entity_add_field {
+                            EntityEditField::Name => EntityEditField::Context,
+                            EntityEditField::Type => EntityEditField::Name,
+                            EntityEditField::Context => EntityEditField::Type,
+                        };
+                    }
+                    KeyCode::Enter => {
+                        if self.entity_add_field == EntityEditField::Type {
+                            // Cycle type on Enter
+                            let current_idx = ENTITY_TYPES.iter().position(|t| *t == self.entity_add_type).unwrap_or(0);
+                            self.entity_add_type = ENTITY_TYPES[(current_idx + 1) % ENTITY_TYPES.len()].to_string();
+                        } else if !self.entity_add_name.trim().is_empty() {
+                            // Save if name is not empty
+                            self.save_entity_add()?;
+                            self.entity_mode = EntityMode::Browse;
+                        }
+                    }
+                    KeyCode::Char(' ') if self.entity_add_field == EntityEditField::Type => {
+                        let current_idx = ENTITY_TYPES.iter().position(|t| *t == self.entity_add_type).unwrap_or(0);
+                        self.entity_add_type = ENTITY_TYPES[(current_idx + 1) % ENTITY_TYPES.len()].to_string();
+                    }
+                    KeyCode::Backspace => {
+                        match self.entity_add_field {
+                            EntityEditField::Name => { self.entity_add_name.pop(); }
+                            EntityEditField::Type => {}
+                            EntityEditField::Context => { self.entity_add_context.pop(); }
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        match self.entity_add_field {
+                            EntityEditField::Name => self.entity_add_name.push(c),
+                            EntityEditField::Type => {}
+                            EntityEditField::Context => self.entity_add_context.push(c),
+                        }
                     }
                     _ => {}
                 }
@@ -1047,6 +1159,9 @@ impl Dashboard {
                 self.entity_edit_context = entity.context.clone().unwrap_or_default();
                 self.entity_edit_field = EntityEditField::Name;
                 self.entity_mode = EntityMode::Editing;
+                self.owl_world_mood = OwlWorldMood::Thinking;
+                self.owl_quip = "Editing... I'm watching closely.".to_string();
+                self.owl_quip_timer = 0;
             }
         }
     }
@@ -1089,6 +1204,7 @@ impl Dashboard {
             let _ = rebuild_world_from_entities(&self.db);
             self.load_entities()?;
             self.selected_entity = None;
+            self.set_owl_quip_action("Noted! Knowledge updated.");
         }
         Ok(())
     }
@@ -1108,6 +1224,9 @@ impl Dashboard {
             }
         }
         self.selected_entity = None;
+        self.owl_quip = "Gone but not forgotten... well, actually forgotten.".to_string();
+        self.owl_quip_timer = 30;
+        self.owl_world_mood = OwlWorldMood::Idle;
         Ok(())
     }
 
@@ -1125,6 +1244,70 @@ impl Dashboard {
 
         self.merge_source_entity = None;
         self.selected_entity = None;
+        self.set_owl_quip_action("Two become one. Efficient!");
+        Ok(())
+    }
+
+    fn set_owl_quip_for_browse(&mut self) {
+        let count = self.entities.len();
+        self.owl_quip = match count {
+            0 => "Nothing here yet... record something and I'll fill this up!".to_string(),
+            1..=3 => "Just getting started... record more!".to_string(),
+            4..=10 => "A growing world... I like it.".to_string(),
+            _ => "Hoo knows everyone around here!".to_string(),
+        };
+        self.owl_quip_timer = 0;
+    }
+
+    fn set_owl_quip_action(&mut self, quip: &str) {
+        self.owl_quip = quip.to_string();
+        self.owl_quip_timer = 30;
+        self.owl_world_mood = OwlWorldMood::Celebrating;
+    }
+
+    fn start_entity_add(&mut self) {
+        self.entity_add_name.clear();
+        self.entity_add_type = "person".to_string();
+        self.entity_add_context.clear();
+        self.entity_add_aliases.clear();
+        self.entity_add_field = EntityEditField::Name;
+        self.entity_mode = EntityMode::Adding;
+        self.owl_world_mood = OwlWorldMood::Thinking;
+        self.owl_quip = "Tell me about this new entry...".to_string();
+        self.owl_quip_timer = 0;
+    }
+
+    fn save_entity_add(&mut self) -> Result<()> {
+        if self.entity_add_name.trim().is_empty() {
+            return Ok(());
+        }
+        let mut registry = EntityRegistry::new(&mut self.db);
+        let entity = registry.create_entity(
+            self.entity_add_type.trim(),
+            self.entity_add_name.trim(),
+            if self.entity_add_context.trim().is_empty() {
+                None
+            } else {
+                Some(self.entity_add_context.trim())
+            },
+        )?;
+        // Add aliases if provided
+        if let Some(id) = entity.id {
+            for alias in self.entity_add_aliases.split(',') {
+                let alias = alias.trim();
+                if !alias.is_empty() {
+                    registry.add_entity_alias(id, alias)?;
+                }
+            }
+        }
+        drop(registry);
+        let _ = rebuild_world_from_entities(&self.db);
+        self.load_entities()?;
+        // Select the new entity (should be last or find by name)
+        if let Some(pos) = self.entities.iter().position(|e| e.canonical_name == self.entity_add_name.trim()) {
+            self.entity_table_state.select(Some(pos));
+        }
+        self.set_owl_quip_action("Hoo hoo! Welcome to the world!");
         Ok(())
     }
 
@@ -2161,26 +2344,95 @@ impl Dashboard {
     fn render_header(&self, f: &mut Frame, area: ratatui::layout::Rect) {
         use ratatui::text::{Line, Span};
 
-        let lines = vec![
-            Line::from(Span::styled(
-                "  (o,o)  ╔═╗╔═╗╦═╗╦╔╗ ╔═╗",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                "  {`\"'}  ╚═╗║  ╠╦╝║╠╩╗╠═╣",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(vec![
-                Span::styled(
-                    "  -\"-\"-  ╚═╝╚═╝╩╚═╩╚═╝╩ ╩",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" — hoo remembers everything  v{}", env!("CARGO_PKG_VERSION")),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]),
-        ];
+        let cycle = self.header_anim_frame % 250;
+        let is_flying = cycle >= 150 && cycle < 190;
+        let is_blink = !is_flying && (cycle % 40) < 3;
+
+        let yellow_bold = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        let gray = Style::default().fg(Color::DarkGray);
+
+        let lines = if is_flying {
+            // Flight phase: owl hops right of logo, flies across, bobs up and down
+            let fly_frame = cycle - 150; // 0..39
+            let inner_width = (area.width as usize).saturating_sub(2);
+            let logo_end = 28;
+            let flyable = inner_width.saturating_sub(logo_end + 7);
+
+            // Horizontal: out and back over 40 frames
+            let progress = if fly_frame < 20 {
+                fly_frame as f64 / 19.0
+            } else {
+                (40 - fly_frame) as f64 / 20.0
+            };
+            let eased = if progress < 0.5 {
+                2.0 * progress * progress
+            } else {
+                1.0 - (-2.0 * progress + 2.0).powi(2) / 2.0
+            };
+            let offset = (eased * flyable as f64) as usize;
+
+            // Vertical: bob between line 0 and 1 only
+            let vert = ((fly_frame as f64 / 8.0) * std::f64::consts::PI).sin();
+            let row = if vert > 0.0 { 0 } else { 1 };
+
+            let face = if fly_frame < 3 || fly_frame > 37 { "(o,o)" } else { "(^,^)" };
+            let owl_str = if fly_frame >= 3 && fly_frame <= 37 {
+                format!("~{}~", face)
+            } else {
+                format!(" {} ", face)
+            };
+            let gap = " ".repeat(offset);
+            let owl_span = Span::styled(format!("{}{}", gap, owl_str), yellow_bold);
+            let empty_span = Span::raw("");
+
+            // Build 3 lines: logo is always fixed, owl appears on the row it's bobbing to
+            let logo_lines = [
+                "         ╔═╗╔═╗╦═╗╦╔╗ ╔═╗",
+                "         ╚═╗║  ╠╦╝║╠╩╗╠═╣",
+                "         ╚═╝╚═╝╩╚═╩╚═╝╩ ╩",
+            ];
+
+            vec![
+                Line::from(vec![
+                    Span::styled(logo_lines[0], yellow_bold),
+                    if row == 0 { owl_span.clone() } else { empty_span.clone() },
+                ]),
+                Line::from(vec![
+                    Span::styled(logo_lines[1], yellow_bold),
+                    if row == 1 { owl_span.clone() } else { empty_span.clone() },
+                ]),
+                Line::from(vec![
+                    Span::styled(logo_lines[2], yellow_bold),
+                    Span::styled(
+                        " — hoo remembers everything",
+                        gray,
+                    ),
+                ]),
+            ]
+        } else {
+            // Idle: owl sits next to SCRIBA, blinks occasionally
+            let face = if is_blink { "(-,-)" } else { "(o,o)" };
+            vec![
+                Line::from(Span::styled(
+                    format!("  {}  ╔═╗╔═╗╦═╗╦╔╗ ╔═╗", face),
+                    yellow_bold,
+                )),
+                Line::from(Span::styled(
+                    "  {`\"'}  ╚═╗║  ╠╦╝║╠╩╗╠═╣",
+                    yellow_bold,
+                )),
+                Line::from(vec![
+                    Span::styled(
+                        "  -\"-\"-  ╚═╝╚═╝╩╚═╩╚═╝╩ ╩",
+                        yellow_bold,
+                    ),
+                    Span::styled(
+                        " — hoo remembers everything",
+                        gray,
+                    ),
+                ]),
+            ]
+        };
 
         let header = Paragraph::new(lines)
             .block(
@@ -2421,9 +2673,9 @@ impl Dashboard {
         let controls = if self.search_mode {
             "ESC: Cancel | ENTER: Search | Type to search...".to_string()
         } else if self.transcribing_recording_name.is_some() {
-            "↑↓: Navigate | [/]: Pages | ENTER: Transcript | P: Play | D/Del: Delete | /: Search | R/A/T: Actions | E/S/H/Q  |  Transcribing...".to_string()
+            "↑↓: Navigate | [/]: Pages | ENTER: Transcript | P: Play | D/Del: Delete | /: Search | R/A/T: Actions | W/S/H/Q  |  Transcribing...".to_string()
         } else {
-            "↑↓: Navigate | [/]: Pages | ENTER: Transcript | P: Play | D/Del: Delete | /: Search | R/A/T: Actions | E: Entities | S: Settings | H: Help | Q: Quit".to_string()
+            "↑↓: Navigate | [/]: Pages | ENTER: Transcript | P: Play | D/Del: Delete | /: Search | R/A/T: Actions | W: World | S: Settings | H: Help | Q: Quit".to_string()
         };
 
         let controls_paragraph = Paragraph::new(controls)
@@ -2682,28 +2934,121 @@ impl Dashboard {
     }
 
     fn render_entities_view(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
+        use ratatui::text::{Line, Span};
+
         // Main layout: Header + Content + Footer
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),  // Header
-                Constraint::Min(10),    // Entity table
+                Constraint::Length(5),  // Header (owl + summary + quip)
+                Constraint::Min(8),     // Entity table
                 Constraint::Length(3),  // Footer
             ])
             .split(area);
 
-        // Header
-        let header = Paragraph::new("🧠 KNOWLEDGE BASE - ENTITIES")
-            .style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .alignment(Alignment::Center)
+        // Animated owl header — fixed-width face + separate thought bubble
+        let (owl_face, owl_body, owl_feet, thought) = match self.owl_world_mood {
+            OwlWorldMood::Idle => {
+                let face = if self.owl_world_anim_frame % 30 < 3 { "(-,-)" } else { "(o,o)" };
+                (face, "{`\"'}", "-\"-\"-", "")
+            }
+            OwlWorldMood::Thinking => {
+                let frame = (self.owl_world_anim_frame / 3) % 8;
+                let face = if frame == 4 { "(-,-)" } else { "(o,o)" };
+                let bubble = match frame {
+                    0 => "  ?",
+                    1 => "  ~",
+                    2 => "  !",
+                    3 => " ~~",
+                    4 => "  ?",
+                    5 => "~~~",
+                    6 => "  !",
+                    _ => "...",
+                };
+                let beak = if frame % 2 == 1 { "{`~'}" } else { "{`\"'}" };
+                (face, beak, "-\"-\"-", bubble)
+            }
+            OwlWorldMood::Celebrating => {
+                let frame = (self.owl_world_anim_frame / 2) % 4;
+                let face = match frame {
+                    0 | 2 => "(^,^)",
+                    _ => "(^,^)",
+                };
+                (face, "{`\"'}", "-\"-\"-", "")
+            }
+        };
+
+        // Build owner summary from entities
+        let owner_entity = self.entities.iter().find(|e| {
+            e.context.as_deref().unwrap_or("").contains("Owner of this Scriba instance")
+        });
+        let owner_summary = if let Some(owner) = owner_entity {
+            let ctx = owner.context.as_deref().unwrap_or("");
+            let role_part = ctx.splitn(2, '.').nth(1).unwrap_or("").trim();
+            if role_part.is_empty() {
+                owner.canonical_name.clone()
+            } else {
+                format!("{} | {}", owner.canonical_name, role_part)
+            }
+        } else {
+            "No owner set".to_string()
+        };
+
+        let people_count = self.entities.iter().filter(|e| {
+            e.entity_type == "person" && !e.context.as_deref().unwrap_or("").contains("Owner of this Scriba instance")
+        }).count();
+        let org_count = self.entities.iter().filter(|e| e.entity_type == "organization").count();
+        let project_count = self.entities.iter().filter(|e| e.entity_type == "project").count();
+
+        let mut counts = Vec::new();
+        if people_count > 0 { counts.push(format!("{} people", people_count)); }
+        if org_count > 0 { counts.push(format!("{} orgs", org_count)); }
+        if project_count > 0 { counts.push(format!("{} projects", project_count)); }
+        let counts_str = if counts.is_empty() { String::new() } else { format!(" | {}", counts.join(", ")) };
+
+        let header_lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("  {}  ", owl_face),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "SCRIBA'S WORLD",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}", thought),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    format!("  {}  ", owl_body),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    format!("{}{}", owner_summary, counts_str),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    format!("  {}  ", owl_feet),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    format!("\"{}\"", self.owl_quip),
+                    Style::default().fg(Color::Green),
+                ),
+            ]),
+        ];
+
+        let header = Paragraph::new(header_lines)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::Cyan)),
+                    .style(Style::default().fg(Color::Cyan))
+                    .border_type(ratatui::widgets::BorderType::Double),
             );
         f.render_widget(header, main_chunks[0]);
 
@@ -2814,7 +3159,8 @@ impl Dashboard {
 
         // Footer (changes based on entity mode)
         let footer_text = match self.entity_mode {
-            EntityMode::Browse => "↑↓: Navigate | Enter: Details | E: Edit | D: Delete | M: Merge | R: Refresh | Esc: Back".to_string(),
+            EntityMode::Browse => "↑↓: Navigate | Enter: Details | A: Add | E: Edit | D: Delete | M: Merge | R: Refresh | Esc: Back".to_string(),
+            EntityMode::Adding => "Tab/↑↓: Switch Field | Type chars | Space: Cycle Type | Enter: Save | Esc: Cancel".to_string(),
             EntityMode::Editing => "Tab/↑↓: Switch Field | Type chars | Space: Cycle Type | Esc: Save & Close".to_string(),
             EntityMode::DeleteConfirm => "Y: Confirm Delete | N/Esc: Cancel".to_string(),
             EntityMode::MergeSelectTarget => {
@@ -2839,6 +3185,9 @@ impl Dashboard {
         // Popups
         if self.show_entity_detail {
             self.render_entity_detail_popup(f, area);
+        }
+        if self.entity_mode == EntityMode::Adding {
+            self.render_entity_add_popup(f, area);
         }
         if self.entity_mode == EntityMode::Editing {
             self.render_entity_edit_popup(f, area);
@@ -2969,6 +3318,97 @@ impl Dashboard {
 
             f.render_widget(detail_paragraph, popup_area);
         }
+    }
+
+    fn render_entity_add_popup(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        let popup_area = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(15),
+                Constraint::Percentage(70),
+                Constraint::Percentage(15),
+            ])
+            .split(area)[1];
+        let popup_area = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(15),
+                Constraint::Percentage(70),
+                Constraint::Percentage(15),
+            ])
+            .split(popup_area)[1];
+
+        f.render_widget(Clear, popup_area);
+
+        let cursor = "\u{2588}";
+        let name_style = if self.entity_add_field == EntityEditField::Name {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let context_style = if self.entity_add_field == EntityEditField::Context {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+
+        let name_display = if self.entity_add_field == EntityEditField::Name {
+            format!("{}{}", self.entity_add_name, cursor)
+        } else if self.entity_add_name.is_empty() {
+            "(type a name)".to_string()
+        } else {
+            self.entity_add_name.clone()
+        };
+
+        let type_display: Vec<Span> = ENTITY_TYPES.iter().map(|t| {
+            if *t == self.entity_add_type {
+                Span::styled(format!(" [{}] ", t), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled(format!("  {}  ", t), Style::default().fg(Color::Gray))
+            }
+        }).collect();
+
+        let context_display = if self.entity_add_field == EntityEditField::Context {
+            format!("{}{}", self.entity_add_context, cursor)
+        } else if self.entity_add_context.is_empty() {
+            "(optional)".to_string()
+        } else {
+            self.entity_add_context.clone()
+        };
+
+        let content = vec![
+            Line::from(vec![
+                Span::styled("Name: ", Style::default().fg(Color::Green)),
+            ]),
+            Line::from(vec![Span::styled(name_display, name_style)]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Type: ", Style::default().fg(Color::Green)),
+            ]),
+            Line::from(type_display),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Context: ", Style::default().fg(Color::Green)),
+            ]),
+            Line::from(vec![Span::styled(context_display, context_style)]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Tab/↑↓: Switch Field | Space: Cycle Type | Enter: Save | Esc: Cancel", Style::default().fg(Color::DarkGray)),
+            ]),
+        ];
+
+        let add_paragraph = Paragraph::new(content)
+            .style(Style::default().fg(Color::White))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" ADD NEW ENTITY ")
+                    .title_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                    .border_style(Style::default().fg(Color::Yellow)),
+            )
+            .wrap(Wrap { trim: true });
+
+        f.render_widget(add_paragraph, popup_area);
     }
 
     fn render_entity_edit_popup(&self, f: &mut Frame, area: ratatui::layout::Rect) {

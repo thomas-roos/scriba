@@ -1,3 +1,30 @@
+Scriba 0.15.0 — Scriba the Owl
+
+Highlights
+
+- **Meet Scriba the Owl**: A charming ASCII owl character that guides you through the entire experience with personality, humor, and animations.
+- **Animated Onboarding**: First-run users get a delightful, videogame-style onboarding conversation with the owl — it flies onto screen, asks questions, builds your world, and transitions to the dashboard with a sparkle dissolve effect.
+- **Scriba's World (W)**: The entities view is now "Scriba's World" — same powerful entity table with a new animated owl header showing owner summary, entity counts, and contextual owl quips that react to your actions.
+- **Add Entities (A)**: Create new entities directly from the World view with name, type, context, and aliases. The missing "C" in CRUD is here.
+- **Owl Personality**: The owl reacts to everything — celebrates when you add or edit, quips when you delete ("Gone but not forgotten... well, actually forgotten."), scribbles along while you're editing, and blinks in idle mode.
+- **Flying Owl Header**: The main dashboard header features an animated owl that occasionally takes flight across the navbar, bobbing up and down with eased motion before settling back next to the SCRIBA logo.
+- **Compact Header**: New 3-line owl + thin block letter header replaces the old 5-line block letters. Tagline: "hoo remembers everything".
+- **Graceful Ollama Fallback**: If Ollama isn't running during onboarding, your info is saved as-is with a friendly message — no crash, no confusion.
+
+Changelog
+
+- feat(tui): animated owl onboarding experience with entrance fly-in, typewriter text, speech bubbles, step dots, and magic sparkle transition
+- feat(tui): "Scriba's World" view with animated owl header, owner summary, entity counts, and contextual quips
+- feat(tui): add entity mode (A key) with name/type/context popup and entity creation
+- feat(tui): owl mood system — Idle (blink), Thinking (scribble), Celebrating (wing-wave) — reacts to user actions
+- feat(tui): flying owl animation in main dashboard header with sine-wave vertical bobbing
+- feat(tui): compact owl + thin block letter header with "hoo remembers everything" tagline
+- feat(core): extract reusable `initialize_world_from_seed()` for both CLI and TUI world initialization
+- refactor(tui): replace E key with W for World view, update all footer hints
+- refactor(main): simplify `WorldCommand::Init` to delegate to shared workflow function
+
+---
+
 Scriba 0.14.0 — Knowledge Extraction & Entity Management
 
 Highlights
