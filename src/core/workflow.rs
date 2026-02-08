@@ -11,7 +11,7 @@ use super::recording::{record_audio, RecordOptions};
 use super::transcription::transcribe_audio;
 use super::types::{ManagedRecording, RecordingConfig, RecordingMode};
 use crate::database::{Database, Recording};
-use crate::enrichment::{EnrichmentService, WorldContext, WorldData, append_new_facts};
+use crate::enrichment::{EnrichmentService, WorldContext, WorldData, WorldEntityExtractionResult, append_new_facts};
 use crate::enrichment::world::{OrgInfo, PersonInfo, ProjectInfo};
 use crate::entities::{EntityLinker, EntityRegistry};
 use crate::utils::{generate_recording_name, BASE_PATH};
@@ -906,6 +906,83 @@ fn apply_world_delta_to_entities(db: &mut Database, delta: &WorldData) -> Result
     }
 
     Ok(())
+}
+
+/// Initialize a world from seed content (used by both CLI and TUI onboarding).
+///
+/// Does: health check → extract_world_seed → save world.md → extract_world_entities → create entities.
+/// Returns `Ok(Some((world_data, entities)))` on success, `Ok(None)` if Ollama unavailable (raw seed saved).
+pub async fn initialize_world_from_seed(
+    db: &mut Database,
+    config: &ScribaConfig,
+    seed_content: &str,
+) -> Result<Option<(WorldData, WorldEntityExtractionResult)>> {
+    let service = EnrichmentService::new(
+        &config.enrichment.ollama_endpoint,
+        &config.enrichment.ollama_model,
+    );
+
+    // Check Ollama availability
+    if service.health_check().await.is_err() {
+        // Save raw seed as world.md and return None
+        WorldContext::initialize(seed_content)?;
+        return Ok(None);
+    }
+
+    // Convert seed to structured JSON via LLM
+    let world_data = match service.extract_world_seed(seed_content).await {
+        Ok(data) => data,
+        Err(_) => {
+            // Fallback: save raw seed
+            WorldContext::initialize(seed_content)?;
+            return Ok(None);
+        }
+    };
+
+    let world_json = world_data.to_json().unwrap_or_else(|_| seed_content.to_string());
+    WorldContext::initialize(&world_json)?;
+
+    // Extract entities from the seed
+    let extraction = match service.extract_world_entities(seed_content).await {
+        Ok(ext) => ext,
+        Err(_) => {
+            return Ok(Some((world_data, WorldEntityExtractionResult {
+                people: vec![],
+                organizations: vec![],
+            })));
+        }
+    };
+
+    // Create entities in DB
+    let mut registry = EntityRegistry::new(db);
+
+    for person in &extraction.people {
+        let context = if person.is_owner {
+            format!("Owner of this Scriba instance. {}", person.context)
+        } else {
+            person.context.clone()
+        };
+
+        if let Ok(entity) = registry.create_entity("person", &person.name, Some(&context)) {
+            if let Some(entity_id) = entity.id {
+                for alias in &person.aliases {
+                    let _ = registry.add_entity_alias(entity_id, alias);
+                }
+            }
+        }
+    }
+
+    for org in &extraction.organizations {
+        if let Ok(entity) = registry.create_entity("organization", &org.name, Some(&org.context)) {
+            if let Some(entity_id) = entity.id {
+                for alias in &org.aliases {
+                    let _ = registry.add_entity_alias(entity_id, alias);
+                }
+            }
+        }
+    }
+
+    Ok(Some((world_data, extraction)))
 }
 
 /// Health status for workflow manager.

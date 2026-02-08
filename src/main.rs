@@ -1,10 +1,10 @@
 use anyhow::Result;
 use scriba::core::{
     resolve_transcription_mode, AudioFormat, CompressionSettings, LocalModelSize, ScribaConfig,
-    TranscriptionMode, WorkflowManager,
+    TranscriptionMode, WorkflowManager, initialize_world_from_seed,
 };
 use scriba::database::Database;
-use scriba::enrichment::{EnrichmentService, WorldContext};
+use scriba::enrichment::WorldContext;
 use scriba::entities::EntityRegistry;
 use scriba::mcp::run_mcp_server;
 use scriba::tui::Dashboard;
@@ -646,13 +646,11 @@ async fn main() -> Result<()> {
                         }
 
                         let seed_content = if stdin {
-                            // Read from stdin
                             println!("Reading world seed from stdin...");
                             let mut content = String::new();
                             io::stdin().read_to_string(&mut content)?;
                             content
                         } else {
-                            // Interactive prompt
                             println!("🌍 Initialize Scriba's World\n");
                             println!("Tell Scriba about yourself. This context helps with:");
                             println!("  • Better entity recognition (company names, people)");
@@ -685,121 +683,33 @@ async fn main() -> Result<()> {
                             return Ok(());
                         }
 
-                        let config = ScribaConfig::load()?;
-                        let service = EnrichmentService::new(
-                            &config.enrichment.ollama_endpoint,
-                            &config.enrichment.ollama_model,
-                        );
-
-                        // Try to convert seed to structured JSON via LLM
                         println!("\n🔍 Building structured world profile...");
+                        let config = ScribaConfig::load()?;
+                        let mut db = Database::new()?;
 
-                        let world_json = match service.health_check().await {
-                            Ok(_) => {
-                                match service.extract_world_seed(&seed_content).await {
-                                    Ok(world_data) => {
-                                        println!("   ✅ Structured profile created");
-                                        match world_data.to_json() {
-                                            Ok(json) => json,
-                                            Err(_) => seed_content.clone(),
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("   ⚠️ Could not structure profile: {}", e);
-                                        println!("   Using raw seed text instead.");
-                                        seed_content.clone()
-                                    }
+                        match initialize_world_from_seed(&mut db, &config, &seed_content).await? {
+                            Some((_world_data, extraction)) => {
+                                println!("   ✅ Structured profile created");
+                                let entity_count = extraction.people.len() + extraction.organizations.len();
+                                for person in &extraction.people {
+                                    println!("   ✅ Created person: {} {}",
+                                        person.name,
+                                        if person.is_owner { "(owner)" } else { "" }
+                                    );
                                 }
+                                for org in &extraction.organizations {
+                                    println!("   ✅ Created organization: {}", org.name);
+                                }
+                                println!("\n🎉 Created {} entities from your world description.", entity_count);
                             }
-                            Err(_) => {
-                                println!("   ⚠️ Ollama not available - saving raw seed text.");
+                            None => {
+                                println!("   ⚠️ Ollama not available - saved raw seed text.");
                                 println!("   Make sure Ollama is running with model '{}'.", config.enrichment.ollama_model);
-                                seed_content.clone()
                             }
-                        };
-
-                        WorldContext::initialize(&world_json)?;
-                        println!("\n✅ World initialized at:");
-                        println!("   {}", WorldContext::file_path().display());
-
-                        // Extract entities from the world description
-                        println!("\n🔍 Extracting entities from your world description...");
-
-                        match service.health_check().await {
-                            Ok(_) => {
-                                match service.extract_world_entities(&seed_content).await {
-                                    Ok(extraction) => {
-                                        let mut db = Database::new()?;
-                                        let mut registry = EntityRegistry::new(&mut db);
-
-                                        let mut created_count = 0;
-
-                                        // Create person entities
-                                        for person in &extraction.people {
-                                            let context = if person.is_owner {
-                                                format!("Owner of this Scriba instance. {}", person.context)
-                                            } else {
-                                                person.context.clone()
-                                            };
-
-                                            match registry.create_entity(
-                                                "person",
-                                                &person.name,
-                                                Some(&context),
-                                            ) {
-                                                Ok(entity) => {
-                                                    // Add aliases
-                                                    if let Some(entity_id) = entity.id {
-                                                        for alias in &person.aliases {
-                                                            let _ = registry.add_entity_alias(entity_id, alias);
-                                                        }
-                                                    }
-                                                    println!("   ✅ Created person: {} {}",
-                                                        person.name,
-                                                        if person.is_owner { "(owner)" } else { "" }
-                                                    );
-                                                    created_count += 1;
-                                                }
-                                                Err(e) => {
-                                                    eprintln!("   ⚠️ Failed to create {}: {}", person.name, e);
-                                                }
-                                            }
-                                        }
-
-                                        // Create organization entities
-                                        for org in &extraction.organizations {
-                                            match registry.create_entity(
-                                                "organization",
-                                                &org.name,
-                                                Some(&org.context),
-                                            ) {
-                                                Ok(entity) => {
-                                                    // Add aliases
-                                                    if let Some(entity_id) = entity.id {
-                                                        for alias in &org.aliases {
-                                                            let _ = registry.add_entity_alias(entity_id, alias);
-                                                        }
-                                                    }
-                                                    println!("   ✅ Created organization: {}", org.name);
-                                                    created_count += 1;
-                                                }
-                                                Err(e) => {
-                                                    eprintln!("   ⚠️ Failed to create {}: {}", org.name, e);
-                                                }
-                                            }
-                                        }
-
-                                        println!("\n🎉 Created {} entities from your world description.", created_count);
-                                    }
-                                    Err(e) => {
-                                        eprintln!("\n⚠️ Could not extract entities: {}", e);
-                                        println!("   You can manually create them with 'scriba entity' commands.");
-                                    }
-                                }
-                            }
-                            Err(_) => {}
                         }
 
+                        println!("\n✅ World initialized at:");
+                        println!("   {}", WorldContext::file_path().display());
                         println!("\nScriba will now use this context for all extractions.");
                         println!("The world will evolve automatically as you add recordings.");
                         Ok(())

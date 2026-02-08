@@ -22,4 +22,4 @@ pub use files::FileManager;
 pub use recording::{record_audio, AudioLevelMonitor, RecordOptions};
 pub use transcription::{transcribe_audio, TranscriptionProgress};
 pub use types::{ManagedRecording, RecordingConfig, RecordingMetadata, RecordingMode};
-pub use workflow::{DatabaseManager, HealthStatus, HealthStatusLevel, WorkflowManager, rebuild_world_from_entities};
+pub use workflow::{DatabaseManager, HealthStatus, HealthStatusLevel, WorkflowManager, rebuild_world_from_entities, initialize_world_from_seed};
