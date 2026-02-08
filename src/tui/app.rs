@@ -23,11 +23,6 @@ use ratatui::{
 use std::io;
 use tokio::sync::mpsc;
 
-const ASCII_ART: &str = r#" ███████  ██████ ██████  ██ ██████   █████
-██      ██      ██   ██ ██ ██   ██ ██   ██
-███████ ██      ██████  ██ ██████  ███████
-     ██ ██      ██   ██ ██ ██   ██ ██   ██
-███████  ██████ ██   ██ ██ ██████  ██   ██"#;
 use anyhow::Context;
 use dirs::home_dir;
 use std::path::PathBuf;
@@ -2138,7 +2133,7 @@ impl Dashboard {
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(8), // Header (increased for ASCII art)
+                Constraint::Length(5), // Header (owl + text)
                 Constraint::Min(6),    // Recordings Table
                 Constraint::Length(4), // Statistics
                 Constraint::Length(3), // Footer
@@ -2164,16 +2159,30 @@ impl Dashboard {
     }
 
     fn render_header(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let header_text = format!("{}\nv{} — Record. Transcribe. Understand.", ASCII_ART, env!("CARGO_PKG_VERSION"));
+        use ratatui::text::{Line, Span};
 
-        let header = Paragraph::new(header_text)
-            .style(
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: false })
+        let lines = vec![
+            Line::from(Span::styled(
+                "  (o,o)  ╔═╗╔═╗╦═╗╦╔╗ ╔═╗",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "  {`\"'}  ╚═╗║  ╠╦╝║╠╩╗╠═╣",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(vec![
+                Span::styled(
+                    "  -\"-\"-  ╚═╝╚═╝╩╚═╩╚═╝╩ ╩",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" — hoo remembers everything  v{}", env!("CARGO_PKG_VERSION")),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+        ];
+
+        let header = Paragraph::new(lines)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
