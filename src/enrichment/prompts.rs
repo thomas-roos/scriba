@@ -103,38 +103,24 @@ Return ONLY valid JSON:"#,
     )
 }
 
-/// Build a prompt for compacting an entity's context with new information.
+/// Build a prompt for updating an entity description with new information.
 ///
-/// Merges existing context + new facts into a single clean, self-contained
-/// description in one LLM call. Replaces the old `append_new_facts()` approach.
+/// Takes what we currently know and new facts, asks the LLM to produce
+/// a single updated description.
 pub fn build_context_compaction_prompt(
     entity_name: &str,
-    entity_type: &str,
+    _entity_type: &str,
     existing_context: &str,
     new_info: &str,
 ) -> String {
     format!(
-        r#"You are maintaining a knowledge base entry for a {entity_type} named "{entity_name}".
-
-CURRENT DESCRIPTION:
+        r#"What we know about "{entity_name}":
 {existing_context}
 
-NEW INFORMATION:
+New information:
 {new_info}
 
-YOUR TASK: Merge ALL facts from both sources into a single clean, self-contained description of "{entity_name}".
-
-RULES:
-1. PRESERVE every meaningful fact from both sources — do not drop details
-2. REMOVE redundant or repetitive statements
-3. If new information contradicts old information, prefer the newer information
-4. Write in a neutral, factual tone — like a concise encyclopedia entry
-5. The result must read as a polished summary, NOT an append log
-6. Keep it concise but complete (aim for 1-3 sentences)
-7. Do NOT add any preamble, explanation, or formatting — return ONLY the merged description text
-
-MERGED DESCRIPTION:"#,
-        entity_type = entity_type,
+Write an updated 1-2 sentence description of "{entity_name}" combining everything above. Be concise and factual. Only return the description, nothing else."#,
         entity_name = entity_name,
         existing_context = existing_context,
         new_info = new_info
@@ -199,6 +185,8 @@ RULES:
 - For projects: only include active projects the owner is working on
 - For beliefs: only include strong convictions the owner clearly expressed
 - Keep descriptions SHORT (under 15 words each)
+- ALL string values MUST be plain text, NEVER nested JSON objects or arrays. For example: "relationship": "Giovanni's girlfriend" NOT "relationship": {{"key": "value"}}
+- "description" and "relationship" fields are short plain-text sentences, nothing else
 
 Return ONLY valid JSON, nothing else:"#,
         current_world = current_world,
@@ -244,6 +232,7 @@ RULES:
 - Do NOT invent or assume information not present
 - Leave arrays empty if nothing relevant is mentioned
 - Keep descriptions SHORT (under 15 words)
+- ALL string values MUST be plain text, NEVER nested JSON objects or arrays
 
 Return ONLY valid JSON, nothing else."#,
         world_content = world_content

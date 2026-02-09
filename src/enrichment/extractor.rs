@@ -300,15 +300,17 @@ impl EnrichmentService {
             .await
             .context("Failed to compact entity context")?;
 
-        // Clean up: remove quotes, trim whitespace
+        // Clean up: remove quotes, markdown fences, trim whitespace
         let compacted = response
             .trim()
+            .trim_start_matches("```")
+            .trim_end_matches("```")
             .trim_matches('"')
             .trim()
             .to_string();
 
-        if compacted.is_empty() {
-            // LLM returned empty — keep existing + new as fallback
+        if compacted.is_empty() || compacted.starts_with('{') || compacted.starts_with('[') {
+            // LLM returned empty or JSON instead of plain text — fall back
             Ok(format!("{}. {}", existing_context.trim_end_matches('.'), new_info))
         } else {
             Ok(compacted)
