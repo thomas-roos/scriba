@@ -1,3 +1,14 @@
+Scriba 0.15.1 — Bug Fixes
+
+Fixes
+
+- **fix: Merged entities no longer recreated** (#34): After merging entities in the TUI, subsequent enrichment runs now correctly recognize aliases and link to the existing entity instead of creating a duplicate.
+- **fix: Duplicate entities from single extraction** (#33): If the same person or organization appeared multiple times in a transcript, they could be created as separate entities. The linker now deduplicates extraction results before processing, and the LLM prompt explicitly instructs against duplicates.
+- **fix: Alias-aware entity lookup**: New `get_entity_by_name_or_alias()` searches both canonical names and aliases across the entire entity pipeline (linker, world delta application).
+- **fix: World context refreshed before extraction**: World.md is now rebuilt from entities before each extraction, ensuring the LLM sees up-to-date alias mappings and merged state.
+
+---
+
 Scriba 0.15.0 — Scriba the Owl
 
 Highlights
