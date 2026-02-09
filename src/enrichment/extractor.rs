@@ -276,6 +276,45 @@ impl EnrichmentService {
         WorldData::from_json(cleaned).context("Failed to parse world seed extraction result")
     }
 
+    /// Compact an entity's context by merging existing + new info into a clean description.
+    ///
+    /// Single LLM call that produces a polished, self-contained summary.
+    /// Falls back to simple append if the LLM call fails.
+    pub async fn compact_entity_context(
+        &self,
+        entity_name: &str,
+        entity_type: &str,
+        existing_context: &str,
+        new_info: &str,
+    ) -> Result<String> {
+        let prompt = prompts::build_context_compaction_prompt(
+            entity_name,
+            entity_type,
+            existing_context,
+            new_info,
+        );
+
+        let response = self
+            .client
+            .generate(&prompt)
+            .await
+            .context("Failed to compact entity context")?;
+
+        // Clean up: remove quotes, trim whitespace
+        let compacted = response
+            .trim()
+            .trim_matches('"')
+            .trim()
+            .to_string();
+
+        if compacted.is_empty() {
+            // LLM returned empty — keep existing + new as fallback
+            Ok(format!("{}. {}", existing_context.trim_end_matches('.'), new_info))
+        } else {
+            Ok(compacted)
+        }
+    }
+
     /// Get the underlying Ollama client.
     pub fn client(&self) -> &OllamaClient {
         &self.client

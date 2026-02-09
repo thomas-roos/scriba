@@ -11,7 +11,7 @@ use super::recording::{record_audio, RecordOptions};
 use super::transcription::transcribe_audio;
 use super::types::{ManagedRecording, RecordingConfig, RecordingMode};
 use crate::database::{Database, Recording};
-use crate::enrichment::{EnrichmentService, WorldContext, WorldData, WorldEntityExtractionResult, append_new_facts};
+use crate::enrichment::{EnrichmentService, WorldContext, WorldData, WorldEntityExtractionResult};
 use crate::enrichment::world::{OrgInfo, PersonInfo, ProjectInfo};
 use crate::entities::{EntityLinker, EntityRegistry};
 use crate::utils::{generate_recording_name, BASE_PATH};
@@ -480,8 +480,8 @@ impl WorkflowManager {
                 .await
             {
                 Ok(Some(delta)) => {
-                    // Apply delta to entities (source of truth)
-                    if let Err(e) = apply_world_delta_to_entities(&mut self.db_manager.db, &delta) {
+                    // Apply delta to entities (source of truth) with LLM context compaction
+                    if let Err(e) = apply_world_delta_to_entities(&mut self.db_manager.db, &delta, &service, verbose).await {
                         if verbose {
                             eprintln!("  ⚠️ Failed to apply delta to entities: {}", e);
                         }
@@ -834,7 +834,16 @@ pub fn rebuild_world_from_entities(db: &Database) -> Result<()> {
 ///
 /// Instead of merging into world.md first, we apply changes to entities
 /// (the source of truth), then rebuild the world from them.
-fn apply_world_delta_to_entities(db: &mut Database, delta: &WorldData) -> Result<()> {
+///
+/// Uses LLM-powered context compaction: existing context + new info are merged
+/// into a clean, self-contained description in a single LLM call.
+/// Falls back to simple append if the compaction call fails.
+async fn apply_world_delta_to_entities(
+    db: &mut Database,
+    delta: &WorldData,
+    service: &EnrichmentService,
+    verbose: bool,
+) -> Result<()> {
     let mut registry = EntityRegistry::new(db);
 
     // Apply owner changes
@@ -856,9 +865,16 @@ fn apply_world_delta_to_entities(db: &mut Database, delta: &WorldData) -> Result
             Some(entity) => {
                 let entity_id = entity.id.unwrap();
                 if !person.relationship.is_empty() {
-                    let mut existing_ctx = entity.context.unwrap_or_default();
-                    append_new_facts(&mut existing_ctx, &person.relationship);
-                    registry.update_entity_context(entity_id, &existing_ctx)?;
+                    let existing_ctx = entity.context.unwrap_or_default();
+                    let compacted = compact_or_append(
+                        service,
+                        &person.name,
+                        "person",
+                        &existing_ctx,
+                        &person.relationship,
+                        verbose,
+                    ).await;
+                    registry.update_entity_context(entity_id, &compacted)?;
                 }
                 for alias in &person.aliases {
                     registry.add_entity_alias(entity_id, alias)?;
@@ -889,9 +905,16 @@ fn apply_world_delta_to_entities(db: &mut Database, delta: &WorldData) -> Result
             Some(entity) => {
                 let entity_id = entity.id.unwrap();
                 if !org.description.is_empty() {
-                    let mut existing_ctx = entity.context.unwrap_or_default();
-                    append_new_facts(&mut existing_ctx, &org.description);
-                    registry.update_entity_context(entity_id, &existing_ctx)?;
+                    let existing_ctx = entity.context.unwrap_or_default();
+                    let compacted = compact_or_append(
+                        service,
+                        &org.name,
+                        "organization",
+                        &existing_ctx,
+                        &org.description,
+                        verbose,
+                    ).await;
+                    registry.update_entity_context(entity_id, &compacted)?;
                 }
                 for alias in &org.aliases {
                     registry.add_entity_alias(entity_id, alias)?;
@@ -914,6 +937,39 @@ fn apply_world_delta_to_entities(db: &mut Database, delta: &WorldData) -> Result
     }
 
     Ok(())
+}
+
+/// Compact entity context via LLM, falling back to simple append on failure.
+async fn compact_or_append(
+    service: &EnrichmentService,
+    entity_name: &str,
+    entity_type: &str,
+    existing_context: &str,
+    new_info: &str,
+    verbose: bool,
+) -> String {
+    if existing_context.is_empty() {
+        return new_info.to_string();
+    }
+
+    match service
+        .compact_entity_context(entity_name, entity_type, existing_context, new_info)
+        .await
+    {
+        Ok(compacted) => {
+            if verbose {
+                println!("    📝 Compacted context for '{}'", entity_name);
+            }
+            compacted
+        }
+        Err(e) => {
+            if verbose {
+                eprintln!("    ⚠️ Compaction failed for '{}', appending: {}", entity_name, e);
+            }
+            // Fallback: simple append
+            format!("{}. {}", existing_context.trim_end_matches('.'), new_info)
+        }
+    }
 }
 
 /// Initialize a world from seed content (used by both CLI and TUI onboarding).

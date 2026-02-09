@@ -103,6 +103,44 @@ Return ONLY valid JSON:"#,
     )
 }
 
+/// Build a prompt for compacting an entity's context with new information.
+///
+/// Merges existing context + new facts into a single clean, self-contained
+/// description in one LLM call. Replaces the old `append_new_facts()` approach.
+pub fn build_context_compaction_prompt(
+    entity_name: &str,
+    entity_type: &str,
+    existing_context: &str,
+    new_info: &str,
+) -> String {
+    format!(
+        r#"You are maintaining a knowledge base entry for a {entity_type} named "{entity_name}".
+
+CURRENT DESCRIPTION:
+{existing_context}
+
+NEW INFORMATION:
+{new_info}
+
+YOUR TASK: Merge ALL facts from both sources into a single clean, self-contained description of "{entity_name}".
+
+RULES:
+1. PRESERVE every meaningful fact from both sources — do not drop details
+2. REMOVE redundant or repetitive statements
+3. If new information contradicts old information, prefer the newer information
+4. Write in a neutral, factual tone — like a concise encyclopedia entry
+5. The result must read as a polished summary, NOT an append log
+6. Keep it concise but complete (aim for 1-3 sentences)
+7. Do NOT add any preamble, explanation, or formatting — return ONLY the merged description text
+
+MERGED DESCRIPTION:"#,
+        entity_type = entity_type,
+        entity_name = entity_name,
+        existing_context = existing_context,
+        new_info = new_info
+    )
+}
+
 /// Build a prompt for evolving the world description based on a new transcript.
 ///
 /// This prompt asks the LLM to return ONLY the new information to add to the

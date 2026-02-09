@@ -1,3 +1,18 @@
+Scriba 0.15.2 — Context Compaction
+
+Highlights
+
+- **LLM-powered entity context compaction** (#35): Entity descriptions are now automatically compacted during enrichment. Instead of appending sentence fragments from each recording, Scriba merges existing context + new information into a clean, self-contained description via a single LLM call. Entity context always reads as a polished summary — not an append log.
+
+Changelog
+
+- feat(enrichment): replace `append_new_facts()` with LLM-powered `compact_entity_context()` during world delta application
+- feat(enrichment): new `build_context_compaction_prompt()` for single-call merge + summarize
+- feat(core): `apply_world_delta_to_entities()` is now async with LLM compaction and graceful fallback
+- refactor(core): remove `append_new_facts` import from workflow (no longer needed for entity updates)
+
+---
+
 Scriba 0.15.1 — Bug Fixes
 
 Fixes
