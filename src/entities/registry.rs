@@ -56,6 +56,11 @@ impl<'a> EntityRegistry<'a> {
         self.db.get_entity_by_name(name)
     }
 
+    /// Get an entity by canonical name or alias.
+    pub fn get_entity_by_name_or_alias(&self, name: &str) -> Result<Option<Entity>> {
+        self.db.get_entity_by_name_or_alias(name)
+    }
+
     /// List all entities, optionally filtered by type.
     pub fn list_entities(
         &self,
