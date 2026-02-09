@@ -25,6 +25,8 @@ Extract the following information and return it as a JSON object:
 6. "key_points": An array of key points or insights (3-5 items)
 7. "action_items": An array of action items or tasks mentioned (if any)
 
+IMPORTANT: If the same person or organization appears multiple times in the transcript (even with slight spelling variations), include them ONLY ONCE with combined context. Do NOT return duplicate entries.
+
 Return ONLY valid JSON, no additional text. If a field has no relevant content, use an empty array [] or empty string "".
 
 Example JSON structure (DO NOT copy these example values - extract from the actual transcript above):
@@ -299,9 +301,10 @@ Extract the following information and return it as a JSON object:
 
 ENTITY RESOLUTION RULES:
 - Transcripts often contain misspellings due to speech-to-text errors. "Exane", "Xane", "Hexane" could all be "Exein". Use the world context to resolve these.
-- If a name closely resembles a known person or organization from the world, resolve it.
+- If a name closely resembles a known person or organization from the world, resolve it. Check BOTH names AND aliases in the world context.
 - If a name is genuinely new (not in the world at all), set "resolved_to" to null.
 - When in doubt, resolve to the known entity rather than creating a new one.
+- DEDUPLICATION: If the same person or organization appears multiple times in the transcript (even with slight spelling variations), include them ONLY ONCE with combined context. Do NOT return duplicate entries.
 
 Return ONLY valid JSON, no additional text. If a field has no relevant content, use an empty array [] or empty string "".
 

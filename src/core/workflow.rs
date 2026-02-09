@@ -313,6 +313,14 @@ impl WorkflowManager {
             println!("  📊 Extracting metadata from transcript...");
         }
 
+        // Rebuild world from entities BEFORE extraction so LLM sees
+        // up-to-date aliases and merged entity state
+        if let Err(e) = rebuild_world_from_entities(&self.db_manager.db) {
+            if verbose {
+                eprintln!("  ⚠️ Failed to refresh world context: {}", e);
+            }
+        }
+
         // Load world context (Scriba's understanding of the owner)
         let world = WorldContext::load().unwrap_or_default();
         let world_content = if world.has_content() {
@@ -831,7 +839,7 @@ fn apply_world_delta_to_entities(db: &mut Database, delta: &WorldData) -> Result
 
     // Apply owner changes
     if !delta.owner.name.is_empty() {
-        if let Some(entity) = registry.get_entity_by_name(&delta.owner.name)? {
+        if let Some(entity) = registry.get_entity_by_name_or_alias(&delta.owner.name)? {
             let entity_id = entity.id.unwrap();
             for alias in &delta.owner.aliases {
                 registry.add_entity_alias(entity_id, alias)?;
@@ -844,7 +852,7 @@ fn apply_world_delta_to_entities(db: &mut Database, delta: &WorldData) -> Result
         if person.name.is_empty() {
             continue;
         }
-        match registry.get_entity_by_name(&person.name)? {
+        match registry.get_entity_by_name_or_alias(&person.name)? {
             Some(entity) => {
                 let entity_id = entity.id.unwrap();
                 if !person.relationship.is_empty() {
@@ -877,7 +885,7 @@ fn apply_world_delta_to_entities(db: &mut Database, delta: &WorldData) -> Result
         if org.name.is_empty() {
             continue;
         }
-        match registry.get_entity_by_name(&org.name)? {
+        match registry.get_entity_by_name_or_alias(&org.name)? {
             Some(entity) => {
                 let entity_id = entity.id.unwrap();
                 if !org.description.is_empty() {

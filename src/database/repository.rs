@@ -721,6 +721,31 @@ impl Database {
         }
     }
 
+    /// Get an entity by canonical name OR alias (case-insensitive).
+    ///
+    /// First checks canonical_name, then scans aliases JSON arrays.
+    /// This prevents recreating entities that were merged (where the old
+    /// name became an alias of the target entity).
+    pub fn get_entity_by_name_or_alias(&self, name: &str) -> Result<Option<Entity>> {
+        // First try canonical name (fast path)
+        if let Some(entity) = self.get_entity_by_name(name)? {
+            return Ok(Some(entity));
+        }
+
+        // Scan all entities for alias match
+        let name_lower = name.to_lowercase();
+        let all = self.list_entities(None, None)?;
+        for entity in all {
+            for alias in entity.aliases_list() {
+                if alias.to_lowercase() == name_lower {
+                    return Ok(Some(entity));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     /// List all entities, optionally filtered by type.
     pub fn list_entities(&self, entity_type: Option<&str>, limit: Option<i64>) -> Result<Vec<Entity>> {
         let sql = match (entity_type, limit) {
