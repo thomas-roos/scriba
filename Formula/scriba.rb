@@ -8,7 +8,7 @@ class Scriba < Formula
     sha256 "PLACEHOLDER"
   else
     url "https://github.com/giovannialberto/scriba/releases/download/v0.16.0/scriba-aarch64-apple-darwin"
-    sha256 "PLACEHOLDER"
+    sha256 "f9202f7674dd7d0d5318bb9ddd4de8619b71832dcba873b4ccf2d24f2237a397"
   end
 
   def install
