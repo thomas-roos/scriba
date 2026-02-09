@@ -19,6 +19,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 use super::config::{LocalModelSize, ScribaConfig, TranscriptionMode};
 use super::files::FileManager;
 use crate::database::Database;
+use crate::enrichment::{WorldContext, WorldData};
 use crate::utils::BASE_PATH;
 
 extern "C" {
@@ -339,6 +340,149 @@ async fn download_file_streaming(url: &str, dest: &Path, quiet: bool) -> Result<
     Ok(())
 }
 
+/// Approximate max characters for ~224 Whisper tokens.
+const WHISPER_PROMPT_CHAR_LIMIT: usize = 670;
+
+/// Filter aliases to only include genuine spelling variants, not LLM annotations.
+fn filter_aliases(aliases: &[String], canonical_name: &str) -> Vec<String> {
+    let canonical_lower = canonical_name.to_lowercase();
+    aliases
+        .iter()
+        .filter(|a| {
+            let lower = a.to_lowercase();
+            lower != canonical_lower && !a.contains('(') && a.len() <= 30
+        })
+        .cloned()
+        .collect()
+}
+
+/// Build a Whisper initial prompt from structured world data.
+///
+/// Returns a natural-language contextual string that primes Whisper's decoder
+/// with proper nouns, roles, and relationships for better transcription accuracy.
+fn build_prompt_from_world_data(data: &WorldData) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+
+    // 1) Owner — contextual sentence about who owns this instance
+    if !data.owner.name.is_empty() {
+        let name = &data.owner.name;
+        let aliases = filter_aliases(&data.owner.aliases, name);
+        let role = &data.owner.role;
+        let org = &data.owner.organization;
+
+        let mut sentence = if !role.is_empty() && !org.is_empty() {
+            format!("{} is the {} at {}", name, role, org)
+        } else if !role.is_empty() {
+            format!("{} is a {}", name, role)
+        } else if !org.is_empty() {
+            format!("{} works at {}", name, org)
+        } else {
+            format!("{} is the owner of this recording", name)
+        };
+
+        if !aliases.is_empty() {
+            sentence.push_str(&format!(", also known as {}", aliases.join(", ")));
+        }
+
+        sentence.push_str(". It is likely that he is involved in this conversation.");
+        parts.push(sentence);
+    }
+
+    // 2) People — natural sentence with roles/relationships
+    if !data.people.is_empty() {
+        let people_descriptions: Vec<String> = data
+            .people
+            .iter()
+            .map(|p| {
+                let aliases = filter_aliases(&p.aliases, &p.name);
+                let mut desc = p.name.clone();
+                if !aliases.is_empty() {
+                    desc.push_str(&format!(" ({})", aliases.join(", ")));
+                }
+                if !p.relationship.is_empty() && !p.relationship.starts_with('{') {
+                    desc.push_str(&format!(", {}", p.relationship));
+                }
+                desc
+            })
+            .collect();
+        parts.push(format!(
+            "Common people he interacts with: {}.",
+            people_descriptions.join("; ")
+        ));
+    }
+
+    // 3) Organizations — with descriptions
+    if !data.organizations.is_empty() {
+        let org_descriptions: Vec<String> = data
+            .organizations
+            .iter()
+            .map(|o| {
+                let aliases = filter_aliases(&o.aliases, &o.name);
+                let mut desc = o.name.clone();
+                if !aliases.is_empty() {
+                    desc.push_str(&format!(" ({})", aliases.join(", ")));
+                }
+                if !o.description.is_empty() && !o.description.starts_with('{') {
+                    desc.push_str(&format!(", {}", o.description));
+                }
+                desc
+            })
+            .collect();
+        parts.push(format!(
+            "Organizations: {}.",
+            org_descriptions.join("; ")
+        ));
+    }
+
+    // 4) Projects and interests — domain vocabulary
+    let mut topics: Vec<String> = Vec::new();
+    for p in &data.projects {
+        topics.push(p.name.clone());
+    }
+    for i in &data.interests {
+        topics.push(i.clone());
+    }
+    if !topics.is_empty() {
+        parts.push(format!("Topics often discussed: {}.", topics.join(", ")));
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    // Assemble with budget enforcement
+    let mut prompt = String::new();
+    for part in &parts {
+        let candidate = if prompt.is_empty() {
+            part.clone()
+        } else {
+            format!("{} {}", prompt, part)
+        };
+        if candidate.len() > WHISPER_PROMPT_CHAR_LIMIT {
+            break;
+        }
+        prompt = candidate;
+    }
+
+    // Strip null bytes (set_initial_prompt panics on them)
+    let prompt = prompt.replace('\0', "");
+
+    if prompt.is_empty() {
+        None
+    } else {
+        Some(prompt)
+    }
+}
+
+/// Load world context and build a Whisper initial prompt.
+///
+/// Returns `None` if no world context exists or it cannot be parsed.
+fn build_whisper_world_prompt() -> Option<String> {
+    let world_ctx = WorldContext::load().ok()?;
+    let data = world_ctx.parsed()?;
+    build_prompt_from_world_data(&data)
+}
+
 fn run_whisper_transcription(model_path: &Path, wav_path: &Path) -> Result<String> {
     if !model_path.exists() {
         return Err(anyhow::anyhow!(
@@ -399,6 +543,10 @@ fn run_whisper_transcription(model_path: &Path, wav_path: &Path) -> Result<Strin
     params.set_print_timestamps(false);
     params.set_single_segment(false);
     params.set_n_threads(num_cpus::get() as i32);
+
+    if let Some(world_prompt) = build_whisper_world_prompt() {
+        params.set_initial_prompt(&world_prompt);
+    }
 
     state
         .full(params, &samples_f32)
@@ -591,4 +739,146 @@ pub async fn transcribe_audio(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::enrichment::world::{OrgInfo, OwnerInfo, PersonInfo, ProjectInfo};
+
+    #[test]
+    fn test_filter_aliases_removes_canonical_match() {
+        let aliases = vec!["giovanni".to_string()];
+        let result = filter_aliases(&aliases, "Giovanni");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_filter_aliases_removes_annotations_with_parens() {
+        let aliases = vec![
+            "Gio".to_string(),
+            "Giovanni (in the owner's world)".to_string(),
+        ];
+        let result = filter_aliases(&aliases, "Giovanni");
+        assert_eq!(result, vec!["Gio"]);
+    }
+
+    #[test]
+    fn test_filter_aliases_removes_long_aliases() {
+        let aliases = vec![
+            "Exane".to_string(),
+            "This is an extremely long alias that should be filtered out".to_string(),
+        ];
+        let result = filter_aliases(&aliases, "Exein");
+        assert_eq!(result, vec!["Exane"]);
+    }
+
+    #[test]
+    fn test_filter_aliases_keeps_genuine_variants() {
+        let aliases = vec!["Exane".to_string(), "Saci".to_string()];
+        let result = filter_aliases(&aliases, "Exein");
+        assert_eq!(result, vec!["Exane", "Saci"]);
+    }
+
+    #[test]
+    fn test_build_prompt_empty_world() {
+        let data = WorldData::default();
+        assert!(build_prompt_from_world_data(&data).is_none());
+    }
+
+    #[test]
+    fn test_build_prompt_owner_only() {
+        let data = WorldData {
+            owner: OwnerInfo {
+                name: "Giovanni".to_string(),
+                aliases: vec!["Gio".to_string()],
+                role: "CTO".to_string(),
+                organization: "Exein".to_string(),
+                location: String::new(),
+            },
+            ..Default::default()
+        };
+        let prompt = build_prompt_from_world_data(&data).unwrap();
+        assert!(prompt.contains("Giovanni is the CTO at Exein"));
+        assert!(prompt.contains("also known as Gio"));
+        assert!(prompt.contains("likely that he is involved"));
+    }
+
+    #[test]
+    fn test_build_prompt_full_world() {
+        let data = WorldData {
+            owner: OwnerInfo {
+                name: "Giovanni".to_string(),
+                aliases: vec![],
+                role: "CTO".to_string(),
+                organization: "Exein".to_string(),
+                location: String::new(),
+            },
+            people: vec![
+                PersonInfo {
+                    name: "Gerardo".to_string(),
+                    relationship: "CFO of Exein".to_string(),
+                    aliases: vec!["Gerardo Gagliardo".to_string()],
+                },
+                PersonInfo {
+                    name: "Steve".to_string(),
+                    relationship: String::new(),
+                    aliases: vec![],
+                },
+            ],
+            organizations: vec![OrgInfo {
+                name: "Exein".to_string(),
+                description: "cybersecurity company".to_string(),
+                aliases: vec!["Exane".to_string()],
+            }],
+            projects: vec![ProjectInfo {
+                name: "ASPISEC".to_string(),
+                description: String::new(),
+            }],
+            interests: vec!["cybersecurity".to_string()],
+            beliefs: vec![],
+        };
+        let prompt = build_prompt_from_world_data(&data).unwrap();
+        assert!(prompt.contains("Giovanni is the CTO at Exein"));
+        assert!(prompt.contains("Common people he interacts with"));
+        assert!(prompt.contains("Gerardo (Gerardo Gagliardo), CFO of Exein"));
+        assert!(prompt.contains("Steve"));
+        assert!(prompt.contains("Exein (Exane), cybersecurity company"));
+        assert!(prompt.contains("ASPISEC"));
+        assert!(prompt.contains("cybersecurity"));
+    }
+
+    #[test]
+    fn test_build_prompt_respects_char_limit() {
+        let data = WorldData {
+            owner: OwnerInfo {
+                name: "Owner".to_string(),
+                ..Default::default()
+            },
+            people: (0..200)
+                .map(|i| PersonInfo {
+                    name: format!("Person{}", i),
+                    relationship: String::new(),
+                    aliases: vec![],
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let prompt = build_prompt_from_world_data(&data).unwrap();
+        assert!(prompt.len() <= WHISPER_PROMPT_CHAR_LIMIT);
+    }
+
+    #[test]
+    fn test_build_prompt_strips_null_bytes() {
+        let data = WorldData {
+            owner: OwnerInfo {
+                name: "Test\0Name".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let prompt = build_prompt_from_world_data(&data).unwrap();
+        assert!(!prompt.contains('\0'));
+        assert!(prompt.contains("TestName"));
+    }
 }

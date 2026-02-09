@@ -856,9 +856,18 @@ async fn apply_world_delta_to_entities(
         }
     }
 
+    // Generic placeholder names that should never become entities
+    let blocked_names: &[&str] = &[
+        "speaker", "speakers", "narrator", "author", "autore",
+        "owner", "user", "host", "interviewer", "interviewee",
+        "participant", "moderator", "presenter", "listener",
+        "the speaker", "the owner", "the author", "the narrator",
+        "you", "me", "i", "we", "they",
+    ];
+
     // Apply people changes
     for person in &delta.people {
-        if person.name.is_empty() {
+        if person.name.is_empty() || blocked_names.contains(&person.name.to_lowercase().as_str()) {
             continue;
         }
         match registry.get_entity_by_name_or_alias(&person.name)? {
@@ -949,6 +958,18 @@ async fn compact_or_append(
     verbose: bool,
 ) -> String {
     if existing_context.is_empty() {
+        return new_info.to_string();
+    }
+
+    // Skip compaction if the new info adds nothing beyond what's already known
+    if existing_context.trim() == new_info.trim()
+        || existing_context.to_lowercase().contains(&new_info.to_lowercase())
+    {
+        return existing_context.to_string();
+    }
+
+    // If the new info is a superset of existing, just use it directly
+    if new_info.to_lowercase().contains(&existing_context.to_lowercase()) {
         return new_info.to_string();
     }
 

@@ -32,6 +32,21 @@ impl EntityLinker {
         Self
     }
 
+    /// Names that should never become entities — generic placeholders the LLM
+    /// sometimes returns despite being told not to.
+    const BLOCKED_NAMES: &'static [&'static str] = &[
+        "speaker", "speakers", "narrator", "author", "autore",
+        "owner", "user", "host", "interviewer", "interviewee",
+        "participant", "moderator", "presenter", "listener",
+        "the speaker", "the owner", "the author", "the narrator",
+        "you", "me", "i", "we", "they",
+    ];
+
+    fn is_blocked_name(name: &str) -> bool {
+        let lower = name.to_lowercase();
+        Self::BLOCKED_NAMES.iter().any(|b| lower == *b)
+    }
+
     /// Deduplicate extracted entities by canonical name.
     ///
     /// If the LLM returns "Steve" twice with different contexts,
@@ -40,6 +55,15 @@ impl EntityLinker {
         let mut seen: HashMap<String, DeduplicatedEntity> = HashMap::new();
 
         for (entity, entity_type) in extraction.all_entities() {
+            // Skip generic placeholder names
+            let canonical_name_raw = entity
+                .resolved_to
+                .as_deref()
+                .unwrap_or(&entity.name);
+            if Self::is_blocked_name(canonical_name_raw) || Self::is_blocked_name(&entity.name) {
+                continue;
+            }
+
             let canonical = entity
                 .resolved_to
                 .as_deref()
