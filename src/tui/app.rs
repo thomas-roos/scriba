@@ -66,6 +66,10 @@ pub struct Dashboard {
     settings_selection: usize,             // Current setting selection
     editing_api_key: bool,                 // Whether we're editing API key
     api_key_input: String,                 // API key input buffer
+    editing_ollama_model: bool,            // Whether we're editing Ollama model
+    ollama_model_input: String,            // Ollama model input buffer
+    editing_ollama_endpoint: bool,         // Whether we're editing Ollama endpoint
+    ollama_endpoint_input: String,         // Ollama endpoint input buffer
     return_to_view: Option<DashboardView>, // View to return to after message dismissal
     // File import dialog state
     show_file_dialog: bool,
@@ -350,6 +354,10 @@ impl Dashboard {
             settings_selection: 0,
             editing_api_key: false,
             api_key_input: String::new(),
+            editing_ollama_model: false,
+            ollama_model_input: String::new(),
+            editing_ollama_endpoint: false,
+            ollama_endpoint_input: String::new(),
             return_to_view: None,
             // File import dialog state
             show_file_dialog: false,
@@ -1868,40 +1876,40 @@ impl Dashboard {
         }
     }
 
+    fn is_editing_settings_field(&self) -> bool {
+        self.editing_api_key || self.editing_ollama_model || self.editing_ollama_endpoint
+    }
+
+    fn save_enrichment_config(&mut self) -> Result<()> {
+        self.config.save()?;
+        self.config = ScribaConfig::load()?;
+        Ok(())
+    }
+
     async fn handle_settings_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
+        // Max settings index: 0=Mode, 1=ModeSpecific, 2=OllamaModel, 3=OllamaEndpoint
+        let max_index = 3;
+
         match key_code {
             KeyCode::Esc => {
-                self.current_view = DashboardView::Main;
-                self.editing_api_key = false;
+                if self.is_editing_settings_field() {
+                    self.editing_api_key = false;
+                    self.editing_ollama_model = false;
+                    self.editing_ollama_endpoint = false;
+                } else {
+                    self.current_view = DashboardView::Main;
+                }
                 Ok(DashboardAction::Continue)
             }
             KeyCode::Up => {
-                if !self.editing_api_key {
-                    match &self.config.transcription {
-                        TranscriptionMode::Local { .. } => {
-                            // Local mode: 0=Mode, 1=ModelSize
-                            self.settings_selection = self.settings_selection.saturating_sub(1);
-                        }
-                        TranscriptionMode::Api { .. } => {
-                            // API mode: 0=Mode, 1=APIKey
-                            self.settings_selection = self.settings_selection.saturating_sub(1);
-                        }
-                    }
+                if !self.is_editing_settings_field() {
+                    self.settings_selection = self.settings_selection.saturating_sub(1);
                 }
                 Ok(DashboardAction::Continue)
             }
             KeyCode::Down => {
-                if !self.editing_api_key {
-                    match &self.config.transcription {
-                        TranscriptionMode::Local { .. } => {
-                            // Local mode: 0=Mode, 1=ModelSize (max index 1)
-                            self.settings_selection = std::cmp::min(self.settings_selection + 1, 1);
-                        }
-                        TranscriptionMode::Api { .. } => {
-                            // API mode: 0=Mode, 1=APIKey (max index 1)
-                            self.settings_selection = std::cmp::min(self.settings_selection + 1, 1);
-                        }
-                    }
+                if !self.is_editing_settings_field() {
+                    self.settings_selection = std::cmp::min(self.settings_selection + 1, max_index);
                 }
                 Ok(DashboardAction::Continue)
             }
@@ -1913,25 +1921,46 @@ impl Dashboard {
                     };
                     match self.config.set_transcription_mode(new_mode) {
                         Ok(()) => {
-                            self.config = ScribaConfig::load()?; // Reload config
-                                                                 // Stay in settings, no success message
+                            self.config = ScribaConfig::load()?;
                         }
                         Err(e) => {
-                            // Show error message only for actual errors
-                            self.message = format!("❌ Failed to save API key: {}", e);
+                            self.message = format!("Failed to save API key: {}", e);
                             self.show_message = true;
                             self.return_to_view = Some(DashboardView::Settings);
                         }
                     }
                     self.editing_api_key = false;
                     self.api_key_input.clear();
+                } else if self.editing_ollama_model {
+                    let new_model = self.ollama_model_input.trim().to_string();
+                    if !new_model.is_empty() {
+                        self.config.enrichment.ollama_model = new_model;
+                        if let Err(e) = self.save_enrichment_config() {
+                            self.message = format!("Failed to save Ollama model: {}", e);
+                            self.show_message = true;
+                            self.return_to_view = Some(DashboardView::Settings);
+                        }
+                    }
+                    self.editing_ollama_model = false;
+                    self.ollama_model_input.clear();
+                } else if self.editing_ollama_endpoint {
+                    let new_endpoint = self.ollama_endpoint_input.trim().to_string();
+                    if !new_endpoint.is_empty() {
+                        self.config.enrichment.ollama_endpoint = new_endpoint;
+                        if let Err(e) = self.save_enrichment_config() {
+                            self.message = format!("Failed to save Ollama endpoint: {}", e);
+                            self.show_message = true;
+                            self.return_to_view = Some(DashboardView::Settings);
+                        }
+                    }
+                    self.editing_ollama_endpoint = false;
+                    self.ollama_endpoint_input.clear();
                 } else {
                     match self.settings_selection {
                         0 => {
                             // Toggle transcription mode
                             let new_mode = match &self.config.transcription {
                                 TranscriptionMode::Local { .. } => {
-                                    // Use preserved API key if available, otherwise empty
                                     let api_key = self
                                         .config
                                         .last_api_key
@@ -1947,13 +1976,10 @@ impl Dashboard {
                             match self.config.set_transcription_mode(new_mode) {
                                 Ok(()) => {
                                     self.config = ScribaConfig::load()?;
-                                    // Reset selection to mode (index 0) when changing modes
                                     self.settings_selection = 0;
-                                    // Stay in settings, no success message
                                 }
                                 Err(e) => {
-                                    // Show error message only for actual errors
-                                    self.message = format!("❌ Failed to change mode: {}", e);
+                                    self.message = format!("Failed to change mode: {}", e);
                                     self.show_message = true;
                                     self.return_to_view = Some(DashboardView::Settings);
                                 }
@@ -1962,7 +1988,6 @@ impl Dashboard {
                         1 => {
                             match &self.config.transcription {
                                 TranscriptionMode::Local { model_size } => {
-                                    // In local mode: index 1 = Model Size
                                     let new_model = match model_size {
                                         LocalModelSize::Tiny => LocalModelSize::Base,
                                         LocalModelSize::Base => LocalModelSize::Small,
@@ -1977,19 +2002,16 @@ impl Dashboard {
                                     match self.config.set_transcription_mode(new_mode) {
                                         Ok(()) => {
                                             self.config = ScribaConfig::load()?;
-                                            // Stay in settings, no success message
                                         }
                                         Err(e) => {
-                                            // Show error message only for actual errors
                                             self.message =
-                                                format!("❌ Failed to change model: {}", e);
+                                                format!("Failed to change model: {}", e);
                                             self.show_message = true;
                                             self.return_to_view = Some(DashboardView::Settings);
                                         }
                                     }
                                 }
                                 TranscriptionMode::Api { .. } => {
-                                    // In API mode: index 1 = API Key
                                     self.editing_api_key = true;
                                     self.api_key_input = match &self.config.transcription {
                                         TranscriptionMode::Api { api_key } => api_key.clone(),
@@ -1997,6 +2019,16 @@ impl Dashboard {
                                     };
                                 }
                             }
+                        }
+                        2 => {
+                            // Ollama Model
+                            self.editing_ollama_model = true;
+                            self.ollama_model_input = self.config.enrichment.ollama_model.clone();
+                        }
+                        3 => {
+                            // Ollama Endpoint
+                            self.editing_ollama_endpoint = true;
+                            self.ollama_endpoint_input = self.config.enrichment.ollama_endpoint.clone();
                         }
                         _ => {}
                     }
@@ -2006,12 +2038,20 @@ impl Dashboard {
             KeyCode::Char(c) => {
                 if self.editing_api_key {
                     self.api_key_input.push(c);
+                } else if self.editing_ollama_model {
+                    self.ollama_model_input.push(c);
+                } else if self.editing_ollama_endpoint {
+                    self.ollama_endpoint_input.push(c);
                 }
                 Ok(DashboardAction::Continue)
             }
             KeyCode::Backspace => {
                 if self.editing_api_key {
                     self.api_key_input.pop();
+                } else if self.editing_ollama_model {
+                    self.ollama_model_input.pop();
+                } else if self.editing_ollama_endpoint {
+                    self.ollama_endpoint_input.pop();
                 }
                 Ok(DashboardAction::Continue)
             }
@@ -2890,34 +2930,68 @@ impl Dashboard {
             }
         }
 
-        // Audio settings preview
+        // Ollama settings section
         settings_text.push(Line::from(""));
         settings_text.push(Line::from(vec![Span::styled(
-            "Audio Settings:",
-            Style::default().fg(Color::Green),
+            "ENRICHMENT (Ollama)",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )]));
-        settings_text.push(Line::from(vec![Span::styled(
+
+        // Ollama Model (index 2)
+        let ollama_model_display = if self.editing_ollama_model {
+            format!("{}_", self.ollama_model_input)
+        } else {
             format!(
-                "  Sample Rate: {} Hz",
-                self.config.audio_settings.sample_rate
-            ),
-            Style::default().fg(Color::Gray),
-        )]));
-        settings_text.push(Line::from(vec![Span::styled(
-            format!("  Bitrate: {} kbps", self.config.audio_settings.bitrate),
-            Style::default().fg(Color::Gray),
-        )]));
-        settings_text.push(Line::from(vec![Span::styled(
-            format!("  Channels: {}", self.config.audio_settings.channels),
-            Style::default().fg(Color::Gray),
-        )]));
-        settings_text.push(Line::from(vec![Span::styled(
+                "{} <- Press Enter to edit",
+                self.config.enrichment.ollama_model
+            )
+        };
+        let ollama_model_style = if self.settings_selection == 2 {
+            if self.editing_ollama_model {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            }
+        } else {
+            Style::default().fg(Color::White)
+        };
+        settings_text.push(Line::from(vec![
+            Span::styled("Ollama Model: ", Style::default().fg(Color::Green)),
+            Span::styled(ollama_model_display, ollama_model_style),
+        ]));
+
+        // Ollama Endpoint (index 3)
+        let ollama_endpoint_display = if self.editing_ollama_endpoint {
+            format!("{}_", self.ollama_endpoint_input)
+        } else {
             format!(
-                "  Speech Optimized: {}",
-                self.config.audio_settings.speech_optimized
-            ),
-            Style::default().fg(Color::Gray),
-        )]));
+                "{} <- Press Enter to edit",
+                self.config.enrichment.ollama_endpoint
+            )
+        };
+        let ollama_endpoint_style = if self.settings_selection == 3 {
+            if self.editing_ollama_endpoint {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            }
+        } else {
+            Style::default().fg(Color::White)
+        };
+        settings_text.push(Line::from(vec![
+            Span::styled("Ollama Server: ", Style::default().fg(Color::Green)),
+            Span::styled(ollama_endpoint_display, ollama_endpoint_style),
+        ]));
 
         settings_text.push(Line::from(""));
         settings_text.push(Line::from(vec![Span::styled(
