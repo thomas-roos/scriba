@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use std::time::Duration;
+
 use super::audio::CompressionSettings;
 use super::config::TranscriptionMode;
 
@@ -23,6 +25,7 @@ pub enum RecordingMode {
     Tui {
         stop_rx: tokio::sync::mpsc::Receiver<()>,
         level_tx: tokio::sync::mpsc::Sender<f32>,
+        silence_timeout: Option<Duration>,
     },
 }
 
