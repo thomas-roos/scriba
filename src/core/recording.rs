@@ -18,7 +18,8 @@ use crate::utils::BASE_PATH;
 use chrono::Utc;
 
 /// RMS level below which we consider the mic dead (near-zero signal).
-const SILENCE_THRESHOLD: f32 = 0.001;
+/// Typical closed-lid / muted mic noise floor sits around 0.002-0.004.
+const SILENCE_THRESHOLD: f32 = 0.005;
 
 /// Monitors audio input levels for real-time feedback during recording.
 pub struct AudioLevelMonitor {
