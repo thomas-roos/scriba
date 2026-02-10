@@ -3,9 +3,9 @@
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::signal;
 use tokio::sync::mpsc;
 
@@ -189,6 +189,7 @@ fn record_core(
     verbose: bool,
     silence_timeout: Option<Duration>,
     silence_flag: Arc<AtomicBool>,
+    last_callback_ms: Arc<AtomicU64>,
     wait_stop: Box<dyn FnOnce()>,
 ) -> Result<RecordingResult, anyhow::Error> {
     let host = cpal::default_host();
@@ -234,6 +235,7 @@ fn record_core(
     let encoder_2 = encoder.clone();
     let level_monitor_2 = level_monitor.clone();
     let silence_flag_2 = silence_flag.clone();
+    let lcb = last_callback_ms.clone();
 
     let err_fn = move |err| {
         eprintln!("an error occurred on stream: {}", err);
@@ -243,10 +245,11 @@ fn record_core(
         cpal::SampleFormat::I8 => {
             let sf = silence_flag_2.clone();
             let st = silence_timeout;
+            let cb = lcb.clone();
             device.build_input_stream(
                 &config.clone().into(),
                 move |data: &[i8], _: &_| {
-                    write_input_data_i8(data, &encoder_2, &level_monitor_2, level_tx_opt.as_ref(), &sf, st)
+                    write_input_data_i8(data, &encoder_2, &level_monitor_2, level_tx_opt.as_ref(), &sf, st, &cb)
                 },
                 err_fn,
                 None,
@@ -255,10 +258,11 @@ fn record_core(
         cpal::SampleFormat::I16 => {
             let sf = silence_flag_2.clone();
             let st = silence_timeout;
+            let cb = lcb.clone();
             device.build_input_stream(
                 &config.clone().into(),
                 move |data: &[i16], _: &_| {
-                    write_input_data_i16(data, &encoder_2, &level_monitor_2, level_tx_opt.as_ref(), &sf, st)
+                    write_input_data_i16(data, &encoder_2, &level_monitor_2, level_tx_opt.as_ref(), &sf, st, &cb)
                 },
                 err_fn,
                 None,
@@ -267,10 +271,11 @@ fn record_core(
         cpal::SampleFormat::I32 => {
             let sf = silence_flag_2.clone();
             let st = silence_timeout;
+            let cb = lcb.clone();
             device.build_input_stream(
                 &config.clone().into(),
                 move |data: &[i32], _: &_| {
-                    write_input_data_i32(data, &encoder_2, &level_monitor_2, level_tx_opt.as_ref(), &sf, st)
+                    write_input_data_i32(data, &encoder_2, &level_monitor_2, level_tx_opt.as_ref(), &sf, st, &cb)
                 },
                 err_fn,
                 None,
@@ -279,10 +284,11 @@ fn record_core(
         cpal::SampleFormat::F32 => {
             let sf = silence_flag_2.clone();
             let st = silence_timeout;
+            let cb = lcb.clone();
             device.build_input_stream(
                 &config.clone().into(),
                 move |data: &[f32], _: &_| {
-                    write_input_data_f32(data, &encoder_2, &level_monitor_2, level_tx_opt.as_ref(), &sf, st)
+                    write_input_data_f32(data, &encoder_2, &level_monitor_2, level_tx_opt.as_ref(), &sf, st, &cb)
                 },
                 err_fn,
                 None,
@@ -349,9 +355,17 @@ pub async fn record_audio(output_path: PathBuf, options: RecordOptions) -> Resul
     let silence_flag = Arc::new(AtomicBool::new(false));
     let silence_timeout = options.silence_timeout;
 
+    // Timestamp of last audio callback — used to detect stale device (lid close)
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let last_callback_ms = Arc::new(AtomicU64::new(now_ms));
+
     let wait_strategy: Box<dyn FnOnce()> = match options.stop_rx {
         Some(mut rx) => {
             let sf = silence_flag.clone();
+            let lcb = last_callback_ms.clone();
             Box::new(move || {
                 let (tx, rx_done) = std::sync::mpsc::channel();
                 let tx2 = tx.clone();
@@ -360,10 +374,23 @@ pub async fn record_audio(output_path: PathBuf, options: RecordOptions) -> Resul
                     let _ = rx.blocking_recv();
                     let _ = tx.send(());
                 });
-                // Thread 2: silence flag poll
-                if silence_timeout.is_some() {
+                // Thread 2: silence + stale callback poll
+                if let Some(timeout) = silence_timeout {
+                    let timeout_ms = timeout.as_millis() as u64;
                     std::thread::spawn(move || loop {
+                        // Check silence flag (mic active but quiet)
                         if sf.load(Ordering::Relaxed) {
+                            let _ = tx2.send(());
+                            return;
+                        }
+                        // Check stale callback (device suspended, e.g. lid close)
+                        let last = lcb.load(Ordering::Relaxed);
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        if now.saturating_sub(last) >= timeout_ms {
+                            sf.store(true, Ordering::Relaxed);
                             let _ = tx2.send(());
                             return;
                         }
@@ -376,6 +403,7 @@ pub async fn record_audio(output_path: PathBuf, options: RecordOptions) -> Resul
         None => {
             let handle = tokio::runtime::Handle::current();
             let sf = silence_flag.clone();
+            let lcb = last_callback_ms.clone();
             Box::new(move || {
                 let (tx, rx) = std::sync::mpsc::channel();
                 let tx2 = tx.clone();
@@ -385,10 +413,21 @@ pub async fn record_audio(output_path: PathBuf, options: RecordOptions) -> Resul
                     let _ = handle_clone.block_on(signal::ctrl_c());
                     let _ = tx.send(());
                 });
-                // Thread 2: silence flag poll
-                if silence_timeout.is_some() {
+                // Thread 2: silence + stale callback poll
+                if let Some(timeout) = silence_timeout {
+                    let timeout_ms = timeout.as_millis() as u64;
                     std::thread::spawn(move || loop {
                         if sf.load(Ordering::Relaxed) {
+                            let _ = tx2.send(());
+                            return;
+                        }
+                        let last = lcb.load(Ordering::Relaxed);
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        if now.saturating_sub(last) >= timeout_ms {
+                            sf.store(true, Ordering::Relaxed);
                             let _ = tx2.send(());
                             return;
                         }
@@ -407,6 +446,7 @@ pub async fn record_audio(output_path: PathBuf, options: RecordOptions) -> Resul
         options.verbose,
         silence_timeout,
         silence_flag,
+        last_callback_ms,
         wait_strategy,
     )
 }
@@ -419,7 +459,15 @@ fn write_input_data_f32(
     level_tx: Option<&mpsc::Sender<f32>>,
     silence_flag: &Arc<AtomicBool>,
     silence_timeout: Option<Duration>,
+    last_callback_ms: &Arc<AtomicU64>,
 ) {
+    // Update last callback timestamp for stale-callback detection (lid close)
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    last_callback_ms.store(now_ms, Ordering::Relaxed);
+
     if let Ok(mut monitor) = level_monitor.try_lock() {
         if let Some(level) = monitor.update_level(input) {
             if let Some(tx) = level_tx {
@@ -448,9 +496,10 @@ fn write_input_data_i16(
     level_tx: Option<&mpsc::Sender<f32>>,
     silence_flag: &Arc<AtomicBool>,
     silence_timeout: Option<Duration>,
+    last_callback_ms: &Arc<AtomicU64>,
 ) {
     let f32_samples: Vec<f32> = input.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-    write_input_data_f32(&f32_samples, encoder, level_monitor, level_tx, silence_flag, silence_timeout);
+    write_input_data_f32(&f32_samples, encoder, level_monitor, level_tx, silence_flag, silence_timeout, last_callback_ms);
 }
 
 fn write_input_data_i32(
@@ -460,9 +509,10 @@ fn write_input_data_i32(
     level_tx: Option<&mpsc::Sender<f32>>,
     silence_flag: &Arc<AtomicBool>,
     silence_timeout: Option<Duration>,
+    last_callback_ms: &Arc<AtomicU64>,
 ) {
     let f32_samples: Vec<f32> = input.iter().map(|&s| s as f32 / i32::MAX as f32).collect();
-    write_input_data_f32(&f32_samples, encoder, level_monitor, level_tx, silence_flag, silence_timeout);
+    write_input_data_f32(&f32_samples, encoder, level_monitor, level_tx, silence_flag, silence_timeout, last_callback_ms);
 }
 
 fn write_input_data_i8(
@@ -472,7 +522,8 @@ fn write_input_data_i8(
     level_tx: Option<&mpsc::Sender<f32>>,
     silence_flag: &Arc<AtomicBool>,
     silence_timeout: Option<Duration>,
+    last_callback_ms: &Arc<AtomicU64>,
 ) {
     let f32_samples: Vec<f32> = input.iter().map(|&s| s as f32 / i8::MAX as f32).collect();
-    write_input_data_f32(&f32_samples, encoder, level_monitor, level_tx, silence_flag, silence_timeout);
+    write_input_data_f32(&f32_samples, encoder, level_monitor, level_tx, silence_flag, silence_timeout, last_callback_ms);
 }
