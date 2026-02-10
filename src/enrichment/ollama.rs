@@ -64,6 +64,38 @@ struct ModelInfo {
     name: String,
 }
 
+/// Structured diagnosis of Ollama readiness.
+#[derive(Debug)]
+pub enum OllamaStatus {
+    /// Ollama is running and the model is available.
+    Ready,
+    /// The `ollama` binary was not found in PATH.
+    NotInstalled,
+    /// Ollama binary exists but the server is not responding.
+    NotRunning { endpoint: String },
+    /// Server is running but the configured model is not pulled.
+    ModelMissing { model: String },
+}
+
+impl OllamaStatus {
+    /// Return a user-facing hint describing how to fix the issue.
+    pub fn hint(&self) -> Option<String> {
+        match self {
+            OllamaStatus::Ready => None,
+            OllamaStatus::NotInstalled => Some(
+                "I need Ollama to think!\n\nInstall it with:\n  brew install ollama".to_string(),
+            ),
+            OllamaStatus::NotRunning { .. } => Some(
+                "Ollama is installed but sleeping.\n\nStart it with:\n  ollama serve".to_string(),
+            ),
+            OllamaStatus::ModelMissing { model } => Some(format!(
+                "Almost there! Pull the model:\n  ollama pull {}",
+                model
+            )),
+        }
+    }
+}
+
 /// Client for interacting with the Ollama API.
 #[derive(Clone)]
 pub struct OllamaClient {
@@ -127,6 +159,53 @@ impl OllamaClient {
         }
 
         Ok(())
+    }
+
+    /// Diagnose Ollama readiness with actionable status.
+    pub async fn diagnose(&self) -> OllamaStatus {
+        // Check if ollama binary is in PATH
+        let binary_found = std::process::Command::new("which")
+            .arg("ollama")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if !binary_found {
+            return OllamaStatus::NotInstalled;
+        }
+
+        // Check if server is responding
+        let tags_url = format!("{}/api/tags", self.endpoint);
+        let response = match self
+            .client
+            .get(&tags_url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            _ => {
+                return OllamaStatus::NotRunning {
+                    endpoint: self.endpoint.clone(),
+                };
+            }
+        };
+
+        // Check if model is available
+        if let Ok(tags) = response.json::<TagsResponse>().await {
+            let model_base = self.model.split(':').next().unwrap_or(&self.model);
+            let model_available = tags.models.iter().any(|m| {
+                let name_base = m.name.split(':').next().unwrap_or(&m.name);
+                name_base == model_base || m.name == self.model
+            });
+            if !model_available {
+                return OllamaStatus::ModelMissing {
+                    model: self.model.clone(),
+                };
+            }
+        }
+
+        OllamaStatus::Ready
     }
 
     /// Generate a response from the LLM.

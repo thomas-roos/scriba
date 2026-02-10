@@ -92,7 +92,7 @@ impl Default for EnrichmentConfig {
         Self {
             enabled: true,
             ollama_endpoint: "http://localhost:11434".to_string(),
-            ollama_model: "llama3.2".to_string(),
+            ollama_model: "mistral:latest".to_string(),
             auto_link_threshold: 0.8,
             evolve_world: true,
         }

@@ -3,7 +3,7 @@ use crate::core::{
     WorkflowManager, record_audio, rebuild_world_from_entities, initialize_world_from_seed,
 };
 use crate::database::{Database, Entity, Recording, RecordingStats};
-use crate::enrichment::{WorldContext, WorldData, WorldEntityExtractionResult};
+use crate::enrichment::{OllamaClient, WorldContext, WorldData, WorldEntityExtractionResult};
 use crate::entities::EntityRegistry;
 use crate::utils::generate_recording_name;
 use anyhow::Result;
@@ -144,7 +144,8 @@ struct OnboardingState {
     user_role: String,
     user_aliases: String,
     // Processing
-    processing_task: Option<tokio::task::JoinHandle<Result<Option<(WorldData, WorldEntityExtractionResult)>, anyhow::Error>>>,
+    /// Returns (world_result, ollama_hint). Hint is set when Ollama is unavailable.
+    processing_task: Option<tokio::task::JoinHandle<Result<(Option<(WorldData, WorldEntityExtractionResult)>, Option<String>), anyhow::Error>>>,
     processed_world: Option<WorldData>,
     processed_entities: Option<WorldEntityExtractionResult>,
     ollama_available: bool,
@@ -573,7 +574,7 @@ impl Dashboard {
                             if task.is_finished() {
                                 let completed = ob.processing_task.take().unwrap();
                                 match completed.await {
-                                    Ok(Ok(Some((world_data, entities)))) => {
+                                    Ok(Ok((Some((world_data, entities)), _))) => {
                                         // Fill confirmation data
                                         ob.confirm_owner = world_data.owner.name.clone();
                                         ob.confirm_role = world_data.owner.role.clone();
@@ -601,14 +602,23 @@ impl Dashboard {
                                         );
                                         ob.set_step_text(&text);
                                     }
-                                    Ok(Ok(None)) => {
-                                        // Ollama not available
+                                    Ok(Ok((None, hint))) => {
+                                        // Ollama not available — show actionable hint
                                         ob.ollama_available = false;
-                                        ob.set_step_text(
+                                        let msg = if let Some(hint) = hint {
+                                            format!(
+                                                "Hm, I can't think right now.\n\n\
+                                                 {}\n\n\
+                                                 No worries -- I saved your info as-is.\n\
+                                                 Fix that, restart scriba, and I'll be much smarter!",
+                                                hint
+                                            )
+                                        } else {
                                             "Hm, my brain (Ollama) seems to be sleeping.\n\n\
                                              No worries -- I saved your info as-is.\n\
-                                             Set up Ollama later and I'll get much smarter!"
-                                        );
+                                             Set up Ollama later and I'll get much smarter!".to_string()
+                                        };
+                                        ob.set_step_text(&msg);
                                     }
                                     Ok(Err(_)) | Err(_) => {
                                         ob.ollama_available = false;
@@ -4616,7 +4626,18 @@ impl Dashboard {
 
         ob.processing_task = Some(tokio::spawn(async move {
             let mut db = Database::new()?;
-            initialize_world_from_seed(&mut db, &config, &seed).await
+            let result = initialize_world_from_seed(&mut db, &config, &seed).await?;
+            if result.is_some() {
+                Ok((result, None))
+            } else {
+                // Ollama unavailable — diagnose why
+                let client = OllamaClient::new(
+                    &config.enrichment.ollama_endpoint,
+                    &config.enrichment.ollama_model,
+                );
+                let hint = client.diagnose().await.hint();
+                Ok((None, hint))
+            }
         }));
     }
 

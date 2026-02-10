@@ -168,10 +168,50 @@ impl Database {
                 let schema = include_str!("../../schema.sql");
                 tx.execute_batch(schema)
                     .context("Failed to initialize database schema")?;
-                tx.execute("PRAGMA user_version = 1", [])
+                tx.execute("PRAGMA user_version = 2", [])
                     .context("Failed to set user_version")?;
                 tx.commit()
                     .context("Failed to commit schema initialization")?;
+            } else if user_version == 1 {
+                // Migration v1 → v2: add entity tables for existing users
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS entities (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        entity_type TEXT NOT NULL,
+                        canonical_name TEXT NOT NULL,
+                        aliases TEXT,
+                        context TEXT,
+                        metadata TEXT,
+                        mention_count INTEGER DEFAULT 1,
+                        first_seen_at DATETIME,
+                        last_seen_at DATETIME,
+                        created_at DATETIME NOT NULL,
+                        updated_at DATETIME NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS entity_mentions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        entity_id INTEGER,
+                        recording_id INTEGER NOT NULL,
+                        mention_text TEXT NOT NULL,
+                        context_snippet TEXT,
+                        confidence REAL DEFAULT 1.0,
+                        linked_at DATETIME,
+                        created_at DATETIME NOT NULL,
+                        FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE SET NULL,
+                        FOREIGN KEY (recording_id) REFERENCES recordings(id) ON DELETE CASCADE
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type);
+                    CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(canonical_name);
+                    CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity ON entity_mentions(entity_id);
+                    CREATE INDEX IF NOT EXISTS idx_entity_mentions_recording ON entity_mentions(recording_id);",
+                )
+                .context("Failed to migrate database to v2 (entity tables)")?;
+                tx.execute("PRAGMA user_version = 2", [])
+                    .context("Failed to set user_version")?;
+                tx.commit()
+                    .context("Failed to commit v2 migration")?;
             } else {
                 tx.commit().ok();
             }
