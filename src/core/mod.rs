@@ -17,9 +17,9 @@ pub mod workflow;
 
 // Re-export commonly used types for convenience
 pub use audio::{AudioEncoder, AudioFormat, CompressionSettings};
-pub use config::{resolve_transcription_mode, EnrichmentConfig, LocalModelSize, ScribaConfig, TranscriptionMode};
+pub use config::{resolve_transcription_mode, EnrichmentConfig, LocalModelSize, ScribaConfig, SilenceAutoStopConfig, TranscriptionMode};
 pub use files::FileManager;
-pub use recording::{record_audio, AudioLevelMonitor, RecordOptions};
+pub use recording::{record_audio, AudioLevelMonitor, RecordOptions, RecordingResult};
 pub use transcription::{transcribe_audio, TranscriptionProgress};
 pub use types::{ManagedRecording, RecordingConfig, RecordingMetadata, RecordingMode};
 pub use workflow::{DatabaseManager, HealthStatus, HealthStatusLevel, WorkflowManager, rebuild_world_from_entities, initialize_world_from_seed};

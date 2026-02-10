@@ -1,6 +1,7 @@
 use crate::core::{
-    CompressionSettings, LocalModelSize, RecordOptions, ScribaConfig, TranscriptionMode,
-    WorkflowManager, record_audio, rebuild_world_from_entities, initialize_world_from_seed,
+    CompressionSettings, LocalModelSize, RecordOptions, RecordingResult, ScribaConfig,
+    TranscriptionMode, WorkflowManager, record_audio, rebuild_world_from_entities,
+    initialize_world_from_seed,
 };
 use crate::database::{Database, Entity, Recording, RecordingStats};
 use crate::enrichment::{OllamaClient, WorldContext, WorldData, WorldEntityExtractionResult};
@@ -57,7 +58,7 @@ pub struct Dashboard {
     transcribing_recording_name: Option<String>, // directory_name of recording being transcribed
     notification_message: Option<(String, usize)>, // (message, frames_remaining) — auto-dismiss
     header_anim_frame: usize, // Main header owl animation counter
-    recording_task: Option<tokio::task::JoinHandle<Result<String, anyhow::Error>>>, // Background recording task (returns recording name)
+    recording_task: Option<tokio::task::JoinHandle<Result<RecordingResult, anyhow::Error>>>,
     recording_mode: Option<RecordingMode>, // Track if we should transcribe after recording
     recording_stop_tx: Option<mpsc::Sender<()>>, // Channel to stop recording
     recording_level_rx: Option<mpsc::Receiver<f32>>, // Channel to receive volume levels
@@ -447,7 +448,18 @@ impl Dashboard {
                     self.current_volume_level = 0.0;
 
                     match completed_task.await {
-                        Ok(Ok(recording_name)) => {
+                        Ok(Ok(result)) => {
+                            let recording_name = result.recording_name;
+                            let auto_stopped = result.auto_stopped;
+
+                            // Show owl quip if silence auto-stopped
+                            if auto_stopped {
+                                self.notification_message = Some((
+                                    "Hoo left the mic on? I stopped it for you.".to_string(),
+                                    120,
+                                ));
+                            }
+
                             // Recording completed successfully
                             if let Some(RecordingMode::RecordAndTranscribe) = recording_mode {
                                 // Dismiss recording modal — transcription runs non-blocking
@@ -474,7 +486,7 @@ impl Dashboard {
                             } else {
                                 // Recording only mode - complete
                                 self.stop_progress_animation();
-                                self.message = "✅ Recording complete!".to_string();
+                                self.message = "Recording complete.".to_string();
                                 self.show_message = true;
                                 // Reload data to show new recording
                                 let _ = self.load_recordings();
@@ -483,12 +495,12 @@ impl Dashboard {
                         }
                         Ok(Err(err)) => {
                             self.stop_progress_animation();
-                            self.message = format!("❌ Recording failed: {}", err);
+                            self.message = format!("Recording failed: {}", err);
                             self.show_message = true;
                         }
                         Err(_) => {
                             self.stop_progress_animation();
-                            self.message = "❌ Recording task failed".to_string();
+                            self.message = "Recording task failed.".to_string();
                             self.show_message = true;
                         }
                     }
@@ -852,7 +864,7 @@ impl Dashboard {
             KeyCode::Enter => match self.show_selected_transcript().await {
                 Ok(()) => {}
                 Err(e) => {
-                    self.message = format!("❌ Failed to load transcript: {}", e);
+                    self.message = format!("Failed to load transcript: {}", e);
                     self.show_message = true;
                 }
             },
@@ -865,7 +877,7 @@ impl Dashboard {
             KeyCode::Char('p') | KeyCode::Char('P') => match self.play_selected_recording().await {
                 Ok(()) => {}
                 Err(e) => {
-                    self.message = format!("❌ Failed to play recording: {}", e);
+                    self.message = format!("Failed to play recording: {}", e);
                     self.show_message = true;
                 }
             },
@@ -1414,13 +1426,13 @@ impl Dashboard {
                             self.load_enrichment_data(&recording);
                         }
                         Err(e) => {
-                            self.message = format!("❌ Failed to load transcript: {}", e);
+                            self.message = format!("Failed to load transcript: {}", e);
                             self.show_message = true;
                         }
                     }
                 } else {
                     self.message =
-                        "❌ No transcript available for this recording. Use P to play instead."
+                        "No transcript available for this recording. Use P to play instead."
                             .to_string();
                     self.show_message = true;
                 }
@@ -1585,7 +1597,7 @@ impl Dashboard {
                         Err(e) => {
                             // Store error for debugging if no player works
                             if prog == "mpv" && is_mp3 {
-                                self.message = format!("⚠️ mpv failed to play MP3: {}", e);
+                                self.message = format!("mpv failed to play MP3: {}", e);
                             }
                         }
                     }
@@ -1750,11 +1762,11 @@ impl Dashboard {
                 // Copy transcript to clipboard
                 match self.copy_transcript_to_clipboard() {
                     Ok(()) => {
-                        self.message = "📋 Transcript copied to clipboard!".to_string();
+                        self.message = "Transcript copied to clipboard.".to_string();
                         self.show_message = true;
                     }
                     Err(e) => {
-                        self.message = format!("❌ Failed to copy to clipboard: {}", e);
+                        self.message = format!("Failed to copy to clipboard: {}", e);
                         self.show_message = true;
                     }
                 }
@@ -1834,7 +1846,7 @@ impl Dashboard {
                 // Re-transcribe the current recording
                 if let Some(recording) = self.get_current_recording() {
                     if self.transcription_task.is_some() {
-                        self.message = "⚠️ Transcription already in progress".to_string();
+                        self.message = "Transcription already in progress".to_string();
                         self.show_message = true;
                         return Ok(DashboardAction::Continue);
                     }
@@ -1887,8 +1899,9 @@ impl Dashboard {
     }
 
     async fn handle_settings_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
-        // Max settings index: 0=Mode, 1=ModeSpecific, 2=OllamaModel, 3=OllamaEndpoint
-        let max_index = 3;
+        // Max settings index: 0=Mode, 1=ModeSpecific, 2=OllamaModel, 3=OllamaEndpoint,
+        //                    4=SilenceAutoStop, 5=SilenceTimeout
+        let max_index = 5;
 
         match key_code {
             KeyCode::Esc => {
@@ -2030,6 +2043,35 @@ impl Dashboard {
                             self.editing_ollama_endpoint = true;
                             self.ollama_endpoint_input = self.config.enrichment.ollama_endpoint.clone();
                         }
+                        4 => {
+                            // Toggle silence auto-stop enabled/disabled
+                            self.config.silence_auto_stop.enabled = !self.config.silence_auto_stop.enabled;
+                            if let Err(e) = self.config.save() {
+                                self.message = format!("Failed to save setting: {}", e);
+                                self.show_message = true;
+                                self.return_to_view = Some(DashboardView::Settings);
+                            } else {
+                                self.config = ScribaConfig::load()?;
+                            }
+                        }
+                        5 => {
+                            // Cycle silence timeout: 30s → 60s → 120s → 300s
+                            if self.config.silence_auto_stop.enabled {
+                                self.config.silence_auto_stop.timeout_seconds = match self.config.silence_auto_stop.timeout_seconds {
+                                    30 => 60,
+                                    60 => 120,
+                                    120 => 300,
+                                    _ => 30,
+                                };
+                                if let Err(e) = self.config.save() {
+                                    self.message = format!("Failed to save setting: {}", e);
+                                    self.show_message = true;
+                                    self.return_to_view = Some(DashboardView::Settings);
+                                } else {
+                                    self.config = ScribaConfig::load()?;
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -2067,7 +2109,7 @@ impl Dashboard {
                     match self.perform_delete_recording(recording).await {
                         Ok(()) => {}
                         Err(e) => {
-                            self.message = format!("❌ Failed to delete recording: {}", e);
+                            self.message = format!("Failed to delete recording: {}", e);
                             self.show_message = true;
                         }
                     }
@@ -2102,7 +2144,7 @@ impl Dashboard {
                     FileDialogStage::FilePath => {
                         // Validate file path
                         if self.file_path_input.trim().is_empty() {
-                            self.message = "❌ Please enter a file path".to_string();
+                            self.message = "Please enter a file path".to_string();
                             self.show_message = true;
                             self.return_to_view = Some(DashboardView::Main);
                             self.show_file_dialog = false;
@@ -2112,7 +2154,7 @@ impl Dashboard {
                         // Check if file exists
                         let file_path = PathBuf::from(self.file_path_input.trim());
                         if !file_path.exists() {
-                            self.message = "❌ File not found. Please check the path.".to_string();
+                            self.message = "File not found. Please check the path.".to_string();
                             self.show_message = true;
                             self.return_to_view = Some(DashboardView::Main);
                             self.show_file_dialog = false;
@@ -2190,7 +2232,7 @@ impl Dashboard {
 
                     self.load_recordings()?;
                     self.load_stats()?;
-                    self.message = "✅ Recording deleted successfully".to_string();
+                    self.message = "Recording deleted.".to_string();
                     self.show_message = true;
                 }
                 Err(_e) => {
@@ -2649,7 +2691,7 @@ impl Dashboard {
 
             vec![
                 Line::from(vec![
-                    Span::styled("📊 Total: ", Style::default().fg(Color::White)),
+                    Span::styled("Total: ", Style::default().fg(Color::White)),
                     Span::styled(
                         format!("{} recordings", stats.total_recordings),
                         Style::default()
@@ -2657,7 +2699,7 @@ impl Dashboard {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw("    "),
-                    Span::styled("🕒 Duration: ", Style::default().fg(Color::White)),
+                    Span::styled("Duration: ", Style::default().fg(Color::White)),
                     Span::styled(
                         stats.format_duration(),
                         Style::default()
@@ -2666,7 +2708,7 @@ impl Dashboard {
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("💾 Storage: ", Style::default().fg(Color::White)),
+                    Span::styled("Storage: ", Style::default().fg(Color::White)),
                     Span::styled(
                         stats.format_size(),
                         Style::default()
@@ -2674,7 +2716,7 @@ impl Dashboard {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw("      "),
-                    Span::styled("📝 Transcribed: ", Style::default().fg(Color::White)),
+                    Span::styled("Transcribed: ", Style::default().fg(Color::White)),
                     Span::styled(
                         format!("{} ({}%)", stats.transcribed_count, transcribed_percentage),
                         Style::default()
@@ -2852,9 +2894,9 @@ impl Dashboard {
         // Current transcription mode
         let mode_text = match &self.config.transcription {
             TranscriptionMode::Local { model_size } => {
-                format!("⚙️ Local (Whisper {})  ← Press Enter to change", model_size)
+                format!("Local (Whisper {})  <- Press Enter to change", model_size)
             }
-            TranscriptionMode::Api { .. } => "☁️ OpenAI API  ← Press Enter to change".to_string(),
+            TranscriptionMode::Api { .. } => "OpenAI API  <- Press Enter to change".to_string(),
         };
 
         let mode_style = if self.settings_selection == 0 {
@@ -2883,7 +2925,7 @@ impl Dashboard {
             settings_text.push(Line::from(vec![
                 Span::styled("Model Size: ", Style::default().fg(Color::Green)),
                 Span::styled(
-                    format!("{} ← Press Enter to cycle", model_size),
+                    format!("{} <- Press Enter to cycle", model_size),
                     model_style,
                 ),
             ]));
@@ -2897,10 +2939,10 @@ impl Dashboard {
                     format!("{}_", self.api_key_input) // Show cursor
                 } else {
                     if api_key.is_empty() {
-                        "[Not Set] ← Press Enter to edit".to_string()
+                        "[Not Set] <- Press Enter to edit".to_string()
                     } else {
                         format!(
-                            "{}****** ← Press Enter to edit",
+                            "{}****** <- Press Enter to edit",
                             &api_key[..api_key.len().min(4)]
                         )
                     }
@@ -2991,6 +3033,66 @@ impl Dashboard {
         settings_text.push(Line::from(vec![
             Span::styled("Ollama Server: ", Style::default().fg(Color::Green)),
             Span::styled(ollama_endpoint_display, ollama_endpoint_style),
+        ]));
+
+        // Recording section — silence auto-stop
+        settings_text.push(Line::from(""));
+        settings_text.push(Line::from(vec![Span::styled(
+            "RECORDING",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]));
+
+        // Silence Auto-Stop toggle (index 4)
+        let silence_enabled = self.config.silence_auto_stop.enabled;
+        let silence_toggle_text = if silence_enabled {
+            "Enabled <- Press Enter to toggle"
+        } else {
+            "Disabled <- Press Enter to toggle"
+        };
+        let silence_toggle_style = if self.settings_selection == 4 {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        settings_text.push(Line::from(vec![
+            Span::styled("Silence Auto-Stop: ", Style::default().fg(Color::Green)),
+            Span::styled(silence_toggle_text, silence_toggle_style),
+        ]));
+
+        // Silence Timeout (index 5) — only interactive when enabled
+        let timeout_secs = self.config.silence_auto_stop.timeout_seconds;
+        let timeout_display = match timeout_secs {
+            s if s < 60 => format!("{}s", s),
+            s if s % 60 == 0 => format!("{}m", s / 60),
+            s => format!("{}m {}s", s / 60, s % 60),
+        };
+        let timeout_text = if silence_enabled {
+            format!("{} <- Press Enter to cycle", timeout_display)
+        } else {
+            format!("{} (enable auto-stop first)", timeout_display)
+        };
+        let timeout_style = if self.settings_selection == 5 {
+            if silence_enabled {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            }
+        } else {
+            if silence_enabled {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            }
+        };
+        settings_text.push(Line::from(vec![
+            Span::styled("Silence Timeout: ", Style::default().fg(Color::Green)),
+            Span::styled(timeout_text, timeout_style),
         ]));
 
         settings_text.push(Line::from(""));
@@ -3319,17 +3421,17 @@ impl Dashboard {
                 .map(|c| c.clone())
                 .unwrap_or_else(|| "(no context)".to_string());
 
-            let type_icon = match entity.entity_type.as_str() {
-                "person" => "👤",
-                "organization" => "🏢",
-                _ => "📌",
+            let type_label = match entity.entity_type.as_str() {
+                "person" => "person",
+                "organization" => "org",
+                _ => "other",
             };
 
             let content = vec![
                 Line::from(vec![
                     Span::styled(
-                        format!("{} ", type_icon),
-                        Style::default().fg(Color::White),
+                        format!("[{}] ", type_label),
+                        Style::default().fg(Color::DarkGray),
                     ),
                     Span::styled(
                         &entity.canonical_name,
@@ -3797,7 +3899,7 @@ impl Dashboard {
         // Summary
         if let Some(summary) = &self.transcript_summary {
             lines.push(Line::from(vec![
-                Span::styled("📋 Summary: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled("Summary: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
                 Span::styled(summary, Style::default().fg(Color::White)),
             ]));
             lines.push(Line::from(""));
@@ -3807,7 +3909,7 @@ impl Dashboard {
         if let Some(topics) = &self.transcript_topics {
             if !topics.is_empty() {
                 let topic_spans: Vec<Span> = std::iter::once(
-                    Span::styled("🏷️ Topics: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                    Span::styled("Topics: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
                 )
                 .chain(topics.iter().enumerate().flat_map(|(i, topic)| {
                     let mut spans = vec![Span::styled(
@@ -3828,7 +3930,7 @@ impl Dashboard {
         if let Some(entities) = &self.transcript_entities {
             if !entities.is_empty() {
                 let entity_spans: Vec<Span> = std::iter::once(
-                    Span::styled("👥 Entities: ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+                    Span::styled("Entities: ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
                 )
                 .chain(entities.iter().enumerate().flat_map(|(i, (name, etype))| {
                     let color = match etype.as_str() {
@@ -3852,7 +3954,7 @@ impl Dashboard {
             if !key_points.is_empty() {
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![
-                    Span::styled("💡 Key: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled("Key: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
                     Span::styled(&key_points[0], Style::default().fg(Color::White)),
                 ]));
             }
@@ -3864,7 +3966,7 @@ impl Dashboard {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Green))
-                    .title("🧠 Knowledge Extract")
+                    .title("Knowledge Extract")
                     .title_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
             )
             .wrap(Wrap { trim: true });
@@ -3889,7 +3991,7 @@ impl Dashboard {
 
             let visible_lines = wrapped_lines[actual_offset..end].join("\n");
             let scroll_info = format!(
-                "📝 Transcript [{}/{}] - ↑↓: scroll, C: copy, T: re-transcribe, ESC: close",
+                "Transcript [{}/{}] - up/down: scroll, C: copy, T: re-transcribe, ESC: close",
                 actual_offset + 1,
                 total_lines
             );
@@ -3897,7 +3999,7 @@ impl Dashboard {
         } else {
             (
                 self.transcript_content.clone(),
-                "📝 Transcript - C: copy, T: re-transcribe, ESC: close".to_string(),
+                "Transcript - C: copy, T: re-transcribe, ESC: close".to_string(),
             )
         };
 
@@ -3992,7 +4094,7 @@ impl Dashboard {
 
         f.render_widget(Clear, popup_area);
 
-        let search_input = Paragraph::new(format!("🔍 Search: {}", self.search_query))
+        let search_input = Paragraph::new(format!("Search: {}", self.search_query))
             .style(Style::default().fg(Color::Yellow))
             .block(
                 Block::default()
@@ -4007,13 +4109,13 @@ impl Dashboard {
     async fn execute_record_and_transcribe(&mut self) -> Result<()> {
         // Check if already recording or transcribing
         if self.recording_task.is_some() || self.transcription_task.is_some() {
-            self.message = "⚠️ Recording or transcription already in progress".to_string();
+            self.message = "Recording or transcription already in progress".to_string();
             self.show_message = true;
             return Ok(());
         }
 
         // Show immediate progress animation
-        self.progress_animation = Some("🎙️ Recording... (Press Esc to stop)".to_string());
+        self.progress_animation = Some("Recording... (Press Esc to stop)".to_string());
         self.progress_frame = 0;
         self.show_message = true;
         self.recording_mode = Some(RecordingMode::RecordAndTranscribe);
@@ -4028,7 +4130,7 @@ impl Dashboard {
     async fn execute_add_external_file(&mut self) -> Result<()> {
         // Check if already recording or transcribing
         if self.recording_task.is_some() || self.transcription_task.is_some() {
-            self.message = "⚠️ Recording or transcription already in progress".to_string();
+            self.message = "Recording or transcription already in progress".to_string();
             self.show_message = true;
             return Ok(());
         }
@@ -4071,7 +4173,7 @@ impl Dashboard {
     async fn execute_transcribe_selected(&mut self) -> Result<()> {
         // Check if transcription is already running
         if self.transcription_task.is_some() {
-            self.message = "⚠️ Transcription already in progress. Please wait...".to_string();
+            self.message = "Transcription already in progress. Please wait...".to_string();
             self.show_message = true;
             return Ok(());
         }
@@ -4080,7 +4182,7 @@ impl Dashboard {
         let selected_index = match self.table_state.selected() {
             Some(i) => i,
             None => {
-                self.message = "❌ No recording selected".to_string();
+                self.message = "No recording selected".to_string();
                 self.show_message = true;
                 return Ok(());
             }
@@ -4089,7 +4191,7 @@ impl Dashboard {
         let selected_recording = match self.recordings.get(selected_index) {
             Some(recording) => recording.clone(),
             None => {
-                self.message = "❌ Invalid recording selection".to_string();
+                self.message = "Invalid recording selection".to_string();
                 self.show_message = true;
                 return Ok(());
             }
@@ -4113,7 +4215,7 @@ impl Dashboard {
                 // First press - show warning and remember this recording
                 self.last_transcribe_warning = Some(selected_index);
                 self.message =
-                    "⚠️ Recording already has transcript. Press T again to overwrite.".to_string();
+                    "Recording already has transcript. Press T again to overwrite.".to_string();
                 self.show_message = true;
                 return Ok(());
             }
@@ -4412,8 +4514,14 @@ impl Dashboard {
             Some(RecordingMode::RecordAndTranscribe)
         );
 
+        // Silence auto-stop timeout from config
+        let silence_timeout = if self.config.silence_auto_stop.enabled {
+            Some(Duration::from_secs(self.config.silence_auto_stop.timeout_seconds as u64))
+        } else {
+            None
+        };
+
         // Use unified recording function with TUI control channels
-        // record_audio and RecordOptions are already imported from crate::core
         let output_path = PathBuf::from(&recording_name);
 
         self.recording_task = Some(tokio::spawn(async move {
@@ -4424,6 +4532,7 @@ impl Dashboard {
                     stop_rx: Some(stop_rx),
                     level_tx: Some(level_tx),
                     verbose: false,
+                    silence_timeout,
                 },
             )
             .await

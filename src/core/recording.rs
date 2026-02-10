@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::signal;
@@ -16,10 +17,14 @@ use crate::database::{Database, Recording};
 use crate::utils::BASE_PATH;
 use chrono::Utc;
 
+/// RMS level below which we consider the mic dead (near-zero signal).
+const SILENCE_THRESHOLD: f32 = 0.001;
+
 /// Monitors audio input levels for real-time feedback during recording.
 pub struct AudioLevelMonitor {
     last_update: Instant,
     level: f32,
+    silence_start: Option<Instant>,
 }
 
 impl AudioLevelMonitor {
@@ -27,6 +32,7 @@ impl AudioLevelMonitor {
         Self {
             last_update: Instant::now(),
             level: 0.0,
+            silence_start: None,
         }
     }
 
@@ -38,12 +44,28 @@ impl AudioLevelMonitor {
 
         self.level = self.level * 0.8 + rms * 0.2;
 
+        // Update silence tracking
+        if self.level < SILENCE_THRESHOLD {
+            if self.silence_start.is_none() {
+                self.silence_start = Some(Instant::now());
+            }
+        } else {
+            self.silence_start = None;
+        }
+
         if self.last_update.elapsed() >= Duration::from_millis(100) {
             self.last_update = Instant::now();
             Some(self.level)
         } else {
             None
         }
+    }
+
+    /// Returns how long continuous silence has lasted (Duration::ZERO if not silent).
+    pub fn silence_duration(&self) -> Duration {
+        self.silence_start
+            .map(|start| start.elapsed())
+            .unwrap_or(Duration::ZERO)
     }
 }
 
@@ -59,6 +81,8 @@ pub struct RecordOptions {
     pub stop_rx: Option<mpsc::Receiver<()>>,
     pub level_tx: Option<mpsc::Sender<f32>>,
     pub verbose: bool,
+    /// If set, recording auto-stops after this duration of continuous silence.
+    pub silence_timeout: Option<Duration>,
 }
 
 impl Default for RecordOptions {
@@ -68,8 +92,15 @@ impl Default for RecordOptions {
             stop_rx: None,
             level_tx: None,
             verbose: false,
+            silence_timeout: None,
         }
     }
+}
+
+/// Result of a recording session.
+pub struct RecordingResult {
+    pub recording_name: String,
+    pub auto_stopped: bool,
 }
 
 type AudioEncoderHandle = Arc<Mutex<Option<Box<dyn AudioEncoder>>>>;
@@ -155,8 +186,10 @@ fn record_core(
     compression_settings: Option<CompressionSettings>,
     level_tx_opt: Option<mpsc::Sender<f32>>,
     verbose: bool,
+    silence_timeout: Option<Duration>,
+    silence_flag: Arc<AtomicBool>,
     wait_stop: Box<dyn FnOnce()>,
-) -> Result<String, anyhow::Error> {
+) -> Result<RecordingResult, anyhow::Error> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -199,44 +232,61 @@ fn record_core(
 
     let encoder_2 = encoder.clone();
     let level_monitor_2 = level_monitor.clone();
+    let silence_flag_2 = silence_flag.clone();
 
     let err_fn = move |err| {
         eprintln!("an error occurred on stream: {}", err);
     };
 
     let stream = match config.sample_format() {
-        cpal::SampleFormat::I8 => device.build_input_stream(
-            &config.clone().into(),
-            move |data: &[i8], _: &_| {
-                write_input_data_i8(data, &encoder_2, &level_monitor_2, level_tx_opt.as_ref())
-            },
-            err_fn,
-            None,
-        )?,
-        cpal::SampleFormat::I16 => device.build_input_stream(
-            &config.clone().into(),
-            move |data: &[i16], _: &_| {
-                write_input_data_i16(data, &encoder_2, &level_monitor_2, level_tx_opt.as_ref())
-            },
-            err_fn,
-            None,
-        )?,
-        cpal::SampleFormat::I32 => device.build_input_stream(
-            &config.clone().into(),
-            move |data: &[i32], _: &_| {
-                write_input_data_i32(data, &encoder_2, &level_monitor_2, level_tx_opt.as_ref())
-            },
-            err_fn,
-            None,
-        )?,
-        cpal::SampleFormat::F32 => device.build_input_stream(
-            &config.clone().into(),
-            move |data: &[f32], _: &_| {
-                write_input_data_f32(data, &encoder_2, &level_monitor_2, level_tx_opt.as_ref())
-            },
-            err_fn,
-            None,
-        )?,
+        cpal::SampleFormat::I8 => {
+            let sf = silence_flag_2.clone();
+            let st = silence_timeout;
+            device.build_input_stream(
+                &config.clone().into(),
+                move |data: &[i8], _: &_| {
+                    write_input_data_i8(data, &encoder_2, &level_monitor_2, level_tx_opt.as_ref(), &sf, st)
+                },
+                err_fn,
+                None,
+            )?
+        }
+        cpal::SampleFormat::I16 => {
+            let sf = silence_flag_2.clone();
+            let st = silence_timeout;
+            device.build_input_stream(
+                &config.clone().into(),
+                move |data: &[i16], _: &_| {
+                    write_input_data_i16(data, &encoder_2, &level_monitor_2, level_tx_opt.as_ref(), &sf, st)
+                },
+                err_fn,
+                None,
+            )?
+        }
+        cpal::SampleFormat::I32 => {
+            let sf = silence_flag_2.clone();
+            let st = silence_timeout;
+            device.build_input_stream(
+                &config.clone().into(),
+                move |data: &[i32], _: &_| {
+                    write_input_data_i32(data, &encoder_2, &level_monitor_2, level_tx_opt.as_ref(), &sf, st)
+                },
+                err_fn,
+                None,
+            )?
+        }
+        cpal::SampleFormat::F32 => {
+            let sf = silence_flag_2.clone();
+            let st = silence_timeout;
+            device.build_input_stream(
+                &config.clone().into(),
+                move |data: &[f32], _: &_| {
+                    write_input_data_f32(data, &encoder_2, &level_monitor_2, level_tx_opt.as_ref(), &sf, st)
+                },
+                err_fn,
+                None,
+            )?
+        }
         sample_format => {
             return Err(anyhow::Error::msg(format!(
                 "Unsupported sample format '{sample_format}'"
@@ -246,6 +296,7 @@ fn record_core(
 
     stream.play()?;
     wait_stop();
+    let auto_stopped = silence_flag.load(Ordering::Relaxed);
     drop(stream);
 
     if let Some(mut enc) = encoder.lock().unwrap().take() {
@@ -279,32 +330,70 @@ fn record_core(
     }
 
     if verbose {
-        println!("✅ Recording complete: {}", metadata_file_path.display());
+        if auto_stopped {
+            println!("🔇 Recording auto-stopped due to silence: {}", metadata_file_path.display());
+        } else {
+            println!("✅ Recording complete: {}", metadata_file_path.display());
+        }
     }
 
-    Ok(output_path.to_string_lossy().to_string())
+    Ok(RecordingResult {
+        recording_name: output_path.to_string_lossy().to_string(),
+        auto_stopped,
+    })
 }
 
 /// Record audio from the default input device.
-pub async fn record_audio(output_path: PathBuf, options: RecordOptions) -> Result<String> {
+pub async fn record_audio(output_path: PathBuf, options: RecordOptions) -> Result<RecordingResult> {
+    let silence_flag = Arc::new(AtomicBool::new(false));
+    let silence_timeout = options.silence_timeout;
+
     let wait_strategy: Box<dyn FnOnce()> = match options.stop_rx {
-        Some(mut rx) => Box::new(move || {
-            let (tx, rx_done) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = rx.blocking_recv();
-                let _ = tx.send(());
-            });
-            let _ = rx_done.recv();
-        }),
+        Some(mut rx) => {
+            let sf = silence_flag.clone();
+            Box::new(move || {
+                let (tx, rx_done) = std::sync::mpsc::channel();
+                let tx2 = tx.clone();
+                // Thread 1: user stop signal
+                std::thread::spawn(move || {
+                    let _ = rx.blocking_recv();
+                    let _ = tx.send(());
+                });
+                // Thread 2: silence flag poll
+                if silence_timeout.is_some() {
+                    std::thread::spawn(move || loop {
+                        if sf.load(Ordering::Relaxed) {
+                            let _ = tx2.send(());
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(500));
+                    });
+                }
+                let _ = rx_done.recv();
+            })
+        }
         None => {
             let handle = tokio::runtime::Handle::current();
+            let sf = silence_flag.clone();
             Box::new(move || {
                 let (tx, rx) = std::sync::mpsc::channel();
+                let tx2 = tx.clone();
                 let handle_clone = handle.clone();
+                // Thread 1: ctrl+c
                 std::thread::spawn(move || {
                     let _ = handle_clone.block_on(signal::ctrl_c());
                     let _ = tx.send(());
                 });
+                // Thread 2: silence flag poll
+                if silence_timeout.is_some() {
+                    std::thread::spawn(move || loop {
+                        if sf.load(Ordering::Relaxed) {
+                            let _ = tx2.send(());
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(500));
+                    });
+                }
                 let _ = rx.recv();
             })
         }
@@ -315,6 +404,8 @@ pub async fn record_audio(output_path: PathBuf, options: RecordOptions) -> Resul
         options.compression_settings,
         options.level_tx,
         options.verbose,
+        silence_timeout,
+        silence_flag,
         wait_strategy,
     )
 }
@@ -325,11 +416,19 @@ fn write_input_data_f32(
     encoder: &AudioEncoderHandle,
     level_monitor: &Arc<Mutex<AudioLevelMonitor>>,
     level_tx: Option<&mpsc::Sender<f32>>,
+    silence_flag: &Arc<AtomicBool>,
+    silence_timeout: Option<Duration>,
 ) {
     if let Ok(mut monitor) = level_monitor.try_lock() {
         if let Some(level) = monitor.update_level(input) {
             if let Some(tx) = level_tx {
                 let _ = tx.try_send(level);
+            }
+        }
+        // Check silence auto-stop
+        if let Some(timeout) = silence_timeout {
+            if monitor.silence_duration() >= timeout {
+                silence_flag.store(true, Ordering::Relaxed);
             }
         }
     }
@@ -346,9 +445,11 @@ fn write_input_data_i16(
     encoder: &AudioEncoderHandle,
     level_monitor: &Arc<Mutex<AudioLevelMonitor>>,
     level_tx: Option<&mpsc::Sender<f32>>,
+    silence_flag: &Arc<AtomicBool>,
+    silence_timeout: Option<Duration>,
 ) {
     let f32_samples: Vec<f32> = input.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-    write_input_data_f32(&f32_samples, encoder, level_monitor, level_tx);
+    write_input_data_f32(&f32_samples, encoder, level_monitor, level_tx, silence_flag, silence_timeout);
 }
 
 fn write_input_data_i32(
@@ -356,9 +457,11 @@ fn write_input_data_i32(
     encoder: &AudioEncoderHandle,
     level_monitor: &Arc<Mutex<AudioLevelMonitor>>,
     level_tx: Option<&mpsc::Sender<f32>>,
+    silence_flag: &Arc<AtomicBool>,
+    silence_timeout: Option<Duration>,
 ) {
     let f32_samples: Vec<f32> = input.iter().map(|&s| s as f32 / i32::MAX as f32).collect();
-    write_input_data_f32(&f32_samples, encoder, level_monitor, level_tx);
+    write_input_data_f32(&f32_samples, encoder, level_monitor, level_tx, silence_flag, silence_timeout);
 }
 
 fn write_input_data_i8(
@@ -366,7 +469,9 @@ fn write_input_data_i8(
     encoder: &AudioEncoderHandle,
     level_monitor: &Arc<Mutex<AudioLevelMonitor>>,
     level_tx: Option<&mpsc::Sender<f32>>,
+    silence_flag: &Arc<AtomicBool>,
+    silence_timeout: Option<Duration>,
 ) {
     let f32_samples: Vec<f32> = input.iter().map(|&s| s as f32 / i8::MAX as f32).collect();
-    write_input_data_f32(&f32_samples, encoder, level_monitor, level_tx);
+    write_input_data_f32(&f32_samples, encoder, level_monitor, level_tx, silence_flag, silence_timeout);
 }

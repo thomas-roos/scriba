@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::audio::CompressionSettings;
@@ -138,29 +139,32 @@ impl WorkflowManager {
 
         let final_directory_name = match mode {
             RecordingMode::Cli => {
-                let _ = record_audio(
+                let result = record_audio(
                     recording_path,
                     RecordOptions {
                         compression_settings: config.compression.clone(),
                         stop_rx: None,
                         level_tx: None,
                         verbose: true,
+                        silence_timeout: None,
                     },
                 )
                 .await?;
-                directory_name
+                result.recording_name
             }
-            RecordingMode::Tui { stop_rx, level_tx } => {
-                record_audio(
+            RecordingMode::Tui { stop_rx, level_tx, silence_timeout } => {
+                let result = record_audio(
                     recording_path,
                     RecordOptions {
                         compression_settings: config.compression.clone(),
                         stop_rx: Some(stop_rx),
                         level_tx: Some(level_tx),
                         verbose: false,
+                        silence_timeout,
                     },
                 )
-                .await?
+                .await?;
+                result.recording_name
             }
         };
 
@@ -583,6 +587,7 @@ impl WorkflowManager {
         level_tx: mpsc::Sender<f32>,
         auto_transcribe: bool,
         transcription_mode: Option<TranscriptionMode>,
+        silence_timeout: Option<Duration>,
     ) -> Result<ManagedRecording> {
         let config = RecordingConfig {
             name,
@@ -591,7 +596,7 @@ impl WorkflowManager {
             transcription_mode,
         };
 
-        let mode = RecordingMode::Tui { stop_rx, level_tx };
+        let mode = RecordingMode::Tui { stop_rx, level_tx, silence_timeout };
         self.complete_recording_workflow(config, mode).await
     }
 

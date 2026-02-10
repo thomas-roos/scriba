@@ -64,6 +64,27 @@ pub struct ScribaConfig {
     /// Knowledge extraction and enrichment settings.
     #[serde(default)]
     pub enrichment: EnrichmentConfig,
+    /// Silence auto-stop settings.
+    #[serde(default)]
+    pub silence_auto_stop: SilenceAutoStopConfig,
+}
+
+/// Configuration for silence-based auto-stop during recording.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SilenceAutoStopConfig {
+    /// Whether silence auto-stop is enabled.
+    pub enabled: bool,
+    /// Seconds of continuous silence before auto-stopping.
+    pub timeout_seconds: u32,
+}
+
+impl Default for SilenceAutoStopConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout_seconds: 60,
+        }
+    }
 }
 
 /// Configuration for knowledge extraction and enrichment.
@@ -122,6 +143,7 @@ impl Default for ScribaConfig {
             },
             last_api_key: None,
             enrichment: EnrichmentConfig::default(),
+            silence_auto_stop: SilenceAutoStopConfig::default(),
         }
     }
 }
