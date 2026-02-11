@@ -547,7 +547,7 @@ fn run_whisper_transcription(model_path: &Path, wav_path: &Path) -> Result<Strin
     // Anti-hallucination: skip segments that look like no speech
     params.set_no_speech_thold(0.6);
     // Anti-repetition: skip segments with low entropy (repetitive output)
-    params.set_entropy_thold(2.4);
+    params.set_entropy_thold(2.0);
     // Anti-hallucination: skip segments with very low token probability
     params.set_logprob_thold(-1.0);
     // Suppress blank outputs at start of segments
@@ -578,6 +578,9 @@ fn run_whisper_transcription(model_path: &Path, wav_path: &Path) -> Result<Strin
             }
         }
     }
+
+    // Post-processing: remove repetitive phrases that Whisper's entropy filter missed
+    let text = strip_repetitions(&text);
 
     Ok(text)
 }
@@ -755,6 +758,56 @@ pub async fn transcribe_audio(
     Ok(())
 }
 
+/// Remove repetitive phrases from Whisper output.
+///
+/// Scans for any phrase (3+ words) repeated 3+ times consecutively and
+/// collapses it to a single occurrence. Works on both sentence-level
+/// repetition ("I'll see you next time. I'll see you next time.") and
+/// inline repetition ("you can't do it, you can't do it, you can't do it").
+fn strip_repetitions(text: &str) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() < 6 {
+        return text.to_string();
+    }
+
+    let mut result_words: Vec<&str> = Vec::with_capacity(words.len());
+    let mut i = 0;
+
+    while i < words.len() {
+        // Try phrase lengths from 3 to 30 words
+        let mut best_phrase_len = 0;
+        let mut best_repeat_count = 0;
+
+        for phrase_len in 3..=30.min(words.len() - i) {
+            let phrase = &words[i..i + phrase_len];
+            let mut count = 1;
+            let mut j = i + phrase_len;
+            while j + phrase_len <= words.len() && words[j..j + phrase_len] == *phrase {
+                count += 1;
+                j += phrase_len;
+            }
+            // Prefer longer phrases with fewer repeats over short phrases
+            if count >= 3 && phrase_len * count > best_phrase_len * best_repeat_count {
+                best_phrase_len = phrase_len;
+                best_repeat_count = count;
+            }
+        }
+
+        if best_repeat_count >= 3 {
+            // Keep one occurrence, skip the rest
+            for w in &words[i..i + best_phrase_len] {
+                result_words.push(w);
+            }
+            i += best_phrase_len * best_repeat_count;
+        } else {
+            result_words.push(words[i]);
+            i += 1;
+        }
+    }
+
+    result_words.join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -894,5 +947,47 @@ mod tests {
         let prompt = build_prompt_from_world_data(&data).unwrap();
         assert!(!prompt.contains('\0'));
         assert!(prompt.contains("TestName"));
+    }
+
+    #[test]
+    fn test_strip_repetitions_removes_long_loop() {
+        let input = "Hello world. I'll see you next time. I'll see you next time. I'll see you next time. I'll see you next time. I'll see you next time. Goodbye.";
+        let output = strip_repetitions(input);
+        assert_eq!(output.matches("I'll see you next time.").count(), 1);
+        assert!(output.contains("Hello world."));
+        assert!(output.contains("Goodbye."));
+    }
+
+    #[test]
+    fn test_strip_repetitions_keeps_short_text() {
+        let input = "Hello world.";
+        assert_eq!(strip_repetitions(input), "Hello world.");
+    }
+
+    #[test]
+    fn test_strip_repetitions_keeps_two_repeats() {
+        // Two repeats is not a loop — could be intentional
+        let input = "Ok. Ok. Something else here now.";
+        assert_eq!(strip_repetitions(input), input);
+    }
+
+    #[test]
+    fn test_strip_repetitions_handles_inline_loops() {
+        let input = "The result is you can't do it, you can't do it, you can't do it, you can't do it, so we move on.";
+        let output = strip_repetitions(input);
+        assert_eq!(output.matches("you can't do it,").count(), 1);
+        assert!(output.contains("The result is"));
+        assert!(output.contains("so we move on."));
+    }
+
+    #[test]
+    fn test_strip_repetitions_multiple_loops() {
+        let input = "Start. foo bar baz. foo bar baz. foo bar baz. Middle. one two three. one two three. one two three. End.";
+        let output = strip_repetitions(input);
+        assert_eq!(output.matches("foo bar baz.").count(), 1);
+        assert_eq!(output.matches("one two three.").count(), 1);
+        assert!(output.contains("Start."));
+        assert!(output.contains("Middle."));
+        assert!(output.contains("End."));
     }
 }
