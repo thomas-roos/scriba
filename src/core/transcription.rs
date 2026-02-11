@@ -544,6 +544,20 @@ fn run_whisper_transcription(model_path: &Path, wav_path: &Path) -> Result<Strin
     params.set_single_segment(false);
     params.set_n_threads(num_cpus::get() as i32);
 
+    // Anti-hallucination: skip segments that look like no speech
+    params.set_no_speech_thold(0.6);
+    // Anti-repetition: skip segments with low entropy (repetitive output)
+    params.set_entropy_thold(2.4);
+    // Anti-hallucination: skip segments with very low token probability
+    params.set_logprob_thold(-1.0);
+    // Suppress blank outputs at start of segments
+    params.set_suppress_blank(true);
+    // Suppress non-speech tokens
+    params.set_suppress_nst(true);
+    // Temperature fallback: retry with higher temperature on failed decodes
+    params.set_temperature(0.0);
+    params.set_temperature_inc(0.2);
+
     if let Some(world_prompt) = build_whisper_world_prompt() {
         params.set_initial_prompt(&world_prompt);
     }
