@@ -14,7 +14,7 @@ categories = ["command-line-utilities", "multimedia::audio"]
 
 [dependencies]
 structopt = "0.3"
-reqwest = { version = "0.11", features = ["multipart", "stream", "json"] }
+reqwest = { version = "0.11", features = ["multipart", "stream", "json", "blocking"] }
 tokio = { version = "1", features = ["full"] }
 dotenv = "0.15.0"
 cpal = "0.15.2"
@@ -36,3 +36,5 @@ futures-util = "0.3"
 glob = "0.3"
 thiserror = "1.0"
 schemars = "0.8"
+pyannote-rs = "0.3"
+ort = "=2.0.0-rc.10"

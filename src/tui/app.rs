@@ -1900,8 +1900,9 @@ impl Dashboard {
 
     async fn handle_settings_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
         // Max settings index: 0=Mode, 1=ModeSpecific, 2=OllamaModel, 3=OllamaEndpoint,
-        //                    4=SilenceAutoStop, 5=SilenceTimeout
-        let max_index = 5;
+        //                    4=SilenceAutoStop, 5=SilenceTimeout,
+        //                    6=Diarization, 7=MaxSpeakers
+        let max_index = 7;
 
         match key_code {
             KeyCode::Esc => {
@@ -2062,6 +2063,35 @@ impl Dashboard {
                                     60 => 120,
                                     120 => 300,
                                     _ => 30,
+                                };
+                                if let Err(e) = self.config.save() {
+                                    self.message = format!("Failed to save setting: {}", e);
+                                    self.show_message = true;
+                                    self.return_to_view = Some(DashboardView::Settings);
+                                } else {
+                                    self.config = ScribaConfig::load()?;
+                                }
+                            }
+                        }
+                        6 => {
+                            // Toggle speaker diarization enabled/disabled
+                            self.config.diarization.enabled = !self.config.diarization.enabled;
+                            if let Err(e) = self.config.save() {
+                                self.message = format!("Failed to save setting: {}", e);
+                                self.show_message = true;
+                                self.return_to_view = Some(DashboardView::Settings);
+                            } else {
+                                self.config = ScribaConfig::load()?;
+                            }
+                        }
+                        7 => {
+                            // Cycle max speakers: 2 → 4 → 6 → 8
+                            if self.config.diarization.enabled {
+                                self.config.diarization.max_speakers = match self.config.diarization.max_speakers {
+                                    2 => 4,
+                                    4 => 6,
+                                    6 => 8,
+                                    _ => 2,
                                 };
                                 if let Err(e) = self.config.save() {
                                     self.message = format!("Failed to save setting: {}", e);
@@ -3093,6 +3123,59 @@ impl Dashboard {
         settings_text.push(Line::from(vec![
             Span::styled("Silence Timeout: ", Style::default().fg(Color::Green)),
             Span::styled(timeout_text, timeout_style),
+        ]));
+
+        // Diarization section
+        settings_text.push(Line::from(""));
+        settings_text.push(Line::from(vec![Span::styled(
+            "DIARIZATION",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]));
+
+        // Speaker Diarization toggle (index 6)
+        let diarization_enabled = self.config.diarization.enabled;
+        let diarization_toggle_text = if diarization_enabled {
+            "Enabled <- Press Enter to toggle"
+        } else {
+            "Disabled <- Press Enter to toggle"
+        };
+        let diarization_toggle_style = if self.settings_selection == 6 {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        settings_text.push(Line::from(vec![
+            Span::styled("Speaker Diarization: ", Style::default().fg(Color::Green)),
+            Span::styled(diarization_toggle_text, diarization_toggle_style),
+        ]));
+
+        // Max Speakers (index 7) — only interactive when enabled
+        let max_speakers = self.config.diarization.max_speakers;
+        let max_speakers_text = if diarization_enabled {
+            format!("{} <- Press Enter to cycle", max_speakers)
+        } else {
+            format!("{} (enable diarization first)", max_speakers)
+        };
+        let max_speakers_style = if self.settings_selection == 7 {
+            if diarization_enabled {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            }
+        } else if diarization_enabled {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        settings_text.push(Line::from(vec![
+            Span::styled("Max Speakers: ", Style::default().fg(Color::Green)),
+            Span::styled(max_speakers_text, max_speakers_style),
         ]));
 
         settings_text.push(Line::from(""));

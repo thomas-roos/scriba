@@ -1099,4 +1099,42 @@ impl Database {
 
         Ok(())
     }
+
+    /// Update transcript with diarization segments JSON.
+    pub fn update_transcript_segments(
+        &mut self,
+        recording_id: i64,
+        segments_json: &str,
+    ) -> Result<()> {
+        let sql = r#"
+            UPDATE transcripts SET
+                segments = ?1,
+                updated_at = ?2
+            WHERE recording_id = ?3
+        "#;
+
+        self.conn
+            .execute(sql, params![segments_json, Utc::now(), recording_id])?;
+
+        Ok(())
+    }
+
+    /// Update recording with speakers JSON.
+    pub fn update_recording_speakers(
+        &mut self,
+        recording_id: i64,
+        speakers_json: &str,
+    ) -> Result<()> {
+        let sql = r#"
+            UPDATE recordings SET
+                speakers = ?1,
+                updated_at = ?2
+            WHERE id = ?3
+        "#;
+
+        self.conn
+            .execute(sql, params![speakers_json, Utc::now(), recording_id])?;
+
+        Ok(())
+    }
 }

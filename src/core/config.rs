@@ -67,6 +67,9 @@ pub struct ScribaConfig {
     /// Silence auto-stop settings.
     #[serde(default)]
     pub silence_auto_stop: SilenceAutoStopConfig,
+    /// Speaker diarization settings.
+    #[serde(default)]
+    pub diarization: DiarizationConfig,
 }
 
 /// Configuration for silence-based auto-stop during recording.
@@ -120,6 +123,24 @@ impl Default for EnrichmentConfig {
     }
 }
 
+/// Configuration for speaker diarization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiarizationConfig {
+    /// Whether speaker diarization is enabled during transcription.
+    pub enabled: bool,
+    /// Maximum number of speakers to detect.
+    pub max_speakers: u32,
+}
+
+impl Default for DiarizationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_speakers: 6,
+        }
+    }
+}
+
 /// Audio recording settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioSettings {
@@ -144,6 +165,7 @@ impl Default for ScribaConfig {
             last_api_key: None,
             enrichment: EnrichmentConfig::default(),
             silence_auto_stop: SilenceAutoStopConfig::default(),
+            diarization: DiarizationConfig::default(),
         }
     }
 }

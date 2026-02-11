@@ -9,6 +9,7 @@
 
 pub mod audio;
 pub mod config;
+pub mod diarization;
 pub mod files;
 pub mod recording;
 pub mod transcription;
@@ -17,7 +18,7 @@ pub mod workflow;
 
 // Re-export commonly used types for convenience
 pub use audio::{AudioEncoder, AudioFormat, CompressionSettings};
-pub use config::{resolve_transcription_mode, EnrichmentConfig, LocalModelSize, ScribaConfig, SilenceAutoStopConfig, TranscriptionMode};
+pub use config::{resolve_transcription_mode, DiarizationConfig, EnrichmentConfig, LocalModelSize, ScribaConfig, SilenceAutoStopConfig, TranscriptionMode};
 pub use files::FileManager;
 pub use recording::{record_audio, AudioLevelMonitor, RecordOptions, RecordingResult};
 pub use transcription::{transcribe_audio, TranscriptionProgress};

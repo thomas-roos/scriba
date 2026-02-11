@@ -317,6 +317,55 @@ impl EnrichmentService {
         }
     }
 
+    /// Identify speakers in a diarized transcript using world context.
+    ///
+    /// Takes a diarized transcript with generic speaker labels and attempts
+    /// to resolve them to real names using conversational cues and the world.
+    pub async fn identify_speakers(
+        &self,
+        diarized_text: &str,
+        world_context: Option<&str>,
+        num_speakers: usize,
+    ) -> Result<std::collections::HashMap<String, Option<String>>> {
+        let prompt = prompts::build_speaker_identification_prompt(
+            diarized_text,
+            world_context,
+            num_speakers,
+        );
+
+        let response = self
+            .client
+            .generate(&prompt)
+            .await
+            .context("Failed to identify speakers")?;
+
+        let cleaned = response
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
+        // Parse the response — expected format: {"speakers": {"Speaker 0": "Name", ...}}
+        let parsed: serde_json::Value =
+            serde_json::from_str(cleaned).context("Failed to parse speaker identification JSON")?;
+
+        let mut result = std::collections::HashMap::new();
+
+        if let Some(speakers) = parsed.get("speakers").and_then(|s| s.as_object()) {
+            for (key, value) in speakers {
+                let resolved = if value.is_null() {
+                    None
+                } else {
+                    value.as_str().map(|s| s.to_string())
+                };
+                result.insert(key.clone(), resolved);
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Get the underlying Ollama client.
     pub fn client(&self) -> &OllamaClient {
         &self.client
