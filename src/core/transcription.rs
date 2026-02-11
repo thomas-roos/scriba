@@ -17,7 +17,7 @@ use tokio::time::sleep;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use super::config::{DiarizationConfig, LocalModelSize, ScribaConfig, TranscriptionMode};
-use super::diarization::{self, DiarizedTranscript, TimedSegment};
+use super::diarization::{self, DiarizedTranscript, TimedSegment, ensure_diarization_models};
 use super::files::FileManager;
 use crate::database::Database;
 use crate::enrichment::{WorldContext, WorldData};
@@ -823,8 +823,12 @@ pub async fn transcribe_audio(
                     println!("Running speaker diarization...");
                 }
 
+                // Download diarization models (async-safe) before sync diarization
+                let diarization_models = ensure_diarization_models().await
+                    .context("Failed to download diarization models")?;
+
                 // Run diarization on the same WAV
-                match diarization::diarize_audio(&wav_path, max_speakers) {
+                match diarization::diarize_audio(&wav_path, max_speakers, &diarization_models) {
                     Ok(speaker_turns) => {
                         let merged = diarization::merge_segments(&timed_segments, &speaker_turns);
                         let transcript = diarization::build_diarized_transcript(merged);

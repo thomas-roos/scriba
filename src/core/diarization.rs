@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 
 use crate::utils::BASE_PATH;
 
+// Re-export model paths for external async download
+pub use self::models::{ensure_diarization_models, DiarizationModelPaths};
+
 /// A whisper segment with timestamp and text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimedSegment {
@@ -41,75 +44,108 @@ pub struct DiarizedTranscript {
     pub speakers: Vec<String>, // ordered list of speaker labels
 }
 
-/// Get the path to diarization models directory.
-fn models_dir() -> PathBuf {
-    BASE_PATH.join("models")
-}
+/// Model download and management (async-safe).
+mod models {
+    use super::*;
+    use futures_util::StreamExt;
+    use std::io::Write as _;
 
-/// Ensure the segmentation ONNX model is available, downloading if needed.
-fn ensure_segmentation_model() -> Result<PathBuf> {
-    let dir = models_dir();
-    std::fs::create_dir_all(&dir).ok();
-
-    let model_path = dir.join("segmentation-3.0.onnx");
-    if model_path.exists() {
-        return Ok(model_path);
+    /// Paths to the two ONNX models needed for diarization.
+    #[derive(Debug, Clone)]
+    pub struct DiarizationModelPaths {
+        pub segmentation: PathBuf,
+        pub embedding: PathBuf,
     }
 
-    let url = "https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.2.0/segmentation-3.0.onnx";
-    download_model_sync(url, &model_path)
-        .with_context(|| format!("Failed to download segmentation model from {}", url))?;
-
-    Ok(model_path)
-}
-
-/// Ensure the speaker embedding ONNX model is available, downloading if needed.
-fn ensure_embedding_model() -> Result<PathBuf> {
-    let dir = models_dir();
-    std::fs::create_dir_all(&dir).ok();
-
-    let model_path = dir.join("wespeaker_en_voxceleb_CAM++.onnx");
-    if model_path.exists() {
-        return Ok(model_path);
+    /// Get the path to diarization models directory.
+    fn models_dir() -> PathBuf {
+        BASE_PATH.join("models")
     }
 
-    let url = "https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.2.0/wespeaker_en_voxceleb_CAM++.onnx";
-    download_model_sync(url, &model_path)
-        .with_context(|| format!("Failed to download embedding model from {}", url))?;
+    /// Ensure both diarization models are downloaded (async-safe).
+    ///
+    /// Must be called from an async context before `diarize_audio()`.
+    pub async fn ensure_diarization_models() -> Result<DiarizationModelPaths> {
+        let dir = models_dir();
+        std::fs::create_dir_all(&dir).ok();
 
-    Ok(model_path)
-}
+        let seg_path = dir.join("segmentation-3.0.onnx");
+        if !seg_path.exists() {
+            let url = "https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.2.0/segmentation-3.0.onnx";
+            download_model_async(url, &seg_path).await
+                .with_context(|| format!("Failed to download segmentation model from {}", url))?;
+        }
 
-/// Download a file synchronously (blocking).
-fn download_model_sync(url: &str, dest: &Path) -> Result<()> {
-    let resp = reqwest::blocking::get(url)
-        .with_context(|| format!("Failed to fetch {}", url))?
-        .error_for_status()
-        .with_context(|| format!("HTTP error downloading {}", url))?;
+        let emb_path = dir.join("wespeaker_en_voxceleb_CAM++.onnx");
+        if !emb_path.exists() {
+            let url = "https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.2.0/wespeaker_en_voxceleb_CAM++.onnx";
+            download_model_async(url, &emb_path).await
+                .with_context(|| format!("Failed to download embedding model from {}", url))?;
+        }
 
-    let bytes = resp.bytes().context("Failed to read response body")?;
-    std::fs::write(dest, &bytes).with_context(|| {
-        format!("Failed to write model to {}", dest.display())
-    })?;
+        Ok(DiarizationModelPaths {
+            segmentation: seg_path,
+            embedding: emb_path,
+        })
+    }
 
-    Ok(())
+    /// Download a file using async reqwest (safe inside tokio runtime).
+    async fn download_model_async(url: &str, dest: &Path) -> Result<()> {
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("Failed to fetch {}", url))?
+            .error_for_status()
+            .with_context(|| format!("HTTP error downloading {}", url))?;
+
+        let total = resp.content_length();
+        let mut stream = resp.bytes_stream();
+        let mut file = std::fs::File::create(dest)
+            .with_context(|| format!("Failed to create {}", dest.display()))?;
+        let mut downloaded: u64 = 0;
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("Error reading download stream")?;
+            std::io::Write::write_all(&mut file, &chunk)
+                .context("Failed to write model data")?;
+            downloaded += chunk.len() as u64;
+            if let Some(total) = total {
+                if downloaded % (5 * 1024 * 1024) < chunk.len() as u64 {
+                    let pct = (downloaded as f64 / total as f64) * 100.0;
+                    eprint!("\rDownloading diarization model... {:.1}%", pct);
+                    let _ = std::io::stderr().flush();
+                }
+            }
+        }
+        if total.is_some() {
+            eprintln!();
+        }
+
+        Ok(())
+    }
 }
 
 /// Run speaker diarization on a 16kHz mono WAV file.
 ///
+/// Model paths must be provided (use `ensure_diarization_models()` from async
+/// code to download them before calling this sync function).
+///
 /// Returns a list of speaker turns with timestamps and speaker indices.
-pub fn diarize_audio(wav_path: &Path, max_speakers: usize) -> Result<Vec<SpeakerTurn>> {
-    let seg_model = ensure_segmentation_model()?;
-    let emb_model = ensure_embedding_model()?;
-
+pub fn diarize_audio(
+    wav_path: &Path,
+    max_speakers: usize,
+    model_paths: &DiarizationModelPaths,
+) -> Result<Vec<SpeakerTurn>> {
     let wav_str = wav_path.to_string_lossy();
     let (samples, sample_rate) = pyannote_rs::read_wav(&wav_str)
         .map_err(|e| anyhow::anyhow!("Failed to read WAV file for diarization: {}", e))?;
 
-    let segments = pyannote_rs::get_segments(&samples, sample_rate, &seg_model)
+    let segments = pyannote_rs::get_segments(&samples, sample_rate, &model_paths.segmentation)
         .map_err(|e| anyhow::anyhow!("Failed to run segmentation model: {}", e))?;
 
-    let mut extractor = pyannote_rs::EmbeddingExtractor::new(&emb_model)
+    let mut extractor = pyannote_rs::EmbeddingExtractor::new(&model_paths.embedding)
         .map_err(|e| anyhow::anyhow!("Failed to load speaker embedding model: {}", e))?;
     let mut manager = pyannote_rs::EmbeddingManager::new(max_speakers);
 

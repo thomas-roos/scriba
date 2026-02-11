@@ -114,9 +114,15 @@ impl EnrichmentService {
             .await
             .context("Failed to generate extraction")?;
 
-        // Parse the JSON response
+        let cleaned = response
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
         let result: ExtractionResult =
-            serde_json::from_str(&response).context("Failed to parse extraction result")?;
+            serde_json::from_str(cleaned).context("Failed to parse extraction result")?;
 
         Ok(result)
     }
@@ -142,8 +148,15 @@ impl EnrichmentService {
             .await
             .context("Failed to update entity context")?;
 
+        let cleaned = response
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
         let result: ContextUpdateResult =
-            serde_json::from_str(&response).context("Failed to parse context update result")?;
+            serde_json::from_str(cleaned).context("Failed to parse context update result")?;
 
         Ok(result)
     }
@@ -167,9 +180,16 @@ impl EnrichmentService {
             .await
             .context("Failed to generate full-context extraction")?;
 
-        // Parse the JSON response
+        // Clean up LLM response — strip markdown fences if present
+        let cleaned = response
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
         let result: ExtractionResult =
-            serde_json::from_str(&response).context("Failed to parse extraction result")?;
+            serde_json::from_str(cleaned).context("Failed to parse extraction result")?;
 
         Ok(result)
     }
@@ -247,8 +267,14 @@ impl EnrichmentService {
             .await
             .context("Failed to extract entities from world description")?;
 
-        // Parse the JSON response
-        let result: WorldEntityExtractionResult = serde_json::from_str(&response)
+        let cleaned = response
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
+        let result: WorldEntityExtractionResult = serde_json::from_str(cleaned)
             .context("Failed to parse world entity extraction result")?;
 
         Ok(result)
