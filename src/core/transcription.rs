@@ -544,6 +544,9 @@ fn run_whisper_transcription(model_path: &Path, wav_path: &Path) -> Result<Strin
     params.set_single_segment(false);
     params.set_n_threads(num_cpus::get() as i32);
 
+    // Force English output: translates any language to English
+    params.set_language(Some("en"));
+    params.set_translate(true);
     // Anti-hallucination: skip segments that look like no speech
     params.set_no_speech_thold(0.6);
     // Anti-repetition: skip segments with low entropy (repetitive output)
