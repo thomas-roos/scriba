@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-use super::config::{LocalModelSize, ScribaConfig, TranscriptionMode};
+use super::config::{DiarizationConfig, LocalModelSize, ScribaConfig, TranscriptionMode};
+use super::diarization::{self, DiarizedTranscript, TimedSegment, ensure_diarization_models};
 use super::files::FileManager;
 use crate::database::Database;
 use crate::enrichment::{WorldContext, WorldData};
@@ -110,10 +111,14 @@ impl Default for TranscriptionProgress {
 }
 
 /// Persist transcript to file and update database.
+///
+/// When `diarized` is provided, also saves the diarization segments and speakers
+/// to the database.
 fn save_transcript_to_files_and_db(
     audio_path: &Path,
     transcript_text: &str,
     model_used: &str,
+    diarized: Option<&DiarizedTranscript>,
 ) -> Result<()> {
     let audio_dir = audio_path
         .parent()
@@ -140,6 +145,16 @@ fn save_transcript_to_files_and_db(
                 true,
                 model_used,
             );
+
+            // Save diarization data if available
+            if let Some(diarized) = diarized {
+                if let Ok(segments_json) = serde_json::to_string(&diarized.segments) {
+                    let _ = db.update_transcript_segments(recording_id, &segments_json);
+                }
+                if let Ok(speakers_json) = serde_json::to_string(&diarized.speakers) {
+                    let _ = db.update_recording_speakers(recording_id, &speakers_json);
+                }
+            }
         }
     }
 
@@ -568,6 +583,105 @@ fn run_whisper_transcription(model_path: &Path, wav_path: &Path) -> Result<Strin
     Ok(text)
 }
 
+/// Run whisper transcription and return both concatenated text and timed segments.
+fn run_whisper_transcription_with_segments(
+    model_path: &Path,
+    wav_path: &Path,
+) -> Result<(String, Vec<TimedSegment>)> {
+    if !model_path.exists() {
+        return Err(anyhow::anyhow!(
+            "Whisper model file not found: {}",
+            model_path.display()
+        ));
+    }
+    if !wav_path.exists() {
+        return Err(anyhow::anyhow!(
+            "Audio file not found: {}",
+            wav_path.display()
+        ));
+    }
+
+    let params_ctx = WhisperContextParameters::default();
+    let model_path_str = model_path.to_string_lossy();
+    let ctx = WhisperContext::new_with_params(&model_path_str, params_ctx).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to load Whisper model '{}': {}",
+            model_path.display(),
+            e
+        )
+    })?;
+
+    let mut state = ctx.create_state().with_context(|| {
+        format!(
+            "Failed to create Whisper state for model: {}",
+            model_path.display()
+        )
+    })?;
+
+    let mut reader = hound::WavReader::open(wav_path)
+        .context("Failed to open normalized WAV for transcription")?;
+    let spec = reader.spec();
+
+    let mut samples_f32: Vec<f32> = Vec::new();
+    match spec.sample_format {
+        hound::SampleFormat::Float => {
+            for s in reader.samples::<f32>() {
+                samples_f32.push(s.unwrap_or(0.0));
+            }
+        }
+        hound::SampleFormat::Int => {
+            let max = (1i64 << (spec.bits_per_sample as i64 - 1)) as f32;
+            for s in reader.samples::<i32>() {
+                let v = s.unwrap_or(0) as f32 / max;
+                samples_f32.push(v);
+            }
+        }
+    }
+
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_print_progress(false);
+    params.set_print_special(false);
+    params.set_print_timestamps(false);
+    params.set_single_segment(false);
+    params.set_n_threads(num_cpus::get() as i32);
+
+    if let Some(world_prompt) = build_whisper_world_prompt() {
+        params.set_initial_prompt(&world_prompt);
+    }
+
+    state
+        .full(params, &samples_f32)
+        .context("Whisper full() failed")?;
+
+    let num_segments = state.full_n_segments();
+    let mut text = String::new();
+    let mut timed_segments = Vec::new();
+
+    for i in 0..num_segments {
+        if let Some(seg) = state.get_segment(i) {
+            if let Ok(segment_text) = seg.to_str() {
+                let trimmed = segment_text.trim();
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(trimmed);
+
+                // Timestamps are in centiseconds (10ms units)
+                let start = seg.start_timestamp() as f64 / 100.0;
+                let end = seg.end_timestamp() as f64 / 100.0;
+
+                timed_segments.push(TimedSegment {
+                    start,
+                    end,
+                    text: trimmed.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok((text, timed_segments))
+}
+
 async fn transcribe_with_openai_api(audio_path: &PathBuf, api_key: &str) -> Result<String> {
     let audio_file = std::fs::read(audio_path).context("Unable to read audio file")?;
 
@@ -620,10 +734,14 @@ async fn transcribe_with_openai_api(audio_path: &PathBuf, api_key: &str) -> Resu
 }
 
 /// Unified transcription function.
+///
+/// When `diarization` is Some and enabled, runs speaker diarization alongside
+/// transcription and produces speaker-labeled output.
 pub async fn transcribe_audio(
     input_path: &PathBuf,
     mode_override: Option<TranscriptionMode>,
     verbose: bool,
+    diarization: Option<&DiarizationConfig>,
 ) -> Result<()> {
     if !verbose {
         ensure_whisper_logs_suppressed();
@@ -650,7 +768,12 @@ pub async fn transcribe_audio(
         println!("\n{}\n", mode_description);
     }
 
-    let (transcription_text, model_used) = match transcription_mode {
+    let diarize = diarization
+        .map(|d| d.enabled)
+        .unwrap_or(false);
+
+    // Transcription result: text, model name, optional diarized transcript
+    let (transcription_text, model_used, diarized) = match transcription_mode {
         TranscriptionMode::Local { model_size } => {
             let progress_task = if verbose {
                 let mut local_progress = progress;
@@ -678,8 +801,61 @@ pub async fn transcribe_audio(
                     .context("Model download timed out after 5 minutes")?
                     .context("Failed to download model")?
             };
-            let result = run_whisper_transcription(&model_path, &wav_path)
-                .context("Local Whisper transcription failed")?;
+
+            let (text, diarized_transcript) = if diarize {
+                let max_speakers = diarization
+                    .map(|d| d.max_speakers as usize)
+                    .unwrap_or(6);
+
+                // Transcribe with segments
+                let (text, timed_segments) =
+                    run_whisper_transcription_with_segments(&model_path, &wav_path)
+                        .context("Local Whisper transcription failed")?;
+
+                if let Some(task) = &progress_task {
+                    task.abort();
+                }
+
+                if verbose {
+                    print!("\r{}", " ".repeat(80));
+                    print!("\r");
+                    stdout().flush().unwrap();
+                    println!("Running speaker diarization...");
+                }
+
+                // Download diarization models (async-safe) before sync diarization
+                let diarization_models = ensure_diarization_models().await
+                    .context("Failed to download diarization models")?;
+
+                // Run diarization on the same WAV
+                match diarization::diarize_audio(&wav_path, max_speakers, &diarization_models) {
+                    Ok(speaker_turns) => {
+                        let merged = diarization::merge_segments(&timed_segments, &speaker_turns);
+                        let transcript = diarization::build_diarized_transcript(merged);
+                        let labeled_text = diarization::format_diarized_text(&transcript);
+
+                        if verbose {
+                            println!(
+                                "Diarization complete: {} speakers detected",
+                                transcript.speakers.len()
+                            );
+                        }
+
+                        (labeled_text, Some(transcript))
+                    }
+                    Err(e) => {
+                        if verbose {
+                            eprintln!("Diarization failed (falling back to plain transcript): {}", e);
+                        }
+                        (text, None)
+                    }
+                }
+            } else {
+                let text = run_whisper_transcription(&model_path, &wav_path)
+                    .context("Local Whisper transcription failed")?;
+                (text, None)
+            };
+
             if wav_path.file_name() == Some(std::ffi::OsStr::new("_tmp_whisper_16k.wav")) {
                 let _ = std::fs::remove_file(&wav_path);
             }
@@ -687,7 +863,7 @@ pub async fn transcribe_audio(
                 task.abort();
             }
             let model_name = format!("whisper-{}", model_size);
-            (result, model_name)
+            (text, model_name, diarized_transcript)
         }
         TranscriptionMode::Api { api_key } => {
             let progress_task = if verbose {
@@ -714,7 +890,8 @@ pub async fn transcribe_audio(
             if let Some(task) = progress_task {
                 task.abort();
             }
-            (result, "whisper-1".to_string())
+            // API mode doesn't support diarization
+            (result, "whisper-1".to_string(), None)
         }
     };
 
@@ -722,10 +899,15 @@ pub async fn transcribe_audio(
         print!("\r{}", " ".repeat(80));
         print!("\r");
         stdout().flush().unwrap();
-        println!("✨ Transcription complete! ✨");
+        println!("Transcription complete!");
     }
 
-    save_transcript_to_files_and_db(&audio_file_path, &transcription_text, &model_used)?;
+    save_transcript_to_files_and_db(
+        &audio_file_path,
+        &transcription_text,
+        &model_used,
+        diarized.as_ref(),
+    )?;
 
     if verbose {
         let transcript_file_path = audio_file_path
@@ -733,7 +915,7 @@ pub async fn transcribe_audio(
             .context("Could not determine audio file directory")?
             .join("transcript.txt");
         println!(
-            "\n📁 Transcript saved to: {}",
+            "\nTranscript saved to: {}",
             transcript_file_path.display()
         );
     }
