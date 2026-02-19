@@ -1,3 +1,78 @@
+Scriba 0.19.0 — Ask Scriba
+
+Highlights
+
+- **Ask Scriba chat panel**: Interactive chat panel in the TUI — ask questions about your recordings or your world context. Streaming markdown responses with syntax highlighting, text selection, and auto-copy.
+- **Multi-provider LLM support**: Choose between Ollama (local), Anthropic (Claude), OpenAI (GPT), or Google (Gemini) for both enrichment and chat. Configure via `scriba config` or TUI settings.
+- **Web search integration**: Scriba can search the web (DuckDuckGo) during enrichment to verify and enrich entity information.
+- **Chat panel polish**: Headings render cleanly (no `#` symbols), scrollbar thumb is stable, and completed messages are cached for smooth 60fps scrolling.
+
+Changelog
+
+- feat(tui): Ask Scriba chat panel with streaming responses, markdown rendering, and text selection
+- feat(enrichment): add Anthropic, OpenAI, and Google Gemini LLM provider clients
+- feat(enrichment): common `LlmProvider` trait for unified multi-provider access
+- feat(enrichment): DuckDuckGo web search for entity verification during enrichment
+- feat(enrichment): chat system prompts with world context and recording-specific modes
+- feat(tui): strip heading `#` prefix spans from tui_markdown output
+- feat(tui): fix scrollbar wiggle by removing begin/end arrow symbols
+- perf(tui): cache completed-message rendering — only visible lines cloned per frame
+- feat(config): `EnrichmentMode` enum (Local/Cloud) with automatic migration from legacy Ollama fields
+- feat(config): `search_enabled`, `max_search_results`, `evolve_world` settings
+
+Migration
+
+- Seamless upgrade: all new config fields use `#[serde(default)]`. Existing configs load unchanged.
+- Legacy `ollama_endpoint`/`ollama_model` fields automatically migrate to `EnrichmentMode::Local`.
+- No database schema changes — existing recordings and entities are untouched.
+
+---
+
+Scriba 0.18.0 — Speaker Diarization
+
+Highlights
+
+- **Speaker diarization**: Automatically identify and label different speakers in recordings using pyannote-rs (ONNX). After transcription, an LLM pass maps speaker labels to real names from your world context.
+- **Async model download**: Diarization ONNX models (~200MB) download automatically on first use without blocking the UI.
+
+Changelog
+
+- feat(core): speaker diarization with pyannote-rs and ONNX runtime
+- feat(core): LLM-powered speaker identification using world context
+- fix: async diarization model download + strip markdown fences in LLM parsing
+
+---
+
+Scriba 0.17.0 — TUI Settings & Silence Auto-Stop
+
+Highlights
+
+- **TUI Ollama settings**: Manage Ollama endpoint and model directly from the TUI Settings view — no manual config editing needed.
+- **Silence auto-stop**: Recordings automatically stop after a configurable period of silence (default: 60s). Detects laptop lid close and stale audio callbacks.
+
+Changelog
+
+- feat(tui): manage Ollama settings from TUI Settings view
+- feat(core): silence auto-stop with configurable timeout
+- fix: detect stale audio callback for lid-close auto-stop
+- fix: raise silence threshold to 0.005 for reliable lid-close detection
+
+---
+
+Scriba 0.16.0 — Whisper World Prompt
+
+Highlights
+
+- **Whisper world prompt**: Whisper transcription now receives a prompt built from your world context — names of people, organizations, and projects you've mentioned before. This dramatically improves recognition of proper nouns and domain-specific terms.
+- **Entity quality fixes**: Better deduplication and alias handling during extraction.
+
+Changelog
+
+- feat(core): build Whisper prompt from world context for better proper noun recognition
+- fix: entity quality improvements and smooth setup for new/existing users
+
+---
+
 Scriba 0.15.2 — Context Compaction
 
 Highlights
