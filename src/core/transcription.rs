@@ -36,7 +36,7 @@ unsafe extern "C" fn discard_whisper_log(_level: i32, _text: *const c_char, _ud:
     // intentionally no-op to keep TUI clean
 }
 
-fn ensure_whisper_logs_suppressed() {
+pub(crate) fn ensure_whisper_logs_suppressed() {
     INIT_WHISPER_LOG.call_once(|| unsafe {
         whisper_log_set(Some(discard_whisper_log), std::ptr::null_mut());
     });
@@ -229,7 +229,7 @@ async fn download_model_with_timeout(model_size: LocalModelSize) -> Result<PathB
     ensure_model_path_local(model_size, true).await
 }
 
-async fn ensure_model_path_local(size: LocalModelSize, quiet: bool) -> Result<PathBuf> {
+pub(crate) async fn ensure_model_path_local(size: LocalModelSize, quiet: bool) -> Result<PathBuf> {
     let models_dir = BASE_PATH.join("models");
     std::fs::create_dir_all(&models_dir).ok();
 

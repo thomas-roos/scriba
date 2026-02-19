@@ -70,6 +70,30 @@ pub struct ScribaConfig {
     /// Speaker diarization settings.
     #[serde(default)]
     pub diarization: DiarizationConfig,
+    /// Voice-activated recording ("Scriba Forever") settings.
+    #[serde(default)]
+    pub voice: VoiceConfig,
+}
+
+/// Configuration for voice-activated recording ("Scriba Forever" mode).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceConfig {
+    /// Whether voice-activated recording mode is enabled.
+    pub enabled: bool,
+    /// RMS threshold for speech detection (VAD).
+    pub vad_threshold: f32,
+    /// Seconds of audio to keep in the rolling pre-buffer.
+    pub pre_buffer_seconds: f32,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            vad_threshold: 0.01,
+            pre_buffer_seconds: 3.0,
+        }
+    }
 }
 
 /// Configuration for silence-based auto-stop during recording.
@@ -90,35 +114,245 @@ impl Default for SilenceAutoStopConfig {
     }
 }
 
+/// Cloud LLM provider for enrichment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CloudProvider {
+    Anthropic,
+    OpenAI,
+    Google,
+}
+
+impl std::fmt::Display for CloudProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CloudProvider::Anthropic => write!(f, "anthropic"),
+            CloudProvider::OpenAI => write!(f, "openai"),
+            CloudProvider::Google => write!(f, "google"),
+        }
+    }
+}
+
+impl std::str::FromStr for CloudProvider {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "anthropic" | "claude" => Ok(CloudProvider::Anthropic),
+            "openai" | "gpt" => Ok(CloudProvider::OpenAI),
+            "google" | "gemini" => Ok(CloudProvider::Google),
+            _ => Err(anyhow::anyhow!("Invalid cloud provider: {}. Use: anthropic, openai, google", s)),
+        }
+    }
+}
+
+impl CloudProvider {
+    /// Default model for this provider.
+    pub fn default_model(&self) -> &str {
+        match self {
+            CloudProvider::Anthropic => "claude-sonnet-4-5-20250929",
+            CloudProvider::OpenAI => "gpt-4o",
+            CloudProvider::Google => "gemini-2.0-flash",
+        }
+    }
+
+    /// Display name for UI.
+    pub fn display_name(&self) -> &str {
+        match self {
+            CloudProvider::Anthropic => "Anthropic (Claude)",
+            CloudProvider::OpenAI => "OpenAI (GPT)",
+            CloudProvider::Google => "Google (Gemini)",
+        }
+    }
+
+    /// Env var name for this provider's API key.
+    pub fn env_var_name(&self) -> &str {
+        match self {
+            CloudProvider::Anthropic => "ANTHROPIC_API_KEY",
+            CloudProvider::OpenAI => "OPENAI_API_KEY",
+            CloudProvider::Google => "GOOGLE_API_KEY",
+        }
+    }
+}
+
+/// Enrichment mode configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EnrichmentMode {
+    Cloud {
+        provider: CloudProvider,
+        api_key: String,
+        /// None = use provider default model.
+        #[serde(default)]
+        model: Option<String>,
+    },
+    Local {
+        ollama_endpoint: String,
+        ollama_model: String,
+    },
+}
+
+impl Default for EnrichmentMode {
+    fn default() -> Self {
+        EnrichmentMode::Cloud {
+            provider: CloudProvider::Anthropic,
+            api_key: String::new(),
+            model: None,
+        }
+    }
+}
+
 /// Configuration for knowledge extraction and enrichment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrichmentConfig {
     /// Whether automatic enrichment is enabled after transcription.
     pub enabled: bool,
-    /// Ollama API endpoint URL.
-    pub ollama_endpoint: String,
-    /// Ollama model to use for extraction.
-    pub ollama_model: String,
+    /// Enrichment provider mode.
+    #[serde(default)]
+    pub mode: EnrichmentMode,
+
+    // Legacy fields — used only for migration from old config format.
+    // Kept with serde(default) so old configs deserialize, then converted to EnrichmentMode::Local.
+    #[serde(default, skip_serializing)]
+    ollama_endpoint: Option<String>,
+    #[serde(default, skip_serializing)]
+    ollama_model: Option<String>,
+
     /// Confidence threshold for automatic entity linking (0.0-1.0).
     pub auto_link_threshold: f32,
     /// Whether to evolve the world description after each enrichment.
-    /// The world is Scriba's evolving understanding of its owner.
     #[serde(default = "default_evolve_world")]
     pub evolve_world: bool,
+    /// Whether to search the web for unresolved entities.
+    #[serde(default = "default_search_enabled")]
+    pub search_enabled: bool,
+    /// Maximum number of web search results per unresolved entity.
+    #[serde(default = "default_max_search_results")]
+    pub max_search_results: usize,
 }
 
 fn default_evolve_world() -> bool {
     true
 }
 
+fn default_search_enabled() -> bool {
+    true
+}
+
+fn default_max_search_results() -> usize {
+    3
+}
+
 impl Default for EnrichmentConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            ollama_endpoint: "http://localhost:11434".to_string(),
-            ollama_model: "mistral:latest".to_string(),
+            mode: EnrichmentMode::default(),
+            ollama_endpoint: None,
+            ollama_model: None,
             auto_link_threshold: 0.8,
             evolve_world: true,
+            search_enabled: true,
+            max_search_results: 3,
+        }
+    }
+}
+
+impl EnrichmentConfig {
+    /// Migrate legacy config fields to the new mode format.
+    /// Called after deserialization.
+    pub fn migrate_legacy(&mut self) {
+        // If legacy fields are present and mode is the default Cloud with empty key,
+        // this was an old config — convert to Local mode.
+        if let Some(endpoint) = self.ollama_endpoint.take() {
+            let model = self.ollama_model.take().unwrap_or_else(|| "mistral:latest".to_string());
+            // Only migrate if mode looks like the default (empty cloud key)
+            if matches!(&self.mode, EnrichmentMode::Cloud { api_key, .. } if api_key.is_empty()) {
+                self.mode = EnrichmentMode::Local {
+                    ollama_endpoint: endpoint,
+                    ollama_model: model,
+                };
+            }
+        }
+    }
+
+    /// Get the provider display name.
+    pub fn provider_display_name(&self) -> &str {
+        match &self.mode {
+            EnrichmentMode::Cloud { provider, .. } => provider.display_name(),
+            EnrichmentMode::Local { .. } => "Ollama (Local)",
+        }
+    }
+
+    /// Whether the current mode needs an API key.
+    pub fn needs_api_key(&self) -> bool {
+        matches!(&self.mode, EnrichmentMode::Cloud { .. })
+    }
+
+    /// Get the API key if in cloud mode.
+    pub fn api_key(&self) -> Option<&str> {
+        match &self.mode {
+            EnrichmentMode::Cloud { api_key, .. } if !api_key.is_empty() => Some(api_key),
+            _ => None,
+        }
+    }
+
+    /// Resolve the effective API key: config value > env var.
+    pub fn resolve_api_key(&self) -> Option<String> {
+        match &self.mode {
+            EnrichmentMode::Cloud { provider, api_key, .. } => {
+                if !api_key.is_empty() {
+                    return Some(api_key.clone());
+                }
+                // Fallback to env var
+                std::env::var(provider.env_var_name()).ok()
+            }
+            EnrichmentMode::Local { .. } => None,
+        }
+    }
+
+    /// Get the model name in use (explicit or provider default).
+    pub fn model_name(&self) -> &str {
+        match &self.mode {
+            EnrichmentMode::Cloud { provider, model, .. } => {
+                model.as_deref().unwrap_or_else(|| provider.default_model())
+            }
+            EnrichmentMode::Local { ollama_model, .. } => ollama_model,
+        }
+    }
+
+    /// Whether the mode is local (Ollama).
+    pub fn is_local(&self) -> bool {
+        matches!(&self.mode, EnrichmentMode::Local { .. })
+    }
+
+    /// Get the Ollama endpoint (only meaningful in Local mode).
+    /// Returns a default if not in Local mode.
+    pub fn ollama_endpoint(&self) -> String {
+        match &self.mode {
+            EnrichmentMode::Local { ollama_endpoint, .. } => ollama_endpoint.clone(),
+            _ => "http://localhost:11434".to_string(),
+        }
+    }
+
+    /// Get the Ollama model (only meaningful in Local mode).
+    /// Returns a default if not in Local mode.
+    pub fn ollama_model(&self) -> String {
+        match &self.mode {
+            EnrichmentMode::Local { ollama_model, .. } => ollama_model.clone(),
+            _ => "mistral:latest".to_string(),
+        }
+    }
+
+    /// Set the Ollama model (only effective in Local mode).
+    pub fn set_ollama_model(&mut self, model: String) {
+        if let EnrichmentMode::Local { ollama_model, .. } = &mut self.mode {
+            *ollama_model = model;
+        }
+    }
+
+    /// Set the Ollama endpoint (only effective in Local mode).
+    pub fn set_ollama_endpoint(&mut self, endpoint: String) {
+        if let EnrichmentMode::Local { ollama_endpoint, .. } = &mut self.mode {
+            *ollama_endpoint = endpoint;
         }
     }
 }
@@ -166,6 +400,7 @@ impl Default for ScribaConfig {
             enrichment: EnrichmentConfig::default(),
             silence_auto_stop: SilenceAutoStopConfig::default(),
             diarization: DiarizationConfig::default(),
+            voice: VoiceConfig::default(),
         }
     }
 }
@@ -190,7 +425,10 @@ impl ScribaConfig {
         }
 
         let content = fs::read_to_string(&config_path).context("Failed to read config file")?;
-        let config: Self = serde_json::from_str(&content).context("Failed to parse config file")?;
+        let mut config: Self = serde_json::from_str(&content).context("Failed to parse config file")?;
+
+        // Migrate legacy enrichment config (ollama_endpoint/ollama_model fields → EnrichmentMode::Local)
+        config.enrichment.migrate_legacy();
 
         Ok(config)
     }

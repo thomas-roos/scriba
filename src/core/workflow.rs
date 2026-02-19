@@ -306,15 +306,15 @@ impl WorkflowManager {
             return Ok(());
         }
 
-        // Create enrichment service
-        let service = EnrichmentService::new(&config.ollama_endpoint, &config.ollama_model);
+        // Create enrichment service from config
+        let service = EnrichmentService::from_config(config);
 
-        // Check if Ollama is available
+        // Check if the enrichment provider is available
         if let Err(e) = service.health_check().await {
             return Err(anyhow::anyhow!(
-                "Ollama not available for enrichment: {}. Make sure Ollama is running with model '{}'.",
+                "Enrichment provider ({}) not available: {}",
+                service.provider_display_name(),
                 e,
-                config.ollama_model
             ));
         }
 
@@ -342,13 +342,50 @@ impl WorkflowManager {
         };
 
         // Extract metadata with world context — the LLM resolves entities inline
-        let extraction = service
+        let mut extraction = service
             .extract_with_full_context(
                 &transcript_content,
                 world_content.as_deref(),
             )
             .await
             .context("Failed to extract metadata from transcript")?;
+
+        // Web search verification for unresolved entities
+        if config.search_enabled {
+            let has_unresolved = extraction.people.iter().any(|e| e.resolved_to.is_none())
+                || extraction.organizations.iter().any(|e| e.resolved_to.is_none());
+
+            if has_unresolved {
+                if verbose {
+                    println!("  🔍 Searching web for unresolved entities...");
+                }
+
+                let search_results = crate::enrichment::search::search_unresolved_entities(
+                    &extraction,
+                    config.max_search_results,
+                )
+                .await;
+
+                if !search_results.is_empty() {
+                    // Build world summary for the resolution prompt
+                    let world_summary = world
+                        .parsed()
+                        .map(|d| d.entities_summary())
+                        .unwrap_or_default();
+
+                    let resolutions = service
+                        .resolve_with_search(&search_results, &world_summary)
+                        .await;
+
+                    if !resolutions.is_empty() {
+                        let resolved_count = apply_search_resolutions(&mut extraction, &resolutions);
+                        if verbose && resolved_count > 0 {
+                            println!("  ✅ Search resolved {} entities", resolved_count);
+                        }
+                    }
+                }
+            }
+        }
 
         // Replace transcript spellings with canonical names everywhere
         let mut title = extraction.title.clone();
@@ -797,13 +834,13 @@ impl WorkflowManager {
             );
         }
 
-        // Check enrichment/Ollama availability
+        // Check enrichment provider availability
         if self.config.enrichment.enabled {
             // We can't await here since health_check is not async, so we just note the config
             warnings.push(format!(
-                "Enrichment enabled - requires Ollama at {} with model '{}'",
-                self.config.enrichment.ollama_endpoint,
-                self.config.enrichment.ollama_model
+                "Enrichment enabled - provider: {}, model: '{}'",
+                self.config.enrichment.provider_display_name(),
+                self.config.enrichment.model_name()
             ));
         }
 
@@ -1060,6 +1097,37 @@ async fn compact_or_append(
     }
 }
 
+/// Apply search resolutions to an extraction result.
+///
+/// For each entity in the extraction whose name matches a key in `resolutions`,
+/// sets its `resolved_to` to the resolved value. Returns the count of entities updated.
+fn apply_search_resolutions(
+    extraction: &mut crate::enrichment::ExtractionResult,
+    resolutions: &std::collections::HashMap<String, Option<String>>,
+) -> usize {
+    let mut count = 0;
+
+    for entity in &mut extraction.people {
+        if let Some(resolved) = resolutions.get(&entity.name) {
+            if resolved.is_some() {
+                entity.resolved_to = resolved.clone();
+                count += 1;
+            }
+        }
+    }
+
+    for entity in &mut extraction.organizations {
+        if let Some(resolved) = resolutions.get(&entity.name) {
+            if resolved.is_some() {
+                entity.resolved_to = resolved.clone();
+                count += 1;
+            }
+        }
+    }
+
+    count
+}
+
 /// Initialize a world from seed content (used by both CLI and TUI onboarding).
 ///
 /// Does: health check → extract_world_seed → save world.md → extract_world_entities → create entities.
@@ -1069,12 +1137,9 @@ pub async fn initialize_world_from_seed(
     config: &ScribaConfig,
     seed_content: &str,
 ) -> Result<Option<(WorldData, WorldEntityExtractionResult)>> {
-    let service = EnrichmentService::new(
-        &config.enrichment.ollama_endpoint,
-        &config.enrichment.ollama_model,
-    );
+    let service = EnrichmentService::from_config(&config.enrichment);
 
-    // Check Ollama availability
+    // Check provider availability
     if service.health_check().await.is_err() {
         // Save raw seed as world.md and return None
         WorldContext::initialize(seed_content)?;

@@ -107,6 +107,58 @@ impl WorldData {
     }
 
 
+    /// Produce a compact summary of all known entity names and aliases.
+    ///
+    /// Used in the search resolution prompt so the LLM can cross-reference
+    /// search results against the world without needing the full JSON.
+    pub fn entities_summary(&self) -> String {
+        let mut lines = Vec::new();
+
+        // Owner
+        if !self.owner.name.is_empty() {
+            let aliases = if self.owner.aliases.is_empty() {
+                String::new()
+            } else {
+                format!(" (aliases: {})", self.owner.aliases.join(", "))
+            };
+            lines.push(format!("Owner: {}{}", self.owner.name, aliases));
+        }
+
+        // People
+        let people_parts: Vec<String> = self
+            .people
+            .iter()
+            .map(|p| {
+                if p.aliases.is_empty() {
+                    p.name.clone()
+                } else {
+                    format!("{} (aliases: {})", p.name, p.aliases.join(", "))
+                }
+            })
+            .collect();
+        if !people_parts.is_empty() {
+            lines.push(format!("People: {}", people_parts.join(", ")));
+        }
+
+        // Organizations
+        let org_parts: Vec<String> = self
+            .organizations
+            .iter()
+            .map(|o| {
+                if o.aliases.is_empty() {
+                    o.name.clone()
+                } else {
+                    format!("{} (aliases: {})", o.name, o.aliases.join(", "))
+                }
+            })
+            .collect();
+        if !org_parts.is_empty() {
+            lines.push(format!("Organizations: {}", org_parts.join(", ")));
+        }
+
+        lines.join("\n")
+    }
+
     /// Merge changes into this world data.
     ///
     /// This is conservative: it only adds new items and updates existing ones.
@@ -590,5 +642,39 @@ mod tests {
         };
         let parsed = world.parsed().unwrap();
         assert_eq!(parsed.owner.name, "Giovanni");
+    }
+
+    #[test]
+    fn test_entities_summary() {
+        let data = WorldData {
+            owner: OwnerInfo {
+                name: "Giovanni Alberto Falcione".to_string(),
+                aliases: vec!["Gio".to_string()],
+                ..Default::default()
+            },
+            people: vec![PersonInfo {
+                name: "Gerardo Gagliardo".to_string(),
+                relationship: "co-founder".to_string(),
+                aliases: vec![],
+            }],
+            organizations: vec![OrgInfo {
+                name: "Exein".to_string(),
+                description: "cybersecurity".to_string(),
+                aliases: vec!["Exane".to_string()],
+            }],
+            ..Default::default()
+        };
+
+        let summary = data.entities_summary();
+        assert!(summary.contains("Owner: Giovanni Alberto Falcione (aliases: Gio)"));
+        assert!(summary.contains("People: Gerardo Gagliardo"));
+        assert!(summary.contains("Organizations: Exein (aliases: Exane)"));
+    }
+
+    #[test]
+    fn test_entities_summary_empty() {
+        let data = WorldData::default();
+        let summary = data.entities_summary();
+        assert!(summary.is_empty());
     }
 }

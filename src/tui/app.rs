@@ -1,15 +1,17 @@
 use crate::core::{
-    CompressionSettings, LocalModelSize, RecordOptions, RecordingResult, ScribaConfig,
-    TranscriptionMode, WorkflowManager, record_audio, rebuild_world_from_entities,
-    initialize_world_from_seed,
+    CloudProvider, CompressionSettings, EnrichmentMode, LocalModelSize, RecordOptions, RecordingResult, ScribaConfig,
+    TranscriptionMode, VoiceCommand, VoiceDetectorHandle, VoiceListeningState,
+    WorkflowManager, record_audio, rebuild_world_from_entities, initialize_world_from_seed,
+    start_voice_detector,
 };
 use crate::database::{Database, Entity, Recording, RecordingStats};
 use crate::enrichment::{OllamaClient, WorldContext, WorldData, WorldEntityExtractionResult};
+use crate::enrichment::chat_prompts;
 use crate::entities::EntityRegistry;
 use crate::utils::generate_recording_name;
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -18,7 +20,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap},
     Frame, Terminal,
 };
 use std::io;
@@ -30,6 +32,129 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command as TokioCommand;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Chat types for "Ask Scriba"
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+enum ChatStreamEvent {
+    Status(String),
+    Chunk(String),
+    Done,
+    Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ChatRole {
+    User,
+    Assistant,
+    System,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ChatContext {
+    Global,
+    Recording { recording_id: i64, recording_name: String },
+}
+
+#[derive(Debug, Clone)]
+struct ChatMessage {
+    role: ChatRole,
+    content: String,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum ChatFocus {
+    Table,
+    ChatInput,
+}
+
+struct ChatState {
+    context: ChatContext,
+    messages: Vec<ChatMessage>,
+    input_buffer: String,
+    scroll_offset: usize,
+
+    // Streaming state
+    stream_rx: Option<mpsc::Receiver<ChatStreamEvent>>,
+    current_status: Option<String>,
+    streaming_content: String,
+    is_generating: bool,
+
+    // Generation task handle
+    generation_task: Option<tokio::task::JoinHandle<()>>,
+
+    // Suggestions
+    suggestions: Vec<String>,
+    show_suggestions: bool,
+    selected_suggestion: usize,
+
+    // Pre-built system prompt
+    system_prompt: String,
+
+    // Focus
+    focus: ChatFocus,
+
+    // Spinner frame
+    spinner_frame: usize,
+
+    // Auto-scroll: stays true until user manually scrolls up
+    auto_scroll: bool,
+
+    // Queued message: submitted while generating, will auto-send when done
+    pending_message: Option<String>,
+
+    // Last rendered chat panel area (for mouse hit-testing)
+    panel_rect: ratatui::layout::Rect,
+
+    // Total content lines (for scroll clamping in mouse handler)
+    total_content_lines: usize,
+
+    // Text selection state (click-drag to select, auto-copy on release)
+    selection_anchor: Option<(usize, usize)>, // (content_line, char_col) where drag started
+    selection_end: Option<(usize, usize)>,    // (content_line, char_col) current drag position
+    content_texts: Vec<String>,               // plain text of each content line for extraction
+
+    // Rendering cache for completed messages
+    cached_msg_lines: Vec<Line<'static>>,
+    cached_msg_texts: Vec<String>,
+    cached_msg_count: usize,
+    cached_width: usize,
+}
+
+impl ChatState {
+    fn new() -> Self {
+        Self {
+            context: ChatContext::Global,
+            messages: Vec::new(),
+            input_buffer: String::new(),
+            scroll_offset: 0,
+            stream_rx: None,
+            current_status: None,
+            streaming_content: String::new(),
+            is_generating: false,
+            generation_task: None,
+            suggestions: Vec::new(),
+            show_suggestions: true,
+            selected_suggestion: 0,
+            system_prompt: String::new(),
+            focus: ChatFocus::Table,
+            spinner_frame: 0,
+            auto_scroll: true,
+            pending_message: None,
+            panel_rect: ratatui::layout::Rect::default(),
+            total_content_lines: 0,
+            selection_anchor: None,
+            selection_end: None,
+            content_texts: Vec::new(),
+            cached_msg_lines: Vec::new(),
+            cached_msg_texts: Vec::new(),
+            cached_msg_count: 0,
+            cached_width: 0,
+        }
+    }
+}
 
 pub struct Dashboard {
     db: Database,
@@ -67,10 +192,12 @@ pub struct Dashboard {
     settings_selection: usize,             // Current setting selection
     editing_api_key: bool,                 // Whether we're editing API key
     api_key_input: String,                 // API key input buffer
-    editing_ollama_model: bool,            // Whether we're editing Ollama model
-    ollama_model_input: String,            // Ollama model input buffer
-    editing_ollama_endpoint: bool,         // Whether we're editing Ollama endpoint
-    ollama_endpoint_input: String,         // Ollama endpoint input buffer
+    editing_enrichment_model: bool,         // Whether we're editing enrichment model
+    enrichment_model_input: String,        // Enrichment model input buffer
+    editing_enrichment_endpoint: bool,     // Whether we're editing Ollama endpoint (local mode)
+    enrichment_endpoint_input: String,     // Ollama endpoint input buffer (local mode)
+    editing_enrichment_api_key: bool,      // Whether we're editing enrichment API key
+    enrichment_api_key_input: String,      // Enrichment API key input buffer
     return_to_view: Option<DashboardView>, // View to return to after message dismissal
     // File import dialog state
     show_file_dialog: bool,
@@ -108,6 +235,17 @@ pub struct Dashboard {
 
     // Onboarding state
     onboarding: Option<OnboardingState>,
+
+    // Voice mode ("Scriba Forever") state
+    voice_command_rx: Option<mpsc::Receiver<VoiceCommand>>,
+    voice_detector_handle: Option<VoiceDetectorHandle>,
+    voice_mode_active: bool,
+
+    // Chat state ("Ask Scriba")
+    chat: ChatState,
+    global_chat_messages: Vec<ChatMessage>,
+    // Track the currently-viewed recording for chat context
+    current_transcript_recording: Option<Recording>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -127,6 +265,10 @@ enum DashboardView {
 enum OnboardingStep {
     Entrance,
     Intro,
+    ModeSelection,
+    ProviderSelection,
+    ApiKeyEntry,
+    ApiKeyValidation,
     AskName,
     AskRole,
     AskAliases,
@@ -144,12 +286,18 @@ struct OnboardingState {
     // Animation
     anim_frame: usize,
     entrance_complete: bool,
+    // Mode selection
+    selected_mode: usize,         // 0 = Cloud, 1 = Privacy (local)
+    selected_provider: usize,     // 0 = Anthropic, 1 = OpenAI, 2 = Google
+    api_key_input: String,
+    api_key_valid: Option<bool>,  // None = not checked, Some(true/false) = result
+    validation_task: Option<tokio::task::JoinHandle<Result<bool, anyhow::Error>>>,
     // User inputs
     user_name: String,
     user_role: String,
     user_aliases: String,
     // Processing
-    /// Returns (world_result, ollama_hint). Hint is set when Ollama is unavailable.
+    /// Returns (world_result, provider_hint). Hint is set when provider is unavailable.
     processing_task: Option<tokio::task::JoinHandle<Result<(Option<(WorldData, WorldEntityExtractionResult)>, Option<String>), anyhow::Error>>>,
     processed_world: Option<WorldData>,
     processed_entities: Option<WorldEntityExtractionResult>,
@@ -173,6 +321,11 @@ impl OnboardingState {
             text_complete: false,
             anim_frame: 0,
             entrance_complete: false,
+            selected_mode: 0,
+            selected_provider: 0,
+            api_key_input: String::new(),
+            api_key_valid: None,
+            validation_task: None,
             user_name: String::new(),
             user_role: String::new(),
             user_aliases: String::new(),
@@ -355,10 +508,12 @@ impl Dashboard {
             settings_selection: 0,
             editing_api_key: false,
             api_key_input: String::new(),
-            editing_ollama_model: false,
-            ollama_model_input: String::new(),
-            editing_ollama_endpoint: false,
-            ollama_endpoint_input: String::new(),
+            editing_enrichment_model: false,
+            enrichment_model_input: String::new(),
+            editing_enrichment_endpoint: false,
+            enrichment_endpoint_input: String::new(),
+            editing_enrichment_api_key: false,
+            enrichment_api_key_input: String::new(),
             return_to_view: None,
             // File import dialog state
             show_file_dialog: false,
@@ -396,6 +551,16 @@ impl Dashboard {
 
             // Onboarding
             onboarding: None,
+
+            // Voice mode
+            voice_command_rx: None,
+            voice_detector_handle: None,
+            voice_mode_active: false,
+
+            // Chat
+            chat: ChatState::new(),
+            global_chat_messages: Vec::new(),
+            current_transcript_recording: None,
         })
     }
 
@@ -415,9 +580,18 @@ impl Dashboard {
         if !WorldContext::exists() {
             self.current_view = DashboardView::Onboarding;
             self.onboarding = Some(OnboardingState::new());
+        } else {
+            // Initialize chat context for global view
+            self.load_entities().ok();
+            self.init_global_chat();
         }
 
         let result = self.run_app(&mut terminal).await;
+
+        // Shut down voice detector if active
+        if let Some(handle) = self.voice_detector_handle.take() {
+            handle.shutdown();
+        }
 
         // Restore terminal
         disable_raw_mode()?;
@@ -435,7 +609,17 @@ impl Dashboard {
         &mut self,
         terminal: &mut Terminal<B>,
     ) -> Result<()> {
-        loop {
+        let mut last_anim_tick = std::time::Instant::now();
+        let anim_interval = Duration::from_millis(100); // animations stay at ~10fps
+
+        'main: loop {
+            // ── Animation tick (throttled to ~100ms) ──────────────────────
+            let now = std::time::Instant::now();
+            let anim_tick = now.duration_since(last_anim_tick) >= anim_interval;
+            if anim_tick {
+                last_anim_tick = now;
+            }
+
             // Check if recording task completed
             if let Some(task) = &mut self.recording_task {
                 if task.is_finished() {
@@ -545,28 +729,46 @@ impl Dashboard {
                 }
             }
 
-            // Update progress animation if active
-            if self.progress_animation.is_some() {
-                self.update_progress_message();
-            }
-
-            // Tick progress frame for inline transcription animation
-            if self.transcribing_recording_name.is_some() {
-                self.progress_frame = self.progress_frame.wrapping_add(1);
-            }
-
-            // Auto-dismiss notification countdown
-            if let Some((_, ref mut frames)) = self.notification_message {
-                if *frames == 0 {
-                    self.notification_message = None;
-                } else {
-                    *frames -= 1;
+            // Check for voice commands
+            if let Some(ref mut rx) = self.voice_command_rx {
+                if let Ok(cmd) = rx.try_recv() {
+                    match cmd {
+                        VoiceCommand::Record => {
+                            self.handle_voice_record_command().await;
+                        }
+                        VoiceCommand::Stop => {
+                            self.handle_voice_stop_command().await;
+                        }
+                    }
                 }
             }
 
-            // Onboarding tick logic
+            // Update progress animation if active (throttled)
+            if anim_tick && self.progress_animation.is_some() {
+                self.update_progress_message();
+            }
+
+            // Tick progress frame for inline transcription animation (throttled)
+            if anim_tick && self.transcribing_recording_name.is_some() {
+                self.progress_frame = self.progress_frame.wrapping_add(1);
+            }
+
+            // Auto-dismiss notification countdown (throttled)
+            if anim_tick {
+                if let Some((_, ref mut frames)) = self.notification_message {
+                    if *frames == 0 {
+                        self.notification_message = None;
+                    } else {
+                        *frames -= 1;
+                    }
+                }
+            }
+
+            // Onboarding tick logic (runs every frame for typewriter + async polling)
             if let Some(ref mut ob) = self.onboarding {
-                ob.anim_frame = ob.anim_frame.wrapping_add(1);
+                if anim_tick {
+                    ob.anim_frame = ob.anim_frame.wrapping_add(1);
+                }
 
                 match ob.step {
                     OnboardingStep::Entrance => {
@@ -584,8 +786,46 @@ impl Dashboard {
                             );
                         }
                     }
-                    OnboardingStep::Intro | OnboardingStep::AskName | OnboardingStep::AskRole | OnboardingStep::AskAliases => {
+                    OnboardingStep::Intro | OnboardingStep::ModeSelection | OnboardingStep::ProviderSelection
+                    | OnboardingStep::ApiKeyEntry
+                    | OnboardingStep::AskName | OnboardingStep::AskRole | OnboardingStep::AskAliases => {
                         ob.tick_typewriter();
+                    }
+                    OnboardingStep::ApiKeyValidation => {
+                        ob.tick_typewriter();
+                        // Poll the async validation task
+                        if let Some(ref task) = ob.validation_task {
+                            if task.is_finished() {
+                                let completed = ob.validation_task.take().unwrap();
+                                match completed.await {
+                                    Ok(Ok(valid)) => {
+                                        ob.api_key_valid = Some(valid);
+                                        if valid {
+                                            ob.step = OnboardingStep::AskName;
+                                            ob.anim_frame = 0;
+                                            ob.set_step_text(
+                                                "API key works! We're in business.\n\n\
+                                                 So, who am I working for?\n\nWhat's your name?"
+                                            );
+                                        } else {
+                                            ob.set_step_text(
+                                                "Hmm, that key didn't work.\n\n\
+                                                 [1] Try a different key\n\
+                                                 [2] Skip for now (you can set it later)"
+                                            );
+                                        }
+                                    }
+                                    _ => {
+                                        ob.api_key_valid = Some(false);
+                                        ob.set_step_text(
+                                            "Hmm, that key didn't work.\n\n\
+                                             [1] Try a different key\n\
+                                             [2] Skip for now (you can set it later)"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                     OnboardingStep::Processing => {
                         ob.tick_typewriter();
@@ -668,50 +908,66 @@ impl Dashboard {
                                 // Transition complete — go to main dashboard
                                 self.onboarding = None;
                                 self.current_view = DashboardView::Main;
+                                self.load_entities().ok();
+                                self.init_global_chat();
                             }
                         }
                     }
                 }
             }
 
-            // Main header owl animation
-            if self.current_view == DashboardView::Main {
-                self.header_anim_frame = self.header_anim_frame.wrapping_add(1);
-            }
+            // Poll chat stream events (non-blocking — every frame for smooth streaming)
+            self.poll_chat_stream();
 
-            // World view tick logic (owl animation + quip timer)
-            if self.current_view == DashboardView::Entities {
-                self.owl_world_anim_frame = self.owl_world_anim_frame.wrapping_add(1);
-                if self.owl_quip_timer > 0 {
-                    self.owl_quip_timer -= 1;
-                    if self.owl_quip_timer == 0 {
-                        self.owl_world_mood = OwlWorldMood::Idle;
-                        self.set_owl_quip_for_browse();
-                    }
+            // Animation counters (throttled to ~10fps)
+            if anim_tick {
+                self.chat.spinner_frame = self.chat.spinner_frame.wrapping_add(1);
+
+                if self.current_view == DashboardView::Main {
+                    self.header_anim_frame = self.header_anim_frame.wrapping_add(1);
                 }
-                // Auto-reset celebrating mood
-                if self.owl_world_mood == OwlWorldMood::Celebrating && self.owl_quip_timer == 0 {
-                    self.owl_world_mood = OwlWorldMood::Idle;
+
+                if self.current_view == DashboardView::Entities {
+                    self.owl_world_anim_frame = self.owl_world_anim_frame.wrapping_add(1);
+                    if self.owl_quip_timer > 0 {
+                        self.owl_quip_timer -= 1;
+                        if self.owl_quip_timer == 0 {
+                            self.owl_world_mood = OwlWorldMood::Idle;
+                            self.set_owl_quip_for_browse();
+                        }
+                    }
+                    if self.owl_world_mood == OwlWorldMood::Celebrating && self.owl_quip_timer == 0 {
+                        self.owl_world_mood = OwlWorldMood::Idle;
+                    }
                 }
             }
 
             terminal.draw(|f| self.ui(f))?;
 
-            if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        match self.handle_key_event(key.code).await {
-                            Ok(DashboardAction::Continue) => continue,
-                            Ok(DashboardAction::Quit) => break,
-                            Ok(action) => {
-                                // Handle other actions (like launching recording, etc.)
-                                self.handle_dashboard_action(action).await?;
+            // Process all pending events (drain queue for smooth scrolling)
+            while event::poll(Duration::from_millis(0))? {
+                match event::read()? {
+                    Event::Key(key) => {
+                        if key.kind == KeyEventKind::Press {
+                            match self.handle_key_event(key.code).await {
+                                Ok(DashboardAction::Continue) => {}
+                                Ok(DashboardAction::Quit) => break 'main,
+                                Ok(action) => {
+                                    self.handle_dashboard_action(action).await?;
+                                }
+                                Err(e) => return Err(e),
                             }
-                            Err(e) => return Err(e),
                         }
                     }
+                    Event::Mouse(mouse) => {
+                        self.handle_mouse_event(mouse);
+                    }
+                    _ => {}
                 }
             }
+
+            // Sleep to target ~30fps when no events pending
+            tokio::time::sleep(Duration::from_millis(16)).await;
         }
         Ok(())
     }
@@ -811,11 +1067,20 @@ impl Dashboard {
         }
 
         if self.show_transcript {
+            // Chat keys in transcript view take priority when chat is focused
+            if self.handle_transcript_chat_key(key_code) {
+                return Ok(DashboardAction::Continue);
+            }
             return self.handle_transcript_keys(key_code).await;
         }
 
         if self.show_delete_confirm {
             return self.handle_delete_confirmation(key_code).await;
+        }
+
+        // Chat key handling (Tab focus toggle, chat input when focused)
+        if self.handle_chat_key(key_code) {
+            return Ok(DashboardAction::Continue);
         }
 
         match key_code {
@@ -1424,6 +1689,8 @@ impl Dashboard {
                             self.show_transcript = true;
                             // Load enrichment data
                             self.load_enrichment_data(&recording);
+                            // Initialize recording chat context
+                            self.init_recording_chat(&recording);
                         }
                         Err(e) => {
                             self.message = format!("Failed to load transcript: {}", e);
@@ -1879,6 +2146,7 @@ impl Dashboard {
                 self.transcript_content.clear();
                 self.transcript_scroll_offset = 0;
                 self.clear_enrichment_data();
+                self.restore_global_chat();
                 Ok(DashboardAction::Continue)
             }
             _ => {
@@ -1889,7 +2157,7 @@ impl Dashboard {
     }
 
     fn is_editing_settings_field(&self) -> bool {
-        self.editing_api_key || self.editing_ollama_model || self.editing_ollama_endpoint
+        self.editing_api_key || self.editing_enrichment_model || self.editing_enrichment_endpoint || self.editing_enrichment_api_key
     }
 
     fn save_enrichment_config(&mut self) -> Result<()> {
@@ -1899,17 +2167,20 @@ impl Dashboard {
     }
 
     async fn handle_settings_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
-        // Max settings index: 0=Mode, 1=ModeSpecific, 2=OllamaModel, 3=OllamaEndpoint,
-        //                    4=SilenceAutoStop, 5=SilenceTimeout,
-        //                    6=Diarization, 7=MaxSpeakers
-        let max_index = 7;
+        // Max settings index: 0=Mode, 1=ModeSpecific,
+        //                    2=EnrichProvider, 3=EnrichModel, 4=EnrichKeyOrEndpoint,
+        //                    5=SilenceAutoStop, 6=SilenceTimeout,
+        //                    7=Diarization, 8=MaxSpeakers,
+        //                    9=VoiceMode, 10=VoiceSensitivity
+        let max_index = 10;
 
         match key_code {
             KeyCode::Esc => {
                 if self.is_editing_settings_field() {
                     self.editing_api_key = false;
-                    self.editing_ollama_model = false;
-                    self.editing_ollama_endpoint = false;
+                    self.editing_enrichment_model = false;
+                    self.editing_enrichment_endpoint = false;
+                    self.editing_enrichment_api_key = false;
                 } else {
                     self.current_view = DashboardView::Main;
                 }
@@ -1945,30 +2216,49 @@ impl Dashboard {
                     }
                     self.editing_api_key = false;
                     self.api_key_input.clear();
-                } else if self.editing_ollama_model {
-                    let new_model = self.ollama_model_input.trim().to_string();
+                } else if self.editing_enrichment_model {
+                    let new_model = self.enrichment_model_input.trim().to_string();
                     if !new_model.is_empty() {
-                        self.config.enrichment.ollama_model = new_model;
+                        match &mut self.config.enrichment.mode {
+                            EnrichmentMode::Cloud { model, .. } => {
+                                *model = Some(new_model);
+                            }
+                            EnrichmentMode::Local { ollama_model, .. } => {
+                                *ollama_model = new_model;
+                            }
+                        }
                         if let Err(e) = self.save_enrichment_config() {
-                            self.message = format!("Failed to save Ollama model: {}", e);
+                            self.message = format!("Failed to save enrichment model: {}", e);
                             self.show_message = true;
                             self.return_to_view = Some(DashboardView::Settings);
                         }
                     }
-                    self.editing_ollama_model = false;
-                    self.ollama_model_input.clear();
-                } else if self.editing_ollama_endpoint {
-                    let new_endpoint = self.ollama_endpoint_input.trim().to_string();
+                    self.editing_enrichment_model = false;
+                    self.enrichment_model_input.clear();
+                } else if self.editing_enrichment_endpoint {
+                    let new_endpoint = self.enrichment_endpoint_input.trim().to_string();
                     if !new_endpoint.is_empty() {
-                        self.config.enrichment.ollama_endpoint = new_endpoint;
+                        self.config.enrichment.set_ollama_endpoint(new_endpoint);
                         if let Err(e) = self.save_enrichment_config() {
                             self.message = format!("Failed to save Ollama endpoint: {}", e);
                             self.show_message = true;
                             self.return_to_view = Some(DashboardView::Settings);
                         }
                     }
-                    self.editing_ollama_endpoint = false;
-                    self.ollama_endpoint_input.clear();
+                    self.editing_enrichment_endpoint = false;
+                    self.enrichment_endpoint_input.clear();
+                } else if self.editing_enrichment_api_key {
+                    let new_key = self.enrichment_api_key_input.trim().to_string();
+                    if let EnrichmentMode::Cloud { api_key, .. } = &mut self.config.enrichment.mode {
+                        *api_key = new_key;
+                    }
+                    if let Err(e) = self.save_enrichment_config() {
+                        self.message = format!("Failed to save API key: {}", e);
+                        self.show_message = true;
+                        self.return_to_view = Some(DashboardView::Settings);
+                    }
+                    self.editing_enrichment_api_key = false;
+                    self.enrichment_api_key_input.clear();
                 } else {
                     match self.settings_selection {
                         0 => {
@@ -2035,16 +2325,51 @@ impl Dashboard {
                             }
                         }
                         2 => {
-                            // Ollama Model
-                            self.editing_ollama_model = true;
-                            self.ollama_model_input = self.config.enrichment.ollama_model.clone();
+                            // Enrichment Provider — cycle through providers
+                            let new_mode = match &self.config.enrichment.mode {
+                                EnrichmentMode::Cloud { provider, api_key, .. } => {
+                                    let next = match provider {
+                                        CloudProvider::Anthropic => CloudProvider::OpenAI,
+                                        CloudProvider::OpenAI => CloudProvider::Google,
+                                        CloudProvider::Google => CloudProvider::Anthropic,
+                                    };
+                                    EnrichmentMode::Cloud {
+                                        provider: next,
+                                        api_key: api_key.clone(),
+                                        model: None,
+                                    }
+                                }
+                                EnrichmentMode::Local { .. } => {
+                                    EnrichmentMode::Cloud {
+                                        provider: CloudProvider::Anthropic,
+                                        api_key: String::new(),
+                                        model: None,
+                                    }
+                                }
+                            };
+                            self.config.enrichment.mode = new_mode;
+                            if let Err(e) = self.save_enrichment_config() {
+                                self.message = format!("Failed to save provider: {}", e);
+                                self.show_message = true;
+                                self.return_to_view = Some(DashboardView::Settings);
+                            }
                         }
                         3 => {
-                            // Ollama Endpoint
-                            self.editing_ollama_endpoint = true;
-                            self.ollama_endpoint_input = self.config.enrichment.ollama_endpoint.clone();
+                            // Enrichment Model
+                            self.editing_enrichment_model = true;
+                            self.enrichment_model_input = self.config.enrichment.model_name().to_string();
                         }
                         4 => {
+                            // Enrichment API Key (cloud) or Ollama Endpoint (local)
+                            if self.config.enrichment.is_local() {
+                                self.editing_enrichment_endpoint = true;
+                                self.enrichment_endpoint_input = self.config.enrichment.ollama_endpoint();
+                            } else {
+                                self.editing_enrichment_api_key = true;
+                                self.enrichment_api_key_input = self.config.enrichment.api_key().unwrap_or("").to_string();
+                            }
+                        }
+                        5 => {
                             // Toggle silence auto-stop enabled/disabled
                             self.config.silence_auto_stop.enabled = !self.config.silence_auto_stop.enabled;
                             if let Err(e) = self.config.save() {
@@ -2055,7 +2380,7 @@ impl Dashboard {
                                 self.config = ScribaConfig::load()?;
                             }
                         }
-                        5 => {
+                        6 => {
                             // Cycle silence timeout: 30s → 60s → 120s → 300s
                             if self.config.silence_auto_stop.enabled {
                                 self.config.silence_auto_stop.timeout_seconds = match self.config.silence_auto_stop.timeout_seconds {
@@ -2073,7 +2398,7 @@ impl Dashboard {
                                 }
                             }
                         }
-                        6 => {
+                        7 => {
                             // Toggle speaker diarization enabled/disabled
                             self.config.diarization.enabled = !self.config.diarization.enabled;
                             if let Err(e) = self.config.save() {
@@ -2084,7 +2409,7 @@ impl Dashboard {
                                 self.config = ScribaConfig::load()?;
                             }
                         }
-                        7 => {
+                        8 => {
                             // Cycle max speakers: 2 → 4 → 6 → 8
                             if self.config.diarization.enabled {
                                 self.config.diarization.max_speakers = match self.config.diarization.max_speakers {
@@ -2092,6 +2417,34 @@ impl Dashboard {
                                     4 => 6,
                                     6 => 8,
                                     _ => 2,
+                                };
+                                if let Err(e) = self.config.save() {
+                                    self.message = format!("Failed to save setting: {}", e);
+                                    self.show_message = true;
+                                    self.return_to_view = Some(DashboardView::Settings);
+                                } else {
+                                    self.config = ScribaConfig::load()?;
+                                }
+                            }
+                        }
+                        9 => {
+                            // Toggle voice mode on/off
+                            self.toggle_voice_mode().await;
+                            self.config.voice.enabled = self.voice_mode_active;
+                            if let Err(e) = self.config.save() {
+                                self.message = format!("Failed to save setting: {}", e);
+                                self.show_message = true;
+                                self.return_to_view = Some(DashboardView::Settings);
+                            }
+                        }
+                        10 => {
+                            // Cycle voice sensitivity: 0.005 → 0.01 → 0.02 → 0.05
+                            if self.voice_mode_active {
+                                self.config.voice.vad_threshold = match self.config.voice.vad_threshold {
+                                    t if t <= 0.005 => 0.01,
+                                    t if t <= 0.01 => 0.02,
+                                    t if t <= 0.02 => 0.05,
+                                    _ => 0.005,
                                 };
                                 if let Err(e) = self.config.save() {
                                     self.message = format!("Failed to save setting: {}", e);
@@ -2110,20 +2463,24 @@ impl Dashboard {
             KeyCode::Char(c) => {
                 if self.editing_api_key {
                     self.api_key_input.push(c);
-                } else if self.editing_ollama_model {
-                    self.ollama_model_input.push(c);
-                } else if self.editing_ollama_endpoint {
-                    self.ollama_endpoint_input.push(c);
+                } else if self.editing_enrichment_model {
+                    self.enrichment_model_input.push(c);
+                } else if self.editing_enrichment_endpoint {
+                    self.enrichment_endpoint_input.push(c);
+                } else if self.editing_enrichment_api_key {
+                    self.enrichment_api_key_input.push(c);
                 }
                 Ok(DashboardAction::Continue)
             }
             KeyCode::Backspace => {
                 if self.editing_api_key {
                     self.api_key_input.pop();
-                } else if self.editing_ollama_model {
-                    self.ollama_model_input.pop();
-                } else if self.editing_ollama_endpoint {
-                    self.ollama_endpoint_input.pop();
+                } else if self.editing_enrichment_model {
+                    self.enrichment_model_input.pop();
+                } else if self.editing_enrichment_endpoint {
+                    self.enrichment_endpoint_input.pop();
+                } else if self.editing_enrichment_api_key {
+                    self.enrichment_api_key_input.pop();
                 }
                 Ok(DashboardAction::Continue)
             }
@@ -2434,28 +2791,40 @@ impl Dashboard {
             return;
         }
 
-        // Main layout: Header + Content + Stats + Footer
+        // Dynamic chat panel height (unified: suggestions/messages + input in one block)
+        let has_chat_content = !self.chat.messages.is_empty()
+            || !self.chat.streaming_content.is_empty()
+            || self.chat.is_generating;
+
+        let chat_panel_height: u16 = if has_chat_content {
+            let available = size.height.saturating_sub(5 + 1); // header + footer
+            (available * 65 / 100).max(10)
+        } else {
+            // Suggestions + input + borders: enough for suggestions + input line
+            (self.chat.suggestions.len() as u16 + 4).max(5).min(8)
+        };
+
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5), // Header (owl + text)
-                Constraint::Min(6),    // Recordings Table
-                Constraint::Length(4), // Statistics
-                Constraint::Length(3), // Footer
+                Constraint::Length(5),                // Header (owl + text)
+                Constraint::Min(6),                   // Recordings Table (shrinks when chat grows)
+                Constraint::Length(chat_panel_height), // Unified chat panel
+                Constraint::Length(1),                // Footer (compressed)
             ])
             .split(size);
 
         // Header
         self.render_header(f, main_chunks[0]);
 
-        // Table
+        // Table (with stats in title)
         self.render_recordings_table(f, main_chunks[1]);
 
-        // Statistics
-        self.render_statistics(f, main_chunks[2]);
+        // Unified chat panel
+        self.render_chat_panel(f, main_chunks[2]);
 
-        // Footer
-        self.render_footer(f, main_chunks[3]);
+        // Compressed footer
+        self.render_compressed_footer(f, main_chunks[3]);
 
         // Search input overlay
         if self.search_mode {
@@ -2692,11 +3061,17 @@ impl Dashboard {
                 .title({
                     let start_index = (self.current_page * self.page_size) + 1;
                     let end_index = start_index + self.recordings.len() - 1;
+                    let stats_suffix = if let Some(stats) = &self.stats {
+                        format!(" — {} total, {}", stats.total_recordings, stats.format_duration())
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        "Recordings (Page {} - #{}-#{})",
+                        "Recordings (Page {} - #{}-#{}){}",
                         self.current_page + 1,
                         start_index,
-                        end_index
+                        end_index,
+                        stats_suffix
                     )
                 }),
         )
@@ -2709,108 +3084,6 @@ impl Dashboard {
         .highlight_symbol("▶ ");
 
         f.render_stateful_widget(table, area, &mut self.table_state);
-    }
-
-    fn render_statistics(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let stats_text = if let Some(stats) = &self.stats {
-            let transcribed_percentage = if stats.total_recordings > 0 {
-                (stats.transcribed_count * 100) / stats.total_recordings
-            } else {
-                0
-            };
-
-            vec![
-                Line::from(vec![
-                    Span::styled("Total: ", Style::default().fg(Color::White)),
-                    Span::styled(
-                        format!("{} recordings", stats.total_recordings),
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw("    "),
-                    Span::styled("Duration: ", Style::default().fg(Color::White)),
-                    Span::styled(
-                        stats.format_duration(),
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("Storage: ", Style::default().fg(Color::White)),
-                    Span::styled(
-                        stats.format_size(),
-                        Style::default()
-                            .fg(Color::Blue)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw("      "),
-                    Span::styled("Transcribed: ", Style::default().fg(Color::White)),
-                    Span::styled(
-                        format!("{} ({}%)", stats.transcribed_count, transcribed_percentage),
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-            ]
-        } else {
-            vec![Line::from("Loading statistics...")]
-        };
-
-        let stats = Paragraph::new(stats_text)
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("STATISTICS")
-                    .title_alignment(Alignment::Center)
-                    .style(Style::default().fg(Color::Cyan)),
-            );
-        f.render_widget(stats, area);
-    }
-
-    fn render_footer(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        // Show notification if present (auto-dismissing)
-        if let Some((ref msg, _)) = self.notification_message {
-            let is_error = msg.contains("failed") || msg.contains("Failed");
-            let style = if is_error {
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-            };
-            let notification = Paragraph::new(msg.as_str())
-                .style(style)
-                .alignment(Alignment::Center)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .style(Style::default().fg(if is_error { Color::Red } else { Color::Green })),
-                );
-            f.render_widget(notification, area);
-            return;
-        }
-
-        let controls = if self.search_mode {
-            "ESC: Cancel | ENTER: Search | Type to search...".to_string()
-        } else if self.transcribing_recording_name.is_some() {
-            "↑↓: Navigate | [/]: Pages | ENTER: Transcript | P: Play | D/Del: Delete | /: Search | R/A/T: Actions | W/S/H/Q  |  Transcribing...".to_string()
-        } else {
-            "↑↓: Navigate | [/]: Pages | ENTER: Transcript | P: Play | D/Del: Delete | /: Search | R/A/T: Actions | W: World | S: Settings | H: Help | Q: Quit".to_string()
-        };
-
-        let controls_paragraph = Paragraph::new(controls)
-            .style(Style::default().fg(Color::White))
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::Blue))
-                    .title("Controls"),
-            );
-
-        f.render_widget(controls_paragraph, area);
     }
 
     fn render_help(&self, f: &mut Frame, area: ratatui::layout::Rect) {
@@ -3002,53 +3275,48 @@ impl Dashboard {
             }
         }
 
-        // Ollama settings section
+        // Enrichment settings section
         settings_text.push(Line::from(""));
+        let enrichment_header = if self.config.enrichment.is_local() {
+            "ENRICHMENT (Privacy Mode)"
+        } else {
+            "ENRICHMENT"
+        };
         settings_text.push(Line::from(vec![Span::styled(
-            "ENRICHMENT (Ollama)",
+            enrichment_header,
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )]));
 
-        // Ollama Model (index 2)
-        let ollama_model_display = if self.editing_ollama_model {
-            format!("{}_", self.ollama_model_input)
-        } else {
-            format!(
-                "{} <- Press Enter to edit",
-                self.config.enrichment.ollama_model
-            )
-        };
-        let ollama_model_style = if self.settings_selection == 2 {
-            if self.editing_ollama_model {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            }
+        // Provider (index 2) — cycle through providers
+        let provider_display = format!(
+            "{} <- Press Enter to cycle",
+            self.config.enrichment.provider_display_name()
+        );
+        let provider_style = if self.settings_selection == 2 {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
         };
         settings_text.push(Line::from(vec![
-            Span::styled("Ollama Model: ", Style::default().fg(Color::Green)),
-            Span::styled(ollama_model_display, ollama_model_style),
+            Span::styled("Provider: ", Style::default().fg(Color::Green)),
+            Span::styled(provider_display, provider_style),
         ]));
 
-        // Ollama Endpoint (index 3)
-        let ollama_endpoint_display = if self.editing_ollama_endpoint {
-            format!("{}_", self.ollama_endpoint_input)
+        // Model (index 3)
+        let model_display = if self.editing_enrichment_model {
+            format!("{}_", self.enrichment_model_input)
         } else {
             format!(
                 "{} <- Press Enter to edit",
-                self.config.enrichment.ollama_endpoint
+                self.config.enrichment.model_name()
             )
         };
-        let ollama_endpoint_style = if self.settings_selection == 3 {
-            if self.editing_ollama_endpoint {
+        let model_style = if self.settings_selection == 3 {
+            if self.editing_enrichment_model {
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD)
@@ -3061,9 +3329,67 @@ impl Dashboard {
             Style::default().fg(Color::White)
         };
         settings_text.push(Line::from(vec![
-            Span::styled("Ollama Server: ", Style::default().fg(Color::Green)),
-            Span::styled(ollama_endpoint_display, ollama_endpoint_style),
+            Span::styled("Model: ", Style::default().fg(Color::Green)),
+            Span::styled(model_display, model_style),
         ]));
+
+        // API Key or Ollama Endpoint (index 4)
+        if self.config.enrichment.is_local() {
+            let endpoint_display = if self.editing_enrichment_endpoint {
+                format!("{}_", self.enrichment_endpoint_input)
+            } else {
+                format!(
+                    "{} <- Press Enter to edit",
+                    self.config.enrichment.ollama_endpoint()
+                )
+            };
+            let endpoint_style = if self.settings_selection == 4 {
+                if self.editing_enrichment_endpoint {
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                }
+            } else {
+                Style::default().fg(Color::White)
+            };
+            settings_text.push(Line::from(vec![
+                Span::styled("Ollama Server: ", Style::default().fg(Color::Green)),
+                Span::styled(endpoint_display, endpoint_style),
+            ]));
+        } else {
+            let key_display = if self.editing_enrichment_api_key {
+                format!("{}_", self.enrichment_api_key_input)
+            } else {
+                match self.config.enrichment.api_key() {
+                    Some(key) if key.len() >= 4 => {
+                        format!("{}****** <- Press Enter to edit", &key[..4])
+                    }
+                    Some(_) => "****** <- Press Enter to edit".to_string(),
+                    None => "[Not Set] <- Press Enter to edit".to_string(),
+                }
+            };
+            let key_style = if self.settings_selection == 4 {
+                if self.editing_enrichment_api_key {
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                }
+            } else {
+                Style::default().fg(Color::White)
+            };
+            settings_text.push(Line::from(vec![
+                Span::styled("API Key: ", Style::default().fg(Color::Green)),
+                Span::styled(key_display, key_style),
+            ]));
+        }
 
         // Recording section — silence auto-stop
         settings_text.push(Line::from(""));
@@ -3081,7 +3407,7 @@ impl Dashboard {
         } else {
             "Disabled <- Press Enter to toggle"
         };
-        let silence_toggle_style = if self.settings_selection == 4 {
+        let silence_toggle_style = if self.settings_selection == 5 {
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
@@ -3105,7 +3431,7 @@ impl Dashboard {
         } else {
             format!("{} (enable auto-stop first)", timeout_display)
         };
-        let timeout_style = if self.settings_selection == 5 {
+        let timeout_style = if self.settings_selection == 6 {
             if silence_enabled {
                 Style::default()
                     .fg(Color::Yellow)
@@ -3141,7 +3467,7 @@ impl Dashboard {
         } else {
             "Disabled <- Press Enter to toggle"
         };
-        let diarization_toggle_style = if self.settings_selection == 6 {
+        let diarization_toggle_style = if self.settings_selection == 7 {
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
@@ -3160,7 +3486,7 @@ impl Dashboard {
         } else {
             format!("{} (enable diarization first)", max_speakers)
         };
-        let max_speakers_style = if self.settings_selection == 7 {
+        let max_speakers_style = if self.settings_selection == 8 {
             if diarization_enabled {
                 Style::default()
                     .fg(Color::Yellow)
@@ -3176,6 +3502,64 @@ impl Dashboard {
         settings_text.push(Line::from(vec![
             Span::styled("Max Speakers: ", Style::default().fg(Color::Green)),
             Span::styled(max_speakers_text, max_speakers_style),
+        ]));
+
+        // Voice mode section
+        settings_text.push(Line::from(""));
+        settings_text.push(Line::from(vec![Span::styled(
+            "VOICE MODE (Scriba Forever)",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]));
+
+        // Voice Mode toggle (index 9)
+        let voice_enabled = self.voice_mode_active;
+        let voice_toggle_text = if voice_enabled {
+            "Active <- Press Enter to toggle"
+        } else {
+            "Off <- Press Enter to toggle"
+        };
+        let voice_toggle_style = if self.settings_selection == 9 {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        settings_text.push(Line::from(vec![
+            Span::styled("Voice Activation: ", Style::default().fg(Color::Green)),
+            Span::styled(voice_toggle_text, voice_toggle_style),
+        ]));
+
+        // Voice Sensitivity (index 10)
+        let sensitivity_label = match self.config.voice.vad_threshold {
+            t if t <= 0.005 => "Very High (0.005)",
+            t if t <= 0.01 => "High (0.01)",
+            t if t <= 0.02 => "Medium (0.02)",
+            _ => "Low (0.05)",
+        };
+        let sensitivity_text = if voice_enabled {
+            format!("{} <- Press Enter to cycle", sensitivity_label)
+        } else {
+            format!("{} (enable voice mode first)", sensitivity_label)
+        };
+        let sensitivity_style = if self.settings_selection == 10 {
+            if voice_enabled {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            }
+        } else if voice_enabled {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        settings_text.push(Line::from(vec![
+            Span::styled("Voice Sensitivity: ", Style::default().fg(Color::Green)),
+            Span::styled(sensitivity_text, sensitivity_style),
         ]));
 
         settings_text.push(Line::from(""));
@@ -3910,22 +4294,22 @@ impl Dashboard {
         f.render_widget(para, popup_area);
     }
 
-    fn render_transcript_popup(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+    fn render_transcript_popup(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
         let popup_area = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Percentage(5),
-                Constraint::Percentage(90),
-                Constraint::Percentage(5),
+                Constraint::Percentage(3),
+                Constraint::Percentage(94),
+                Constraint::Percentage(3),
             ])
             .split(area)[1];
 
         let popup_area = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(3),
-                Constraint::Percentage(94),
-                Constraint::Percentage(3),
+                Constraint::Percentage(2),
+                Constraint::Percentage(96),
+                Constraint::Percentage(2),
             ])
             .split(popup_area)[1];
 
@@ -3936,25 +4320,45 @@ impl Dashboard {
             || self.transcript_topics.is_some()
             || self.transcript_entities.is_some();
 
-        if has_enrichment {
-            // Split popup into enrichment header and transcript content
-            let content_chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(self.calculate_enrichment_height()),
-                    Constraint::Min(5),
-                ])
-                .split(popup_area);
+        // Dynamic chat panel height for transcript view
+        let has_chat_content = !self.chat.messages.is_empty()
+            || !self.chat.streaming_content.is_empty()
+            || self.chat.is_generating;
 
-            // Render enrichment section
-            self.render_enrichment_section(f, content_chunks[0]);
-
-            // Render transcript in remaining space
-            self.render_transcript_content(f, content_chunks[1]);
+        let chat_panel_h: u16 = if has_chat_content {
+            let available = popup_area.height;
+            (available * 45 / 100).max(8)
         } else {
-            // No enrichment, render transcript only
-            self.render_transcript_content(f, popup_area);
+            (self.chat.suggestions.len() as u16 + 4).max(5).min(8)
+        };
+
+        // Build constraints dynamically
+        let mut constraints: Vec<Constraint> = Vec::new();
+
+        if has_enrichment {
+            constraints.push(Constraint::Length(self.calculate_enrichment_height()));
         }
+        constraints.push(Constraint::Min(5)); // Transcript (flexible)
+        constraints.push(Constraint::Length(chat_panel_h)); // Unified chat panel
+
+        let content_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(popup_area);
+
+        let mut chunk_idx = 0;
+
+        if has_enrichment {
+            self.render_enrichment_section(f, content_chunks[chunk_idx]);
+            chunk_idx += 1;
+        }
+
+        // Transcript
+        self.render_transcript_content(f, content_chunks[chunk_idx]);
+        chunk_idx += 1;
+
+        // Unified chat panel
+        self.render_chat_panel(f, content_chunks[chunk_idx]);
     }
 
     fn calculate_enrichment_height(&self) -> u16 {
@@ -4624,6 +5028,148 @@ impl Dashboard {
         Ok(())
     }
 
+    // ── Voice Mode ("Scriba Forever") ────────────────────────────────────
+
+    async fn toggle_voice_mode(&mut self) {
+        if self.voice_mode_active {
+            // Shut down voice detector
+            if let Some(handle) = self.voice_detector_handle.take() {
+                // If recording, stop it first
+                if handle.listening_state() == VoiceListeningState::Recording {
+                    let _ = handle.stop_recording();
+                }
+                handle.shutdown();
+            }
+            self.voice_command_rx = None;
+            self.voice_mode_active = false;
+            self.notification_message = Some(("Voice mode disabled".to_string(), 30));
+        } else {
+            // Start voice detector
+            let (tx, rx) = mpsc::channel(8);
+            match start_voice_detector(&self.config.voice, tx).await {
+                Ok(handle) => {
+                    self.voice_detector_handle = Some(handle);
+                    self.voice_command_rx = Some(rx);
+                    self.voice_mode_active = true;
+                    self.notification_message = Some((
+                        "Voice mode active -- say \"Scriba record\" to start".to_string(),
+                        60,
+                    ));
+                }
+                Err(e) => {
+                    self.notification_message = Some((
+                        format!("Failed to start voice mode: {}", e),
+                        60,
+                    ));
+                }
+            }
+        }
+    }
+
+    async fn handle_voice_record_command(&mut self) {
+        // Don't start if already recording
+        if self.recording_task.is_some() {
+            return;
+        }
+
+        let recording_name = generate_recording_name(None);
+
+        if let Some(ref handle) = self.voice_detector_handle {
+            if let Err(e) = handle.start_recording(&recording_name) {
+                self.notification_message = Some((
+                    format!("Voice record failed: {}", e),
+                    60,
+                ));
+                return;
+            }
+        }
+
+        self.notification_message = Some((
+            "Voice: Recording started! Say \"Scriba stop\" to finish.".to_string(),
+            60,
+        ));
+    }
+
+    async fn handle_voice_stop_command(&mut self) {
+        let result = if let Some(ref handle) = self.voice_detector_handle {
+            handle.stop_recording()
+        } else {
+            return;
+        };
+
+        match result {
+            Ok(Some((dir_name, wav_path))) => {
+                self.notification_message = Some((
+                    "Voice: Recording stopped. Transcribing...".to_string(),
+                    60,
+                ));
+
+                // Save to database
+                let dir_name_clone = dir_name.clone();
+                if let Ok(mut db) = Database::new() {
+                    let meta = crate::core::FileManager::extract_audio_metadata(&wav_path);
+                    if let Ok(meta) = meta {
+                        let recording = Recording {
+                            id: None,
+                            directory_name: dir_name.clone(),
+                            display_name: None,
+                            created_at: chrono::Utc::now(),
+                            updated_at: chrono::Utc::now(),
+                            duration_seconds: meta.duration_seconds,
+                            file_size_bytes: meta.file_size_bytes,
+                            audio_format: meta.audio_format,
+                            sample_rate: meta.sample_rate,
+                            channels: meta.channels,
+                            has_transcript: false,
+                            transcript_status: "pending".to_string(),
+                            language_code: "auto".to_string(),
+                            model_used: "whisper.cpp".to_string(),
+                            tags: None,
+                            summary: None,
+                            key_points: None,
+                            action_items: None,
+                            speakers: None,
+                            sentiment_score: None,
+                            search_index: None,
+                            categories: None,
+                            confidence_score: None,
+                            audio_path: wav_path
+                                .file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .to_string(),
+                            transcript_path: None,
+                        };
+                        let _ = db.insert_recording(&recording);
+                    }
+                }
+
+                // Start transcription pipeline
+                let transcription_mode = self.config.transcription.clone();
+                self.transcribing_recording_name = Some(dir_name_clone.clone());
+                self.progress_frame = 0;
+                let _ = self.load_recordings();
+                let _ = self.load_stats();
+
+                self.transcription_task = Some(tokio::spawn(async move {
+                    let mut workflow = WorkflowManager::new().unwrap();
+                    workflow
+                        .retranscribe_recording_silent(&dir_name_clone, transcription_mode)
+                        .await
+                }));
+            }
+            Ok(None) => {
+                self.notification_message = Some(("Voice: No recording to stop.".to_string(), 30));
+            }
+            Err(e) => {
+                self.notification_message = Some((
+                    format!("Voice stop failed: {}", e),
+                    60,
+                ));
+            }
+        }
+    }
+
     fn render_file_dialog_popup(&self, f: &mut Frame, area: ratatui::layout::Rect) {
         let popup_area = Layout::default()
             .direction(Direction::Vertical)
@@ -4703,6 +5249,1121 @@ impl Dashboard {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Ask Scriba: Chat Implementation
+    // ─────────────────────────────────────────────────────────────────────────
+
+    fn generate_suggestions(&self) -> Vec<String> {
+        match &self.chat.context {
+            ChatContext::Global => {
+                let mut suggestions = vec!["What have I been talking about recently?".to_string()];
+
+                // Top entity suggestion
+                if !self.entities.is_empty() {
+                    if let Some(top) = self.entities.first() {
+                        suggestions.push(format!("Summarize my conversations about {}", top.canonical_name));
+                    }
+                }
+
+                // Action items
+                let has_action_items = self.recordings.iter().any(|r| {
+                    r.action_items.as_ref().map_or(false, |a| !a.is_empty() && a != "[]")
+                });
+                if has_action_items {
+                    suggestions.push("What action items do I have pending?".to_string());
+                }
+
+                // People
+                let has_people = self.entities.iter().any(|e| e.entity_type == "person");
+                if has_people {
+                    suggestions.push("Who have I been meeting with most?".to_string());
+                }
+
+                suggestions.truncate(4);
+                suggestions
+            }
+            ChatContext::Recording { .. } => {
+                let mut suggestions = vec!["Summarize the key takeaways".to_string()];
+
+                // Draft email if action items exist
+                if let Some(recording) = &self.current_transcript_recording {
+                    let has_actions = recording.action_items.as_ref()
+                        .map_or(false, |a| !a.is_empty() && a != "[]");
+                    let has_key_points = recording.key_points.as_ref()
+                        .map_or(false, |k| !k.is_empty() && k != "[]");
+
+                    if has_actions || has_key_points {
+                        suggestions.push("Draft a follow-up email".to_string());
+                    }
+
+                    if has_actions {
+                        suggestions.push("What were the action items?".to_string());
+                    }
+                }
+
+                // Entity cross-reference
+                if let Some(entities) = &self.transcript_entities {
+                    if let Some((name, _)) = entities.first() {
+                        suggestions.push(format!("What other recordings mention {}?", name));
+                    }
+                }
+
+                suggestions.truncate(4);
+                suggestions
+            }
+        }
+    }
+
+    fn init_global_chat(&mut self) {
+        // Load world context
+        let world = WorldContext::load().ok()
+            .and_then(|wc| WorldData::from_json(&wc.content).ok())
+            .unwrap_or_default();
+
+        let owner_name = if world.owner.name.is_empty() {
+            "User".to_string()
+        } else {
+            world.owner.name.clone()
+        };
+
+        let world_json = world.to_json().unwrap_or_default();
+
+        // Stats summary
+        let stats_summary = if let Some(stats) = &self.stats {
+            format!(
+                "{} recordings, {} total duration, {} transcribed",
+                stats.total_recordings,
+                stats.format_duration(),
+                stats.transcribed_count
+            )
+        } else {
+            "No stats available".to_string()
+        };
+
+        // Recent recordings summary
+        let recent_recordings: String = self.recordings.iter().take(10).map(|r| {
+            let name = r.display_name.as_ref().unwrap_or(&r.directory_name);
+            let summary = r.summary.as_deref().unwrap_or("(no summary)");
+            format!("- {} [{}]: {}\n", name, r.created_at.format("%m/%d"), summary)
+        }).collect();
+
+        let entities_summary = world.entities_summary();
+
+        self.chat.system_prompt = chat_prompts::build_global_chat_prompt(
+            &owner_name,
+            &world_json,
+            &stats_summary,
+            &recent_recordings,
+            &entities_summary,
+        );
+
+        self.chat.context = ChatContext::Global;
+        self.chat.suggestions = self.generate_suggestions();
+        self.chat.show_suggestions = self.chat.messages.is_empty();
+    }
+
+    fn init_recording_chat(&mut self, recording: &Recording) {
+        // Stash global messages
+        self.global_chat_messages = self.chat.messages.clone();
+
+        let world = WorldContext::load().ok()
+            .and_then(|wc| WorldData::from_json(&wc.content).ok())
+            .unwrap_or_default();
+
+        let owner_name = if world.owner.name.is_empty() {
+            "User".to_string()
+        } else {
+            world.owner.name.clone()
+        };
+
+        let recording_name = recording.display_name.as_ref()
+            .unwrap_or(&recording.directory_name)
+            .clone();
+
+        let summary = recording.summary.as_deref().unwrap_or("");
+        let action_items = recording.action_items.as_deref().unwrap_or("");
+        let key_points_str = recording.key_points.as_ref()
+            .and_then(|kp| serde_json::from_str::<Vec<String>>(kp).ok())
+            .map(|v| v.join("\n- "))
+            .unwrap_or_default();
+
+        let topics_str = self.transcript_topics.as_ref()
+            .map(|t| t.join(", "))
+            .unwrap_or_default();
+
+        let entities_str = self.transcript_entities.as_ref()
+            .map(|e| e.iter().map(|(n, t)| format!("{} ({})", n, t)).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+
+        let world_json = world.to_json().unwrap_or_default();
+
+        self.chat.system_prompt = chat_prompts::build_recording_chat_prompt(
+            &owner_name,
+            &recording_name,
+            &self.transcript_content,
+            summary,
+            &topics_str,
+            &entities_str,
+            &key_points_str,
+            action_items,
+            &world_json,
+        );
+
+        self.chat.context = ChatContext::Recording {
+            recording_id: recording.id.unwrap_or(0),
+            recording_name,
+        };
+        self.chat.messages.clear();
+        self.chat.input_buffer.clear();
+        self.chat.streaming_content.clear();
+        self.chat.current_status = None;
+        self.chat.is_generating = false;
+        self.chat.scroll_offset = 0;
+
+        self.current_transcript_recording = Some(recording.clone());
+        self.chat.suggestions = self.generate_suggestions();
+        self.chat.show_suggestions = true;
+    }
+
+    fn restore_global_chat(&mut self) {
+        self.chat.messages = std::mem::take(&mut self.global_chat_messages);
+        self.chat.context = ChatContext::Global;
+        self.chat.input_buffer.clear();
+        self.chat.streaming_content.clear();
+        self.chat.current_status = None;
+        self.chat.is_generating = false;
+        self.chat.scroll_offset = 0;
+        self.current_transcript_recording = None;
+        self.chat.suggestions = self.generate_suggestions();
+        self.chat.show_suggestions = self.chat.messages.is_empty();
+        self.chat.focus = ChatFocus::Table;
+    }
+
+    fn send_chat_message(&mut self) {
+        let user_msg = if self.chat.show_suggestions && !self.chat.suggestions.is_empty() {
+            // Check if "Ask Scriba anything..." (last option) is selected
+            if self.chat.selected_suggestion >= self.chat.suggestions.len() {
+                // Switch to free-form input mode
+                self.chat.show_suggestions = false;
+                return;
+            }
+            // Use selected suggestion
+            let msg = self.chat.suggestions[self.chat.selected_suggestion].clone();
+            self.chat.show_suggestions = false;
+            msg
+        } else if !self.chat.input_buffer.is_empty() {
+            let msg = self.chat.input_buffer.clone();
+            self.chat.input_buffer.clear();
+            self.chat.show_suggestions = false;
+            msg
+        } else {
+            return;
+        };
+
+        // Add user message
+        self.chat.messages.push(ChatMessage {
+            role: ChatRole::User,
+            content: user_msg.clone(),
+        });
+
+        // Spawn generation pipeline
+        let (event_tx, event_rx) = mpsc::channel::<ChatStreamEvent>(100);
+        self.chat.stream_rx = Some(event_rx);
+        self.chat.is_generating = true;
+        self.chat.auto_scroll = true; // re-engage for new response
+        self.chat.streaming_content.clear();
+        self.chat.current_status = Some("Preparing...".to_string());
+
+        let config = self.config.enrichment.clone();
+        let system_prompt = self.chat.system_prompt.clone();
+        let messages: Vec<(String, String)> = self.chat.messages.iter().map(|m| {
+            let role = match m.role {
+                ChatRole::User => "User",
+                ChatRole::Assistant => "Assistant",
+                ChatRole::System => "System",
+            };
+            (role.to_string(), m.content.clone())
+        }).collect();
+
+        // Collect entity names for cross-referencing
+        let entity_names: Vec<(String, i64)> = self.entities.iter()
+            .filter_map(|e| e.id.map(|id| (e.canonical_name.clone(), id)))
+            .collect();
+
+        self.chat.generation_task = Some(tokio::spawn(async move {
+            chat_generation_pipeline(config, system_prompt, messages, user_msg, entity_names, event_tx).await;
+        }));
+    }
+
+    fn poll_chat_stream(&mut self) {
+        if let Some(ref mut rx) = self.chat.stream_rx {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    ChatStreamEvent::Status(msg) => {
+                        self.chat.current_status = Some(msg);
+                    }
+                    ChatStreamEvent::Chunk(text) => {
+                        self.chat.current_status = None;
+                        self.chat.streaming_content.push_str(&text);
+                    }
+                    ChatStreamEvent::Done => {
+                        let content = std::mem::take(&mut self.chat.streaming_content);
+                        self.chat.messages.push(ChatMessage {
+                            role: ChatRole::Assistant,
+                            content,
+                        });
+                        self.chat.is_generating = false;
+                        self.chat.stream_rx = None;
+                        self.chat.current_status = None;
+                        // Auto-send queued message if any
+                        if self.chat.pending_message.is_some() {
+                            let msg = self.chat.pending_message.take().unwrap();
+                            self.chat.input_buffer = msg;
+                            self.send_chat_message();
+                        }
+                        return;
+                    }
+                    ChatStreamEvent::Error(msg) => {
+                        self.chat.messages.push(ChatMessage {
+                            role: ChatRole::System,
+                            content: format!("Error: {}", msg),
+                        });
+                        self.chat.is_generating = false;
+                        self.chat.stream_rx = None;
+                        self.chat.current_status = None;
+                        self.chat.streaming_content.clear();
+                        // Drop pending message on error
+                        self.chat.pending_message = None;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_chat_key(&mut self, key_code: KeyCode) -> bool {
+        match key_code {
+            KeyCode::Tab => {
+                // Toggle focus
+                self.chat.focus = match self.chat.focus {
+                    ChatFocus::Table => ChatFocus::ChatInput,
+                    ChatFocus::ChatInput => ChatFocus::Table,
+                };
+                true
+            }
+            _ if self.chat.focus == ChatFocus::ChatInput => {
+                match key_code {
+                    KeyCode::Enter => {
+                        if self.chat.is_generating {
+                            // Queue the message — will auto-send when generation completes
+                            if !self.chat.input_buffer.is_empty() {
+                                self.chat.pending_message = Some(self.chat.input_buffer.clone());
+                                self.chat.input_buffer.clear();
+                            }
+                        } else {
+                            self.send_chat_message();
+                        }
+                    }
+                    KeyCode::Esc => {
+                        if !self.chat.input_buffer.is_empty() {
+                            self.chat.input_buffer.clear();
+                        } else {
+                            self.chat.focus = ChatFocus::Table;
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        self.chat.input_buffer.pop();
+                    }
+                    KeyCode::Up => {
+                        if self.chat.show_suggestions && !self.chat.suggestions.is_empty() {
+                            if self.chat.selected_suggestion > 0 {
+                                self.chat.selected_suggestion -= 1;
+                            }
+                        } else {
+                            // Disengage auto-scroll when user scrolls up
+                            if self.chat.auto_scroll {
+                                // Snap scroll_offset to current bottom before disengaging
+                                self.chat.scroll_offset = usize::MAX; // will be clamped in render
+                            }
+                            self.chat.auto_scroll = false;
+                            self.chat.scroll_offset = self.chat.scroll_offset.saturating_sub(1);
+                        }
+                    }
+                    KeyCode::Down => {
+                        if self.chat.show_suggestions && !self.chat.suggestions.is_empty() {
+                            let max_idx = self.chat.suggestions.len(); // last = free-form
+                            if self.chat.selected_suggestion < max_idx {
+                                self.chat.selected_suggestion += 1;
+                            }
+                        } else if !self.chat.auto_scroll {
+                            self.chat.scroll_offset += 1;
+                            // Re-engage auto-scroll if we've scrolled to the bottom
+                            // (the render will clamp, so just check a generous threshold)
+                            self.chat.auto_scroll = true; // will be re-checked — if user scrolls up again, it disengages
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        self.chat.input_buffer.push(c);
+                        self.chat.show_suggestions = false;
+                    }
+                    _ => {}
+                }
+                true
+            }
+            // Auto-focus: printable chars when table is focused go to chat
+            KeyCode::Char(c) if self.chat.focus == ChatFocus::Table
+                && !self.show_transcript
+                && !self.search_mode
+                && c.is_alphanumeric()
+                && !matches!(c, 'q' | 'h' | 'H' | 's' | 'S' | 'r' | 'R' | 'a' | 'A' | 't' | 'T' | 'w' | 'W' | 'd' | 'p' | 'P' | '/' | '[' | ']') => {
+                self.chat.focus = ChatFocus::ChatInput;
+                self.chat.input_buffer.push(c);
+                self.chat.show_suggestions = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_transcript_chat_key(&mut self, key_code: KeyCode) -> bool {
+        if key_code == KeyCode::Tab {
+            self.chat.focus = match self.chat.focus {
+                ChatFocus::Table => ChatFocus::ChatInput, // Table = transcript scroll in this context
+                ChatFocus::ChatInput => ChatFocus::Table,
+            };
+            return true;
+        }
+
+        if self.chat.focus != ChatFocus::ChatInput {
+            return false;
+        }
+
+        match key_code {
+            KeyCode::Enter => {
+                if self.chat.is_generating {
+                    if !self.chat.input_buffer.is_empty() {
+                        self.chat.pending_message = Some(self.chat.input_buffer.clone());
+                        self.chat.input_buffer.clear();
+                    }
+                } else {
+                    self.send_chat_message();
+                }
+            }
+            KeyCode::Backspace => {
+                self.chat.input_buffer.pop();
+            }
+            KeyCode::Up => {
+                if self.chat.show_suggestions && !self.chat.suggestions.is_empty() {
+                    if self.chat.selected_suggestion > 0 {
+                        self.chat.selected_suggestion -= 1;
+                    }
+                } else {
+                    if self.chat.auto_scroll {
+                        self.chat.scroll_offset = usize::MAX;
+                    }
+                    self.chat.auto_scroll = false;
+                    self.chat.scroll_offset = self.chat.scroll_offset.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if self.chat.show_suggestions && !self.chat.suggestions.is_empty() {
+                    let max_idx = self.chat.suggestions.len();
+                    if self.chat.selected_suggestion < max_idx {
+                        self.chat.selected_suggestion += 1;
+                    }
+                } else if !self.chat.auto_scroll {
+                    self.chat.scroll_offset += 1;
+                    self.chat.auto_scroll = true;
+                }
+            }
+            KeyCode::Char(c) => {
+                self.chat.input_buffer.push(c);
+                self.chat.show_suggestions = false;
+            }
+            KeyCode::Esc => {
+                if !self.chat.input_buffer.is_empty() {
+                    self.chat.input_buffer.clear();
+                } else {
+                    self.chat.focus = ChatFocus::Table;
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    // ── Mouse Handling ────────────────────────────────────────────────────
+
+    /// Map a mouse position to a (content_line, char_col) in the chat content.
+    fn mouse_to_content_pos(&self, mouse_col: u16, mouse_row: u16) -> Option<(usize, usize)> {
+        let rect = self.chat.panel_rect;
+        let click_row = (mouse_row - rect.y).saturating_sub(1) as usize; // subtract top border
+        let char_col = (mouse_col - rect.x).saturating_sub(1) as usize; // subtract left border
+
+        let inner_height = rect.height.saturating_sub(2) as usize;
+        let has_conv = !self.chat.messages.is_empty() || self.chat.is_generating;
+        let reserved = if has_conv { 2 } else { 1 };
+        let chat_height = inner_height.saturating_sub(reserved);
+
+        let scroll_y = if self.chat.auto_scroll || self.chat.total_content_lines <= chat_height {
+            self.chat.total_content_lines.saturating_sub(chat_height)
+        } else {
+            let max_scroll = self.chat.total_content_lines.saturating_sub(chat_height);
+            self.chat.scroll_offset.min(max_scroll)
+        };
+
+        let lines_to_show = self.chat.total_content_lines.saturating_sub(scroll_y);
+        let pad = chat_height.saturating_sub(lines_to_show.min(chat_height));
+        if click_row < pad {
+            return None; // clicked on padding
+        }
+        let content_line = scroll_y + (click_row - pad);
+        if content_line >= self.chat.total_content_lines {
+            return None;
+        }
+        Some((content_line, char_col))
+    }
+
+    fn handle_mouse_event(&mut self, mouse: crossterm::event::MouseEvent) {
+        let rect = self.chat.panel_rect;
+        if rect.width == 0 || rect.height == 0 {
+            return;
+        }
+        // Only handle if mouse is within the chat panel
+        if mouse.column < rect.x || mouse.column >= rect.x + rect.width
+            || mouse.row < rect.y || mouse.row >= rect.y + rect.height
+        {
+            return;
+        }
+
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if self.chat.auto_scroll {
+                    self.chat.scroll_offset = self.chat.total_content_lines;
+                }
+                self.chat.auto_scroll = false;
+                self.chat.scroll_offset = self.chat.scroll_offset.saturating_sub(3);
+            }
+            MouseEventKind::ScrollDown => {
+                if !self.chat.auto_scroll {
+                    self.chat.scroll_offset += 3;
+                    let inner_height = rect.height.saturating_sub(2) as usize;
+                    let has_conv = !self.chat.messages.is_empty() || self.chat.is_generating;
+                    let reserved = if has_conv { 2 } else { 1 };
+                    let chat_height = inner_height.saturating_sub(reserved);
+                    if self.chat.scroll_offset + chat_height >= self.chat.total_content_lines {
+                        self.chat.auto_scroll = true;
+                    }
+                }
+            }
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                // Start text selection
+                if let Some(pos) = self.mouse_to_content_pos(mouse.column, mouse.row) {
+                    self.chat.selection_anchor = Some(pos);
+                    self.chat.selection_end = None; // reset until drag
+                    self.chat.focus = ChatFocus::ChatInput;
+                }
+            }
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                // Extend selection + auto-scroll at edges
+                if self.chat.selection_anchor.is_some() {
+                    let edge_zone = 2u16; // rows from edge that trigger auto-scroll
+                    let top_edge = rect.y + 1; // inside top border
+                    let inner_height = rect.height.saturating_sub(2) as usize;
+                    let has_conv = !self.chat.messages.is_empty() || self.chat.is_generating;
+                    let reserved = if has_conv { 2 } else { 1 };
+                    let chat_height = inner_height.saturating_sub(reserved);
+                    let bottom_edge = rect.y + 1 + chat_height as u16;
+
+                    if mouse.row < top_edge + edge_zone && mouse.row >= rect.y {
+                        // Dragging near top — scroll up
+                        if self.chat.auto_scroll {
+                            self.chat.scroll_offset = self.chat.total_content_lines;
+                        }
+                        self.chat.auto_scroll = false;
+                        self.chat.scroll_offset = self.chat.scroll_offset.saturating_sub(2);
+                    } else if mouse.row >= bottom_edge.saturating_sub(edge_zone) && mouse.row < rect.y + rect.height {
+                        // Dragging near bottom — scroll down
+                        if !self.chat.auto_scroll {
+                            self.chat.scroll_offset += 2;
+                            if self.chat.scroll_offset + chat_height >= self.chat.total_content_lines {
+                                self.chat.auto_scroll = true;
+                            }
+                        }
+                    }
+
+                    if let Some(pos) = self.mouse_to_content_pos(mouse.column, mouse.row) {
+                        self.chat.selection_end = Some(pos);
+                    }
+                }
+            }
+            MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                // Finalize selection and copy
+                if let (Some(anchor), Some(end)) = (self.chat.selection_anchor, self.chat.selection_end) {
+                    let selected = self.extract_selected_text(anchor, end);
+                    if !selected.trim().is_empty() {
+                        use arboard::Clipboard;
+                        if let Ok(mut clipboard) = Clipboard::new() {
+                            let _ = clipboard.set_text(&selected);
+                            self.notification_message = Some(("Copied to clipboard".to_string(), 15));
+                        }
+                    }
+                    // Keep selection visible (don't clear anchor/end) — cleared on next click
+                } else {
+                    // Single click (no drag) — clear any existing selection
+                    self.chat.selection_anchor = None;
+                    self.chat.selection_end = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Extract the plain text between two content positions.
+    fn extract_selected_text(&self, anchor: (usize, usize), end: (usize, usize)) -> String {
+        // Normalize: start is the earlier position
+        let (start, end) = if anchor <= end { (anchor, end) } else { (end, anchor) };
+        let (start_line, start_col) = start;
+        let (end_line, end_col) = end;
+
+        let texts = &self.chat.content_texts;
+        if texts.is_empty() || start_line >= texts.len() {
+            return String::new();
+        }
+
+        let mut result = String::new();
+        for line_idx in start_line..=end_line.min(texts.len() - 1) {
+            let line_text = &texts[line_idx];
+            let chars: Vec<char> = line_text.chars().collect();
+
+            let from = if line_idx == start_line { start_col.min(chars.len()) } else { 0 };
+            let to = if line_idx == end_line { end_col.min(chars.len()) } else { chars.len() };
+
+            if from < to {
+                let slice: String = chars[from..to].iter().collect();
+                result.push_str(&slice);
+            }
+            if line_idx < end_line {
+                result.push('\n');
+            }
+        }
+
+        result
+    }
+
+    // ── Markdown Parsing ─────────────────────────────────────────────────
+
+    /// Parse simple markdown into styled spans: **bold**, *italic*, `code`.
+    /// Returns owned spans to avoid lifetime issues in closures.
+    /// Strip leading `# ` / `## ` etc. prefix spans emitted by tui_markdown for headings.
+    fn strip_heading_prefix(mut line: Line<'static>) -> Line<'static> {
+        if let Some(first) = line.spans.first() {
+            let trimmed = first.content.trim_end();
+            if !trimmed.is_empty() && trimmed.chars().all(|c| c == '#') {
+                line.spans.remove(0);
+            }
+        }
+        line
+    }
+
+    /// Wrap a styled Line to fit within max_width, preserving span styles.
+    fn wrap_styled_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
+        let char_count: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        if char_count <= max_width || max_width == 0 {
+            return vec![line];
+        }
+
+        let styled_chars: Vec<(char, Style)> = line
+            .spans
+            .iter()
+            .flat_map(|span| span.content.chars().map(move |c| (c, span.style)))
+            .collect();
+
+        let mut result = Vec::new();
+        let mut pos = 0;
+
+        while pos < styled_chars.len() {
+            let end = (pos + max_width).min(styled_chars.len());
+            let actual_end = if end >= styled_chars.len() {
+                end
+            } else {
+                styled_chars[pos..end]
+                    .iter()
+                    .rposition(|(c, _)| *c == ' ')
+                    .map(|p| pos + p + 1)
+                    .unwrap_or(end)
+            };
+
+            let chunk = &styled_chars[pos..actual_end];
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            if let Some(&(first_c, first_style)) = chunk.first() {
+                let mut current_text = String::new();
+                current_text.push(first_c);
+                let mut current_style = first_style;
+                for &(c, style) in &chunk[1..] {
+                    if style != current_style {
+                        spans.push(Span::styled(current_text, current_style));
+                        current_text = String::new();
+                        current_style = style;
+                    }
+                    current_text.push(c);
+                }
+                spans.push(Span::styled(current_text, current_style));
+            }
+            result.push(Line::from(spans));
+
+            pos = actual_end;
+            while pos < styled_chars.len() && styled_chars[pos].0 == ' ' {
+                pos += 1;
+            }
+        }
+
+        result
+    }
+
+    /// Apply a highlight background to a portion of a Line (for text selection).
+    fn apply_selection_highlight(line: Line<'static>, sel_start: usize, sel_end: usize) -> Line<'static> {
+        if sel_start >= sel_end {
+            return line;
+        }
+        let highlight_bg = Color::Indexed(237); // subtle dark gray background
+        let mut result_spans: Vec<Span<'static>> = Vec::new();
+        let mut col: usize = 0;
+
+        for span in line.spans {
+            let span_char_count = span.content.chars().count();
+            let span_start = col;
+            let span_end = col + span_char_count;
+
+            if span_end <= sel_start || span_start >= sel_end {
+                // Entirely outside selection
+                result_spans.push(span);
+            } else {
+                let chars: Vec<char> = span.content.chars().collect();
+
+                // Before selection
+                let hl_start = sel_start.saturating_sub(span_start);
+                if hl_start > 0 {
+                    let before: String = chars[..hl_start].iter().collect();
+                    result_spans.push(Span::styled(before, span.style));
+                }
+
+                // Selected portion
+                let hl_end = (sel_end - span_start).min(chars.len());
+                let selected: String = chars[hl_start..hl_end].iter().collect();
+                result_spans.push(Span::styled(selected, span.style.bg(highlight_bg)));
+
+                // After selection
+                if hl_end < chars.len() {
+                    let after: String = chars[hl_end..].iter().collect();
+                    result_spans.push(Span::styled(after, span.style));
+                }
+            }
+
+            col = span_end;
+        }
+
+        Line::from(result_spans)
+    }
+
+    // ── Chat Rendering ──────────────────────────────────────────────────────
+
+    fn render_chat_panel(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
+        self.chat.panel_rect = area;
+        if area.height < 3 {
+            return;
+        }
+
+        let is_focused = self.chat.focus == ChatFocus::ChatInput;
+        let border_color = if is_focused { Color::Cyan } else { Color::DarkGray };
+
+        let title = match &self.chat.context {
+            ChatContext::Global => "Ask Scriba",
+            ChatContext::Recording { .. } => "Ask about this recording",
+        };
+
+        // Content height inside the bordered block (minus top/bottom border)
+        let inner_height = area.height.saturating_sub(2) as usize;
+        let has_conversation = !self.chat.messages.is_empty() || self.chat.is_generating;
+        // Reserve lines at bottom: 1 for input + 1 for separator when conversation active
+        let reserved = if has_conversation { 2 } else { 1 };
+        let chat_height = inner_height.saturating_sub(reserved);
+        let content_width = area.width.saturating_sub(4) as usize; // borders + padding
+
+        let mut final_lines: Vec<Line> = Vec::with_capacity(inner_height);
+
+        // Suggestions mode: no messages yet
+        let show_suggestions = self.chat.show_suggestions
+            && !self.chat.suggestions.is_empty()
+            && self.chat.messages.is_empty()
+            && self.chat.streaming_content.is_empty()
+            && !self.chat.is_generating;
+
+        // Compute selection range (normalized: start <= end)
+        let selection = match (self.chat.selection_anchor, self.chat.selection_end) {
+            (Some(a), Some(e)) => {
+                let (start, end) = if a <= e { (a, e) } else { (e, a) };
+                Some((start, end))
+            }
+            _ => None,
+        };
+
+        if show_suggestions {
+            let mut all_lines: Vec<Line> = Vec::new();
+            let mut content_texts: Vec<String> = Vec::new();
+            let total_options = self.chat.suggestions.len() + 1;
+            for (i, s) in self.chat.suggestions.iter().enumerate() {
+                let text = if i == self.chat.selected_suggestion {
+                    format!("  > {}", s)
+                } else {
+                    format!("    {}", s)
+                };
+                let style = if i == self.chat.selected_suggestion {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                content_texts.push(text.clone());
+                all_lines.push(Line::from(Span::styled(text, style)));
+            }
+            let free_form_idx = total_options - 1;
+            let text = if self.chat.selected_suggestion == free_form_idx {
+                "  > Ask Scriba anything..."
+            } else {
+                "    Ask Scriba anything..."
+            };
+            let style = if self.chat.selected_suggestion == free_form_idx {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            content_texts.push(text.to_string());
+            all_lines.push(Line::from(Span::styled(text.to_string(), style)));
+
+            self.chat.content_texts = content_texts;
+            let total_content = all_lines.len();
+            self.chat.total_content_lines = total_content;
+            let scroll_y: u16 = if self.chat.auto_scroll || total_content <= chat_height {
+                total_content.saturating_sub(chat_height) as u16
+            } else {
+                let max_scroll = total_content.saturating_sub(chat_height);
+                self.chat.scroll_offset.min(max_scroll) as u16
+            };
+            let lines_to_show = total_content.saturating_sub(scroll_y as usize);
+            let pad = chat_height.saturating_sub(lines_to_show.min(chat_height));
+            for _ in 0..pad {
+                final_lines.push(Line::from(""));
+            }
+            for (vis_idx, line) in all_lines.into_iter().skip(scroll_y as usize).take(chat_height).enumerate() {
+                let content_idx = scroll_y as usize + vis_idx;
+                if let Some(((sel_start_line, sel_start_col), (sel_end_line, sel_end_col))) = selection {
+                    if content_idx >= sel_start_line && content_idx <= sel_end_line {
+                        let line_start = if content_idx == sel_start_line { sel_start_col } else { 0 };
+                        let line_text_len = self.chat.content_texts.get(content_idx)
+                            .map(|t| t.chars().count()).unwrap_or(0);
+                        let line_end = if content_idx == sel_end_line { sel_end_col } else { line_text_len };
+                        final_lines.push(Self::apply_selection_highlight(line, line_start, line_end));
+                        continue;
+                    }
+                }
+                final_lines.push(line);
+            }
+        } else {
+            // ── Phase 1: Completed messages (cached) ───────────────────────
+            let msg_count = self.chat.messages.len();
+            let cache_valid = msg_count == self.chat.cached_msg_count
+                && content_width == self.chat.cached_width;
+
+            if !cache_valid {
+                let mut cached_lines: Vec<Line<'static>> = Vec::new();
+                let mut cached_texts: Vec<String> = Vec::new();
+                let wrap_width = content_width.saturating_sub(2);
+
+                for msg in &self.chat.messages {
+                    match msg.role {
+                        ChatRole::User => {
+                            let header = "You:".to_string();
+                            cached_texts.push(header.clone());
+                            cached_lines.push(Line::from(Span::styled(
+                                header,
+                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                            )));
+                            let style = Style::default().fg(Color::Cyan);
+                            for line in msg.content.lines() {
+                                let wrapped = textwrap::wrap(line, wrap_width);
+                                if wrapped.is_empty() {
+                                    cached_texts.push("  ".to_string());
+                                    cached_lines.push(Line::from(Span::styled("  ".to_string(), style)));
+                                } else {
+                                    for w in &wrapped {
+                                        let full = format!("  {}", w);
+                                        cached_texts.push(full.clone());
+                                        cached_lines.push(Line::from(Span::styled(full, style)));
+                                    }
+                                }
+                            }
+                            cached_texts.push(String::new());
+                            cached_lines.push(Line::from(""));
+                        }
+                        ChatRole::Assistant => {
+                            let header = "(o,o):".to_string();
+                            cached_texts.push(header.clone());
+                            cached_lines.push(Line::from(Span::styled(
+                                header,
+                                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                            )));
+                            let md_text = tui_markdown::from_str(&msg.content);
+                            for md_line in md_text.lines {
+                                let owned_line = Line::from(
+                                    md_line
+                                        .spans
+                                        .into_iter()
+                                        .map(|span| Span::styled(span.content.to_string(), span.style))
+                                        .collect::<Vec<_>>(),
+                                );
+                                let owned_line = Self::strip_heading_prefix(owned_line);
+                                let wrapped_lines = Self::wrap_styled_line(owned_line, wrap_width);
+                                for wl in wrapped_lines {
+                                    let plain: String =
+                                        wl.spans.iter().map(|s| s.content.as_ref()).collect();
+                                    cached_texts.push(format!("  {}", plain));
+                                    let mut indented = vec![Span::raw("  ".to_string())];
+                                    indented.extend(wl.spans);
+                                    cached_lines.push(Line::from(indented));
+                                }
+                            }
+                            cached_texts.push(String::new());
+                            cached_lines.push(Line::from(""));
+                        }
+                        ChatRole::System => {
+                            let style = Style::default().fg(Color::Red).add_modifier(Modifier::ITALIC);
+                            for line in msg.content.lines() {
+                                let wrapped = textwrap::wrap(line, content_width);
+                                if wrapped.is_empty() {
+                                    cached_texts.push(String::new());
+                                    cached_lines.push(Line::from(Span::styled(String::new(), style)));
+                                } else {
+                                    for w in &wrapped {
+                                        let full = w.to_string();
+                                        cached_texts.push(full.clone());
+                                        cached_lines.push(Line::from(Span::styled(full, style)));
+                                    }
+                                }
+                            }
+                            cached_texts.push(String::new());
+                            cached_lines.push(Line::from(""));
+                        }
+                    }
+                }
+
+                self.chat.cached_msg_lines = cached_lines;
+                self.chat.cached_msg_texts = cached_texts;
+                self.chat.cached_msg_count = msg_count;
+                self.chat.cached_width = content_width;
+            }
+
+            // ── Phase 2: Dynamic content (always rebuilt) ──────────────────
+            let mut dynamic_lines: Vec<Line<'static>> = Vec::new();
+            let mut dynamic_texts: Vec<String> = Vec::new();
+
+            if !self.chat.streaming_content.is_empty() {
+                let header = "(o,o):".to_string();
+                dynamic_texts.push(header.clone());
+                dynamic_lines.push(Line::from(Span::styled(
+                    header,
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )));
+                let wrap_width = content_width.saturating_sub(2);
+                let md_text = tui_markdown::from_str(&self.chat.streaming_content);
+                for md_line in md_text.lines {
+                    let owned_line = Line::from(
+                        md_line
+                            .spans
+                            .into_iter()
+                            .map(|span| Span::styled(span.content.to_string(), span.style))
+                            .collect::<Vec<_>>(),
+                    );
+                    let owned_line = Self::strip_heading_prefix(owned_line);
+                    let wrapped_lines = Self::wrap_styled_line(owned_line, wrap_width);
+                    for wl in wrapped_lines {
+                        let plain: String =
+                            wl.spans.iter().map(|s| s.content.as_ref()).collect();
+                        dynamic_texts.push(format!("  {}", plain));
+                        let mut indented = vec![Span::raw("  ".to_string())];
+                        indented.extend(wl.spans);
+                        dynamic_lines.push(Line::from(indented));
+                    }
+                }
+            }
+
+            if let Some(status) = &self.chat.current_status {
+                let spinners = ['◐', '◑', '◒', '◓'];
+                let spinner = spinners[self.chat.spinner_frame % spinners.len()];
+                let text = format!(" {} {}", spinner, status);
+                dynamic_texts.push(text);
+                dynamic_lines.push(Line::from(vec![
+                    Span::styled(
+                        format!(" {} ", spinner),
+                        Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(status.clone(), Style::default().fg(Color::Yellow)),
+                ]));
+            }
+
+            // ── Phase 3: Assemble content_texts, compute total ─────────────
+            let cached_len = self.chat.cached_msg_lines.len();
+            let total_content = cached_len + dynamic_lines.len();
+            self.chat.total_content_lines = total_content;
+
+            let mut content_texts = self.chat.cached_msg_texts.clone();
+            content_texts.extend(dynamic_texts);
+            self.chat.content_texts = content_texts;
+
+            // ── Scroll calculation ─────────────────────────────────────────
+            let scroll_y: u16 = if self.chat.auto_scroll || total_content <= chat_height {
+                total_content.saturating_sub(chat_height) as u16
+            } else {
+                let max_scroll = total_content.saturating_sub(chat_height);
+                self.chat.scroll_offset.min(max_scroll) as u16
+            };
+            let lines_to_show = total_content.saturating_sub(scroll_y as usize);
+            let pad = chat_height.saturating_sub(lines_to_show.min(chat_height));
+            for _ in 0..pad {
+                final_lines.push(Line::from(""));
+            }
+
+            // ── Phase 4: Build visible window (only visible lines cloned) ──
+            let start = scroll_y as usize;
+            let end = (start + chat_height).min(total_content);
+            for i in start..end {
+                let line = if i < cached_len {
+                    self.chat.cached_msg_lines[i].clone()
+                } else {
+                    dynamic_lines[i - cached_len].clone()
+                };
+                let content_idx = i;
+                if let Some(((sel_start_line, sel_start_col), (sel_end_line, sel_end_col))) = selection {
+                    if content_idx >= sel_start_line && content_idx <= sel_end_line {
+                        let line_start = if content_idx == sel_start_line { sel_start_col } else { 0 };
+                        let line_text_len = self.chat.content_texts.get(content_idx)
+                            .map(|t| t.chars().count()).unwrap_or(0);
+                        let line_end = if content_idx == sel_end_line { sel_end_col } else { line_text_len };
+                        final_lines.push(Self::apply_selection_highlight(line, line_start, line_end));
+                        continue;
+                    }
+                }
+                final_lines.push(line);
+            }
+        }
+
+        // ── Separator + Input line (always last lines inside the block) ────
+        // Visual breathing room between chat content and input
+        if has_conversation {
+            let sep_width = content_width.min(area.width.saturating_sub(4) as usize);
+            let sep = "─".repeat(sep_width);
+            final_lines.push(Line::from(Span::styled(
+                format!("  {}", sep),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
+        let cursor = if is_focused { "▎" } else { "" };
+        let has_pending = self.chat.pending_message.is_some();
+        let input_line = if has_pending && self.chat.input_buffer.is_empty() {
+            // Message queued while generating
+            let queued_msg = self.chat.pending_message.as_deref().unwrap_or("");
+            Line::from(vec![
+                Span::styled("  ▸ ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("{} ", queued_msg),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled("(queued)", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
+            ])
+        } else if !self.chat.input_buffer.is_empty() {
+            Line::from(vec![
+                Span::styled("  ▸ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("{}{}", self.chat.input_buffer, cursor),
+                    Style::default().fg(Color::White),
+                ),
+            ])
+        } else {
+            let prompt_color = if is_focused { Color::Cyan } else { Color::DarkGray };
+            Line::from(Span::styled(
+                format!("  ▸ {}", cursor),
+                Style::default().fg(prompt_color),
+            ))
+        };
+        final_lines.push(input_line);
+
+        let para = Paragraph::new(final_lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(border_color))
+                    .title(title)
+                    .title_style(Style::default().fg(if is_focused { Color::Cyan } else { Color::DarkGray })),
+            );
+        f.render_widget(para, area);
+
+        // ── Scroll position indicator (right border) ────────────────────────
+        let total_content = self.chat.total_content_lines;
+        if total_content > chat_height && chat_height > 0 {
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .thumb_symbol("█")
+                .track_symbol(Some("│"))
+                .begin_symbol(None)
+                .end_symbol(None)
+                .thumb_style(Style::default().fg(Color::Cyan))
+                .track_style(Style::default().fg(Color::Indexed(237)));
+            let scroll_y = if self.chat.auto_scroll || total_content <= chat_height {
+                total_content.saturating_sub(chat_height)
+            } else {
+                let max_scroll = total_content.saturating_sub(chat_height);
+                self.chat.scroll_offset.min(max_scroll)
+            };
+            let mut scrollbar_state = ScrollbarState::new(total_content)
+                .position(scroll_y);
+            // Render inside the block border area (shrink by 1 on each side)
+            let scrollbar_area = ratatui::layout::Rect {
+                x: area.x,
+                y: area.y + 1,
+                width: area.width,
+                height: area.height.saturating_sub(2),
+            };
+            f.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+        }
+    }
+
+    fn render_compressed_footer(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        // Show notification if present (auto-dismissing)
+        if let Some((ref msg, _)) = self.notification_message {
+            let is_error = msg.contains("failed") || msg.contains("Failed");
+            let style = if is_error {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            };
+            let para = Paragraph::new(msg.as_str())
+                .style(style)
+                .alignment(Alignment::Center);
+            f.render_widget(para, area);
+            return;
+        }
+
+        let voice_status = if self.voice_mode_active { " | Voice" } else { "" };
+        let transcribing = if self.transcribing_recording_name.is_some() { " | Transcribing..." } else { "" };
+        let controls = format!(
+            "TAB: Focus | ↑↓: Nav | /: Search | R: Record | A: Add | W: World | S: Settings | H: Help | Q: Quit{}{}",
+            transcribing, voice_status
+        );
+        let para = Paragraph::new(controls)
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center);
+        f.render_widget(para, area);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Onboarding: Scriba the Owl
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -4725,14 +6386,150 @@ impl Dashboard {
             }
             OnboardingStep::Intro => {
                 if !ob.text_complete {
-                    // Any key completes typewriter
                     ob.complete_text();
                 } else if matches!(key_code, KeyCode::Enter) {
-                    ob.step = OnboardingStep::AskName;
+                    ob.step = OnboardingStep::ModeSelection;
                     ob.anim_frame = 0;
                     ob.set_step_text(
-                        "So, who am I working for?\n\nWhat's your name?"
+                        "First, how should I think?\n\n\
+                         I can use a cloud AI (smarter, needs API key)\n\
+                         or run locally on your machine (private, needs Ollama).\n\n\
+                         [1] Cloud Provider (recommended)\n\
+                         [2] Privacy Mode (local Ollama)"
                     );
+                }
+            }
+            OnboardingStep::ModeSelection => {
+                if !ob.text_complete {
+                    ob.complete_text();
+                } else {
+                    match key_code {
+                        KeyCode::Char('1') => {
+                            ob.selected_mode = 0;
+                            ob.step = OnboardingStep::ProviderSelection;
+                            ob.anim_frame = 0;
+                            ob.set_step_text(
+                                "Great choice! Which cloud provider?\n\n\
+                                 [1] Anthropic (Claude) -- Best for nuanced understanding\n\
+                                 [2] OpenAI (GPT) -- Widely used, reliable\n\
+                                 [3] Google (Gemini) -- Fast and cost-effective"
+                            );
+                        }
+                        KeyCode::Char('2') => {
+                            ob.selected_mode = 1;
+                            // Set local mode in config and skip to AskName
+                            self.config.enrichment.mode = EnrichmentMode::Local {
+                                ollama_endpoint: "http://localhost:11434".to_string(),
+                                ollama_model: "mistral:latest".to_string(),
+                            };
+                            let _ = self.config.save();
+                            ob.step = OnboardingStep::AskName;
+                            ob.anim_frame = 0;
+                            ob.set_step_text(
+                                "Privacy mode it is! Make sure Ollama is running.\n\n\
+                                 So, who am I working for?\n\nWhat's your name?"
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            OnboardingStep::ProviderSelection => {
+                if !ob.text_complete {
+                    ob.complete_text();
+                } else {
+                    let provider = match key_code {
+                        KeyCode::Char('1') => Some(CloudProvider::Anthropic),
+                        KeyCode::Char('2') => Some(CloudProvider::OpenAI),
+                        KeyCode::Char('3') => Some(CloudProvider::Google),
+                        _ => None,
+                    };
+                    if let Some(p) = provider {
+                        ob.selected_provider = match &p {
+                            CloudProvider::Anthropic => 0,
+                            CloudProvider::OpenAI => 1,
+                            CloudProvider::Google => 2,
+                        };
+                        self.config.enrichment.mode = EnrichmentMode::Cloud {
+                            provider: p.clone(),
+                            api_key: String::new(),
+                            model: None,
+                        };
+                        ob.step = OnboardingStep::ApiKeyEntry;
+                        ob.anim_frame = 0;
+                        ob.set_step_text(&format!(
+                            "Excellent! Now I need your {} API key.\n\n\
+                             Paste it below (it won't be shown):",
+                            p.display_name()
+                        ));
+                    }
+                }
+            }
+            OnboardingStep::ApiKeyEntry => {
+                if !ob.text_complete {
+                    ob.complete_text();
+                } else {
+                    match key_code {
+                        KeyCode::Enter => {
+                            if !ob.api_key_input.trim().is_empty() {
+                                let key = ob.api_key_input.trim().to_string();
+                                if let EnrichmentMode::Cloud { api_key, .. } = &mut self.config.enrichment.mode {
+                                    *api_key = key.clone();
+                                }
+                                let _ = self.config.save();
+
+                                // Start validation
+                                ob.step = OnboardingStep::ApiKeyValidation;
+                                ob.anim_frame = 0;
+                                ob.api_key_valid = None;
+                                ob.set_step_text("Testing your API key...");
+
+                                let config = self.config.enrichment.clone();
+                                ob.validation_task = Some(tokio::spawn(async move {
+                                    let provider = crate::enrichment::create_provider(&config);
+                                    match provider.health_check().await {
+                                        Ok(()) => Ok(true),
+                                        Err(_) => Ok(false),
+                                    }
+                                }));
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            ob.api_key_input.push(c);
+                        }
+                        KeyCode::Backspace => {
+                            ob.api_key_input.pop();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            OnboardingStep::ApiKeyValidation => {
+                // Validation result is resolved by the tick handler.
+                // Here we only handle retry/skip choices after validation fails.
+                if ob.api_key_valid == Some(false) {
+                    // Handle retry/skip
+                    match key_code {
+                        KeyCode::Char('1') => {
+                            ob.step = OnboardingStep::ApiKeyEntry;
+                            ob.api_key_input.clear();
+                            ob.anim_frame = 0;
+                            let provider_name = self.config.enrichment.provider_display_name().to_string();
+                            ob.set_step_text(&format!(
+                                "Let's try again. Paste your {} API key:",
+                                provider_name
+                            ));
+                        }
+                        KeyCode::Char('2') => {
+                            ob.step = OnboardingStep::AskName;
+                            ob.anim_frame = 0;
+                            ob.set_step_text(
+                                "No worries! You can set the key later in Settings.\n\n\
+                                 So, who am I working for?\n\nWhat's your name?"
+                            );
+                        }
+                        _ => {}
+                    }
                 }
             }
             OnboardingStep::AskName => {
@@ -4896,12 +6693,26 @@ impl Dashboard {
             if result.is_some() {
                 Ok((result, None))
             } else {
-                // Ollama unavailable — diagnose why
-                let client = OllamaClient::new(
-                    &config.enrichment.ollama_endpoint,
-                    &config.enrichment.ollama_model,
-                );
-                let hint = client.diagnose().await.hint();
+                // Provider unavailable — diagnose why
+                let hint = if config.enrichment.is_local() {
+                    let endpoint = config.enrichment.ollama_endpoint();
+                    let model = config.enrichment.ollama_model();
+                    let client = OllamaClient::new(&endpoint, &model);
+                    client.diagnose().await.hint()
+                } else {
+                    let provider_name = config.enrichment.provider_display_name().to_string();
+                    if config.enrichment.resolve_api_key().is_none() {
+                        Some(format!(
+                            "No API key set for {}.\n\nSet it with:\n  scriba config set-enrichment-key <your-key>",
+                            provider_name
+                        ))
+                    } else {
+                        Some(format!(
+                            "{} is not reachable.\n\nCheck your API key and network connection.",
+                            provider_name
+                        ))
+                    }
+                };
                 Ok((None, hint))
             }
         }));
@@ -5118,6 +6929,10 @@ impl Dashboard {
 
     fn render_owl(&self, f: &mut Frame, area: ratatui::layout::Rect, ob: &OnboardingState) {
         let owl_text = match ob.step {
+            OnboardingStep::ApiKeyValidation if ob.validation_task.is_some() => {
+                // Thinking animation while validating API key
+                OWL_THINKING[(ob.anim_frame / 3) % 8]
+            }
             OnboardingStep::Processing if ob.processing_task.is_some() => {
                 // Slow: one frame change every ~300ms
                 OWL_THINKING[(ob.anim_frame / 3) % 8]
@@ -5165,7 +6980,7 @@ impl Dashboard {
         // Add input field for input steps
         let show_input = ob.text_complete && matches!(
             ob.step,
-            OnboardingStep::AskName | OnboardingStep::AskRole | OnboardingStep::AskAliases
+            OnboardingStep::ApiKeyEntry | OnboardingStep::AskName | OnboardingStep::AskRole | OnboardingStep::AskAliases
         );
 
         // Add confirmation choices
@@ -5210,6 +7025,7 @@ impl Dashboard {
         // Input field
         if show_input {
             let input_value = match ob.step {
+                OnboardingStep::ApiKeyEntry => &ob.api_key_input,
                 OnboardingStep::AskName => &ob.user_name,
                 OnboardingStep::AskRole => &ob.user_role,
                 OnboardingStep::AskAliases => &ob.user_aliases,
@@ -5223,7 +7039,22 @@ impl Dashboard {
                 height: 3,
             };
 
-            let input_text = format!("{}_", input_value);
+            // Mask API key input: show first 4 chars + dots
+            let display_value = if ob.step == OnboardingStep::ApiKeyEntry && !input_value.is_empty() {
+                let visible = input_value.chars().take(4).collect::<String>();
+                let hidden = "*".repeat(input_value.len().saturating_sub(4));
+                format!("{}{}", visible, hidden)
+            } else {
+                input_value.to_string()
+            };
+
+            let input_title = if ob.step == OnboardingStep::ApiKeyEntry {
+                " API Key "
+            } else {
+                " Your answer "
+            };
+
+            let input_text = format!("{}_", display_value);
             let input = Paragraph::new(input_text)
                 .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
                 .block(
@@ -5231,7 +7062,7 @@ impl Dashboard {
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(Color::Yellow))
                         .title(Span::styled(
-                            " Your answer ",
+                            input_title,
                             Style::default().fg(Color::Yellow),
                         )),
                 );
@@ -5240,9 +7071,12 @@ impl Dashboard {
     }
 
     fn render_onboarding_footer(&self, f: &mut Frame, area: ratatui::layout::Rect, ob: &OnboardingState) {
-        // Step indicator dots
+        // Step indicator dots — 9 logical steps
         let steps = [
             OnboardingStep::Intro,
+            OnboardingStep::ModeSelection,
+            OnboardingStep::ProviderSelection,
+            OnboardingStep::ApiKeyEntry,
             OnboardingStep::AskName,
             OnboardingStep::AskRole,
             OnboardingStep::AskAliases,
@@ -5254,12 +7088,15 @@ impl Dashboard {
         let current_idx = match ob.step {
             OnboardingStep::Entrance => 0,
             OnboardingStep::Intro => 0,
-            OnboardingStep::AskName => 1,
-            OnboardingStep::AskRole => 2,
-            OnboardingStep::AskAliases => 3,
-            OnboardingStep::Processing => 4,
-            OnboardingStep::Confirmation => 5,
-            OnboardingStep::Done => 6,
+            OnboardingStep::ModeSelection => 1,
+            OnboardingStep::ProviderSelection => 2,
+            OnboardingStep::ApiKeyEntry | OnboardingStep::ApiKeyValidation => 3,
+            OnboardingStep::AskName => 4,
+            OnboardingStep::AskRole => 5,
+            OnboardingStep::AskAliases => 6,
+            OnboardingStep::Processing => 7,
+            OnboardingStep::Confirmation => 8,
+            OnboardingStep::Done => 9,
         };
 
         let mut dots: Vec<Span> = Vec::new();
@@ -5276,6 +7113,20 @@ impl Dashboard {
         let hint = match ob.step {
             OnboardingStep::Intro => {
                 if ob.text_complete { "ENTER: Continue" } else { "ENTER: Skip text" }
+            }
+            OnboardingStep::ModeSelection => {
+                if ob.text_complete { "[1] Cloud  [2] Local" } else { "ENTER: Skip text" }
+            }
+            OnboardingStep::ProviderSelection => {
+                if ob.text_complete { "[1] Anthropic  [2] OpenAI  [3] Google" } else { "ENTER: Skip text" }
+            }
+            OnboardingStep::ApiKeyEntry => {
+                "Paste your API key, ENTER to validate"
+            }
+            OnboardingStep::ApiKeyValidation => {
+                if ob.validation_task.is_some() { "Validating..." }
+                else if ob.api_key_valid == Some(false) { "[1] Retry  [2] Skip" }
+                else { "" }
             }
             OnboardingStep::AskName | OnboardingStep::AskRole => {
                 "Type your answer, ENTER to continue"
@@ -5394,5 +7245,63 @@ impl Dashboard {
             let p = Paragraph::new(lines);
             f.render_widget(p, area);
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Chat Generation Pipeline (free function, runs as spawned task)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn chat_generation_pipeline(
+    config: crate::core::config::EnrichmentConfig,
+    system_prompt: String,
+    messages: Vec<(String, String)>,
+    user_message: String,
+    entity_names: Vec<(String, i64)>,
+    tx: mpsc::Sender<ChatStreamEvent>,
+) {
+    // Step 1: Entity cross-referencing
+    let _ = tx.send(ChatStreamEvent::Status("Searching for related recordings...".to_string())).await;
+    let mut extra_context = String::new();
+
+    if let Ok(db) = crate::database::Database::new() {
+        for (name, entity_id) in &entity_names {
+            if user_message.to_lowercase().contains(&name.to_lowercase()) {
+                if let Ok(recordings) = db.get_recordings_for_entity(*entity_id) {
+                    if !recordings.is_empty() {
+                        let recording_summaries: Vec<(String, String)> = recordings.iter().take(5).map(|r| {
+                            let rname = r.display_name.as_ref().unwrap_or(&r.directory_name).clone();
+                            let summary = r.summary.as_deref().unwrap_or("(no summary)").to_string();
+                            (rname, summary)
+                        }).collect();
+                        extra_context += &chat_prompts::format_related_recordings(name, &recording_summaries);
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 2: Build prompt
+    let _ = tx.send(ChatStreamEvent::Status("Building context...".to_string())).await;
+    let full_prompt = chat_prompts::build_conversation(&system_prompt, &messages, &user_message, &extra_context);
+
+    // Step 3: Stream response
+    let _ = tx.send(ChatStreamEvent::Status("Thinking...".to_string())).await;
+    let provider = crate::enrichment::create_provider(&config);
+    let (chunk_tx, mut chunk_rx) = mpsc::channel::<String>(100);
+
+    let stream_handle = tokio::spawn(async move {
+        provider.generate_text_stream(&full_prompt, chunk_tx).await
+    });
+
+    // Forward chunks
+    while let Some(chunk) = chunk_rx.recv().await {
+        let _ = tx.send(ChatStreamEvent::Chunk(chunk)).await;
+    }
+
+    match stream_handle.await {
+        Ok(Ok(())) => { let _ = tx.send(ChatStreamEvent::Done).await; }
+        Ok(Err(e)) => { let _ = tx.send(ChatStreamEvent::Error(format!("{}", e))).await; }
+        Err(e) => { let _ = tx.send(ChatStreamEvent::Error(format!("Task error: {}", e))).await; }
     }
 }

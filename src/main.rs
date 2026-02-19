@@ -1,7 +1,7 @@
 use anyhow::Result;
 use scriba::core::{
-    resolve_transcription_mode, AudioFormat, CompressionSettings, LocalModelSize, ScribaConfig,
-    TranscriptionMode, WorkflowManager, initialize_world_from_seed,
+    resolve_transcription_mode, AudioFormat, CloudProvider, CompressionSettings, EnrichmentMode,
+    LocalModelSize, ScribaConfig, TranscriptionMode, WorkflowManager, initialize_world_from_seed,
 };
 use scriba::database::Database;
 use scriba::enrichment::WorldContext;
@@ -117,6 +117,21 @@ enum Command {
     Enrich {
         #[structopt(help = "Recording directory name to enrich")]
         directory_name: String,
+        #[structopt(
+            long = "enrichment-provider",
+            help = "Override enrichment provider (anthropic|openai|google|ollama)"
+        )]
+        enrichment_provider: Option<String>,
+        #[structopt(
+            long = "enrichment-api-key",
+            help = "Override enrichment API key"
+        )]
+        enrichment_api_key: Option<String>,
+        #[structopt(
+            long = "enrichment-model",
+            help = "Override enrichment model"
+        )]
+        enrichment_model: Option<String>,
     },
     /// Manage entities (people, organizations)
     Entity {
@@ -143,6 +158,21 @@ enum ConfigCommand {
     SetApi {
         #[structopt(help = "OpenAI API key")]
         api_key: String,
+    },
+    /// Set the enrichment provider (anthropic, openai, google, ollama)
+    SetProvider {
+        #[structopt(help = "Provider name (anthropic|openai|google|ollama)")]
+        provider: String,
+    },
+    /// Set the enrichment API key (for cloud providers)
+    SetEnrichmentKey {
+        #[structopt(help = "API key")]
+        key: String,
+    },
+    /// Set the enrichment model
+    SetEnrichmentModel {
+        #[structopt(help = "Model name")]
+        model: String,
     },
 }
 
@@ -360,7 +390,19 @@ async fn main() -> Result<()> {
                                     println!("API Key: ***configured***");
                                 }
                             }
-                            println!("Audio Settings:");
+                            println!("\nEnrichment:");
+                            println!("  Enabled: {}", config.enrichment.enabled);
+                            println!("  Provider: {}", config.enrichment.provider_display_name());
+                            println!("  Model: {}", config.enrichment.model_name());
+                            if config.enrichment.needs_api_key() {
+                                let key_status = if config.enrichment.resolve_api_key().is_some() {
+                                    "***configured***"
+                                } else {
+                                    "(not set)"
+                                };
+                                println!("  API Key: {}", key_status);
+                            }
+                            println!("\nAudio Settings:");
                             println!("  Sample Rate: {} Hz", config.audio_settings.sample_rate);
                             println!("  Bitrate: {} kbps", config.audio_settings.bitrate);
                             println!("  Channels: {}", config.audio_settings.channels);
@@ -388,6 +430,56 @@ async fn main() -> Result<()> {
                         println!("✅ Updated transcription mode to OpenAI API");
                         Ok(())
                     }
+                    ConfigCommand::SetProvider { provider } => {
+                        let mut config = ScribaConfig::load()?;
+                        if provider.to_lowercase() == "ollama" {
+                            config.enrichment.mode = EnrichmentMode::Local {
+                                ollama_endpoint: "http://localhost:11434".to_string(),
+                                ollama_model: "mistral:latest".to_string(),
+                            };
+                        } else {
+                            let cloud_provider: CloudProvider = provider.parse()?;
+                            let existing_key = config.enrichment.resolve_api_key().unwrap_or_default();
+                            config.enrichment.mode = EnrichmentMode::Cloud {
+                                provider: cloud_provider.clone(),
+                                api_key: existing_key,
+                                model: None,
+                            };
+                        }
+                        config.save()?;
+                        println!("✅ Updated enrichment provider to {}", config.enrichment.provider_display_name());
+                        Ok(())
+                    }
+                    ConfigCommand::SetEnrichmentKey { key } => {
+                        let mut config = ScribaConfig::load()?;
+                        match &mut config.enrichment.mode {
+                            EnrichmentMode::Cloud { api_key, .. } => {
+                                *api_key = key;
+                            }
+                            EnrichmentMode::Local { .. } => {
+                                return Err(anyhow::anyhow!(
+                                    "Cannot set API key for local (Ollama) mode. Switch to a cloud provider first with: scriba config set-provider <anthropic|openai|google>"
+                                ));
+                            }
+                        }
+                        config.save()?;
+                        println!("✅ Updated enrichment API key");
+                        Ok(())
+                    }
+                    ConfigCommand::SetEnrichmentModel { model } => {
+                        let mut config = ScribaConfig::load()?;
+                        match &mut config.enrichment.mode {
+                            EnrichmentMode::Cloud { model: m, .. } => {
+                                *m = Some(model.clone());
+                            }
+                            EnrichmentMode::Local { ollama_model, .. } => {
+                                *ollama_model = model.clone();
+                            }
+                        }
+                        config.save()?;
+                        println!("✅ Updated enrichment model to '{}'", model);
+                        Ok(())
+                    }
                 },
                 Command::Health { verbose } => {
                     let workflow = WorkflowManager::new()?;
@@ -410,9 +502,18 @@ async fn main() -> Result<()> {
                     // Run MCP server on stdio
                     run_mcp_server().await
                 }
-                Command::Enrich { directory_name } => {
+                Command::Enrich { directory_name, enrichment_provider, enrichment_api_key, enrichment_model } => {
                     println!("🧠 Running knowledge extraction on: {}", directory_name);
-                    let mut workflow = WorkflowManager::new()?;
+
+                    let mut workflow = if enrichment_provider.is_some() || enrichment_api_key.is_some() || enrichment_model.is_some() {
+                        // Apply CLI overrides to config
+                        let mut config = ScribaConfig::load()?;
+                        apply_enrichment_overrides(&mut config, enrichment_provider.as_deref(), enrichment_api_key.as_deref(), enrichment_model.as_deref())?;
+                        WorkflowManager::with_config(config)?
+                    } else {
+                        WorkflowManager::new()?
+                    };
+
                     workflow.enrich_existing_recording(&directory_name, true).await?;
                     Ok(())
                 }
@@ -700,8 +801,8 @@ async fn main() -> Result<()> {
                                 println!("\n🎉 Created {} entities from your world description.", entity_count);
                             }
                             None => {
-                                println!("   ⚠️ Ollama not available - saved raw seed text.");
-                                println!("   Make sure Ollama is running with model '{}'.", config.enrichment.ollama_model);
+                                println!("   ⚠️ Enrichment provider not available - saved raw seed text.");
+                                println!("   Check your enrichment configuration with: scriba config show");
                             }
                         }
 
@@ -751,5 +852,52 @@ async fn main() -> Result<()> {
         eprintln!("An error happened: {err}");
     }
 
+    Ok(())
+}
+
+/// Apply CLI enrichment overrides to config (without persisting).
+fn apply_enrichment_overrides(
+    config: &mut ScribaConfig,
+    provider: Option<&str>,
+    api_key: Option<&str>,
+    model: Option<&str>,
+) -> Result<()> {
+    if let Some(provider_str) = provider {
+        if provider_str.to_lowercase() == "ollama" {
+            config.enrichment.mode = EnrichmentMode::Local {
+                ollama_endpoint: "http://localhost:11434".to_string(),
+                ollama_model: model.unwrap_or("mistral:latest").to_string(),
+            };
+            return Ok(());
+        }
+
+        let cloud_provider: CloudProvider = provider_str.parse()?;
+        let key = api_key
+            .map(|k| k.to_string())
+            .or_else(|| config.enrichment.resolve_api_key())
+            .unwrap_or_default();
+        config.enrichment.mode = EnrichmentMode::Cloud {
+            provider: cloud_provider,
+            api_key: key,
+            model: model.map(|m| m.to_string()),
+        };
+    } else {
+        // No provider override, but possibly api_key or model override
+        if let Some(key) = api_key {
+            if let EnrichmentMode::Cloud { api_key: ref mut k, .. } = config.enrichment.mode {
+                *k = key.to_string();
+            }
+        }
+        if let Some(m) = model {
+            match &mut config.enrichment.mode {
+                EnrichmentMode::Cloud { model: ref mut mm, .. } => {
+                    *mm = Some(m.to_string());
+                }
+                EnrichmentMode::Local { ollama_model, .. } => {
+                    *ollama_model = m.to_string();
+                }
+            }
+        }
+    }
     Ok(())
 }
