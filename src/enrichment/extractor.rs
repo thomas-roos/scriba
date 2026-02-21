@@ -1,11 +1,15 @@
 //! Extraction service for knowledge extraction from transcripts.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::ollama::OllamaClient;
+use super::provider::LlmProvider;
 use super::prompts;
+use super::search::EntitySearchResults;
 use super::world::WorldData;
+use crate::core::config::EnrichmentConfig;
 
 /// Result of extracting metadata from a transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,30 +82,40 @@ pub struct WorldEntityExtractionResult {
 }
 
 /// Service for extracting knowledge from transcripts using LLM.
-#[derive(Clone)]
 pub struct EnrichmentService {
-    client: OllamaClient,
+    provider: Box<dyn LlmProvider>,
 }
 
 impl EnrichmentService {
-    /// Create a new enrichment service.
-    pub fn new(ollama_endpoint: &str, ollama_model: &str) -> Self {
+    /// Create from an LLM provider.
+    pub fn new(provider: Box<dyn LlmProvider>) -> Self {
+        Self { provider }
+    }
+
+    /// Create from enrichment configuration.
+    pub fn from_config(config: &EnrichmentConfig) -> Self {
         Self {
-            client: OllamaClient::new(ollama_endpoint, ollama_model),
+            provider: super::create_provider(config),
         }
     }
 
-    /// Create from an existing Ollama client.
-    pub fn with_client(client: OllamaClient) -> Self {
-        Self { client }
-    }
-
-    /// Check if the enrichment service is available (Ollama running with model).
+    /// Check if the enrichment service is available.
     pub async fn health_check(&self) -> Result<()> {
-        self.client
+        self.provider
             .health_check()
             .await
+            .map_err(|e| anyhow::anyhow!("{}", e))
             .context("Enrichment service health check failed")
+    }
+
+    /// Get the provider display name.
+    pub fn provider_display_name(&self) -> &str {
+        self.provider.display_name()
+    }
+
+    /// Get the model name in use.
+    pub fn model(&self) -> &str {
+        self.provider.model()
     }
 
     /// Extract metadata from a transcript.
@@ -109,14 +123,16 @@ impl EnrichmentService {
         let prompt = prompts::build_extraction_prompt(transcript);
 
         let response = self
-            .client
+            .provider
             .generate(&prompt)
             .await
+            .map_err(|e| anyhow::anyhow!("{}", e))
             .context("Failed to generate extraction")?;
 
-        // Parse the JSON response
+        let cleaned = strip_markdown_fences(&response);
+
         let result: ExtractionResult =
-            serde_json::from_str(&response).context("Failed to parse extraction result")?;
+            serde_json::from_str(cleaned).context("Failed to parse extraction result")?;
 
         Ok(result)
     }
@@ -137,13 +153,16 @@ impl EnrichmentService {
         );
 
         let response = self
-            .client
+            .provider
             .generate(&prompt)
             .await
+            .map_err(|e| anyhow::anyhow!("{}", e))
             .context("Failed to update entity context")?;
 
+        let cleaned = strip_markdown_fences(&response);
+
         let result: ContextUpdateResult =
-            serde_json::from_str(&response).context("Failed to parse context update result")?;
+            serde_json::from_str(cleaned).context("Failed to parse context update result")?;
 
         Ok(result)
     }
@@ -162,14 +181,16 @@ impl EnrichmentService {
             prompts::build_full_context_extraction_prompt(transcript, world_context);
 
         let response = self
-            .client
+            .provider
             .generate(&prompt)
             .await
+            .map_err(|e| anyhow::anyhow!("{}", e))
             .context("Failed to generate full-context extraction")?;
 
-        // Parse the JSON response
+        let cleaned = strip_markdown_fences(&response);
+
         let result: ExtractionResult =
-            serde_json::from_str(&response).context("Failed to parse extraction result")?;
+            serde_json::from_str(cleaned).context("Failed to parse extraction result")?;
 
         Ok(result)
     }
@@ -208,20 +229,14 @@ impl EnrichmentService {
             prompts::build_world_evolution_prompt(current_world, transcript, &extraction_summary);
 
         let response = self
-            .client
+            .provider
             .generate(&prompt)
             .await
+            .map_err(|e| anyhow::anyhow!("{}", e))
             .context("Failed to evolve world description")?;
 
-        // Clean up LLM response
-        let cleaned = response
-            .trim()
-            .trim_start_matches("```json")
-            .trim_start_matches("```")
-            .trim_end_matches("```")
-            .trim();
+        let cleaned = strip_markdown_fences(&response);
 
-        // Parse as WorldData delta
         match WorldData::from_json(cleaned) {
             Ok(delta) => Ok(Some(delta)),
             Err(e) => {
@@ -232,9 +247,6 @@ impl EnrichmentService {
     }
 
     /// Extract entities from a world description.
-    ///
-    /// This is used when initializing the world to automatically create
-    /// entities mentioned in the owner's description.
     pub async fn extract_world_entities(
         &self,
         world_content: &str,
@@ -242,44 +254,37 @@ impl EnrichmentService {
         let prompt = prompts::build_world_entity_extraction_prompt(world_content);
 
         let response = self
-            .client
+            .provider
             .generate(&prompt)
             .await
+            .map_err(|e| anyhow::anyhow!("{}", e))
             .context("Failed to extract entities from world description")?;
 
-        // Parse the JSON response
-        let result: WorldEntityExtractionResult = serde_json::from_str(&response)
+        let cleaned = strip_markdown_fences(&response);
+
+        let result: WorldEntityExtractionResult = serde_json::from_str(cleaned)
             .context("Failed to parse world entity extraction result")?;
 
         Ok(result)
     }
 
     /// Extract a structured world profile from a free-form seed description.
-    ///
-    /// Used during `world init` to convert the user's narrative into structured JSON.
     pub async fn extract_world_seed(&self, seed_content: &str) -> Result<WorldData> {
         let prompt = prompts::build_world_seed_extraction_prompt(seed_content);
 
         let response = self
-            .client
+            .provider
             .generate(&prompt)
             .await
+            .map_err(|e| anyhow::anyhow!("{}", e))
             .context("Failed to extract world seed")?;
 
-        let cleaned = response
-            .trim()
-            .trim_start_matches("```json")
-            .trim_start_matches("```")
-            .trim_end_matches("```")
-            .trim();
+        let cleaned = strip_markdown_fences(&response);
 
         WorldData::from_json(cleaned).context("Failed to parse world seed extraction result")
     }
 
     /// Compact an entity's context by merging existing + new info into a clean description.
-    ///
-    /// Single LLM call that produces a polished, self-contained summary.
-    /// Falls back to simple append if the LLM call fails.
     pub async fn compact_entity_context(
         &self,
         entity_name: &str,
@@ -295,12 +300,12 @@ impl EnrichmentService {
         );
 
         let response = self
-            .client
+            .provider
             .generate(&prompt)
             .await
+            .map_err(|e| anyhow::anyhow!("{}", e))
             .context("Failed to compact entity context")?;
 
-        // Clean up: remove quotes, markdown fences, trim whitespace
         let compacted = response
             .trim()
             .trim_start_matches("```")
@@ -310,17 +315,129 @@ impl EnrichmentService {
             .to_string();
 
         if compacted.is_empty() || compacted.starts_with('{') || compacted.starts_with('[') {
-            // LLM returned empty or JSON instead of plain text — fall back
             Ok(format!("{}. {}", existing_context.trim_end_matches('.'), new_info))
         } else {
             Ok(compacted)
         }
     }
 
-    /// Get the underlying Ollama client.
-    pub fn client(&self) -> &OllamaClient {
-        &self.client
+    /// Identify speakers in a diarized transcript using world context.
+    pub async fn identify_speakers(
+        &self,
+        diarized_text: &str,
+        world_context: Option<&str>,
+        num_speakers: usize,
+    ) -> Result<std::collections::HashMap<String, Option<String>>> {
+        let prompt = prompts::build_speaker_identification_prompt(
+            diarized_text,
+            world_context,
+            num_speakers,
+        );
+
+        let response = self
+            .provider
+            .generate(&prompt)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))
+            .context("Failed to identify speakers")?;
+
+        let cleaned = strip_markdown_fences(&response);
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(cleaned).context("Failed to parse speaker identification JSON")?;
+
+        let mut result = std::collections::HashMap::new();
+
+        if let Some(speakers) = parsed.get("speakers").and_then(|s| s.as_object()) {
+            for (key, value) in speakers {
+                let resolved = if value.is_null() {
+                    None
+                } else {
+                    value.as_str().map(|s| s.to_string())
+                };
+                result.insert(key.clone(), resolved);
+            }
+        }
+
+        Ok(result)
     }
+
+    /// Resolve unresolved entities using web search results.
+    ///
+    /// Takes search results for unresolved entities plus a compact world summary,
+    /// builds a resolution prompt, and asks the LLM to cross-reference.
+    /// Returns a map from transcript name -> canonical name (or None for genuinely new).
+    /// On any failure, returns an empty map (non-fatal).
+    pub async fn resolve_with_search(
+        &self,
+        search_results: &[EntitySearchResults],
+        world_summary: &str,
+    ) -> HashMap<String, Option<String>> {
+        // Build the input tuples for the prompt: (name, type, context, formatted_search_results)
+        let unresolved: Vec<(String, String, String, String)> = search_results
+            .iter()
+            .map(|sr| {
+                let formatted = sr
+                    .results
+                    .iter()
+                    .map(|r| {
+                        format!("    - \"{}\" ({}) — {}", r.title, r.url, r.snippet)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (
+                    sr.entity_name.clone(),
+                    sr.entity_type.clone(),
+                    sr.entity_context.clone(),
+                    formatted,
+                )
+            })
+            .collect();
+
+        let prompt = prompts::build_search_resolution_prompt(&unresolved, world_summary);
+
+        let response = match self
+            .provider
+            .generate(&prompt)
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return HashMap::new(),
+        };
+
+        let cleaned = strip_markdown_fences(&response);
+
+        // Parse: { "resolutions": { "Name": "Canonical" | null } }
+        let parsed: serde_json::Value = match serde_json::from_str(cleaned) {
+            Ok(v) => v,
+            Err(_) => return HashMap::new(),
+        };
+
+        let mut result = HashMap::new();
+
+        if let Some(resolutions) = parsed.get("resolutions").and_then(|r| r.as_object()) {
+            for (key, value) in resolutions {
+                let resolved = if value.is_null() {
+                    None
+                } else {
+                    value.as_str().map(|s| s.to_string())
+                };
+                result.insert(key.clone(), resolved);
+            }
+        }
+
+        result
+    }
+}
+
+/// Strip markdown fences from LLM responses.
+fn strip_markdown_fences(response: &str) -> &str {
+    response
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim()
 }
 
 impl ExtractionResult {

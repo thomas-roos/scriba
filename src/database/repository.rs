@@ -168,7 +168,7 @@ impl Database {
                 let schema = include_str!("../../schema.sql");
                 tx.execute_batch(schema)
                     .context("Failed to initialize database schema")?;
-                tx.execute("PRAGMA user_version = 2", [])
+                tx.execute("PRAGMA user_version = 3", [])
                     .context("Failed to set user_version")?;
                 tx.commit()
                     .context("Failed to commit schema initialization")?;
@@ -213,7 +213,32 @@ impl Database {
                 tx.commit()
                     .context("Failed to commit v2 migration")?;
             } else {
+                // No work for this transaction — drop cleanly
                 tx.commit().ok();
+            }
+        }
+
+        // Migration v2 → v3: add diarization columns (speakers, segments)
+        {
+            let user_version: i64 = self
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap_or(0);
+
+            if user_version == 2 {
+                let tx = self
+                    .conn
+                    .transaction()
+                    .context("Failed to start v3 migration transaction")?;
+                tx.execute_batch(
+                    "ALTER TABLE recordings ADD COLUMN speakers TEXT;
+                     ALTER TABLE transcripts ADD COLUMN segments TEXT;",
+                )
+                .context("Failed to migrate database to v3 (diarization columns)")?;
+                tx.execute("PRAGMA user_version = 3", [])
+                    .context("Failed to set user_version")?;
+                tx.commit()
+                    .context("Failed to commit v3 migration")?;
             }
         }
 
@@ -1096,6 +1121,44 @@ impl Database {
 
         self.conn
             .execute(sql, params![entities, topics, Utc::now(), recording_id])?;
+
+        Ok(())
+    }
+
+    /// Update transcript with diarization segments JSON.
+    pub fn update_transcript_segments(
+        &mut self,
+        recording_id: i64,
+        segments_json: &str,
+    ) -> Result<()> {
+        let sql = r#"
+            UPDATE transcripts SET
+                segments = ?1,
+                updated_at = ?2
+            WHERE recording_id = ?3
+        "#;
+
+        self.conn
+            .execute(sql, params![segments_json, Utc::now(), recording_id])?;
+
+        Ok(())
+    }
+
+    /// Update recording with speakers JSON.
+    pub fn update_recording_speakers(
+        &mut self,
+        recording_id: i64,
+        speakers_json: &str,
+    ) -> Result<()> {
+        let sql = r#"
+            UPDATE recordings SET
+                speakers = ?1,
+                updated_at = ?2
+            WHERE id = ?3
+        "#;
+
+        self.conn
+            .execute(sql, params![speakers_json, Utc::now(), recording_id])?;
 
         Ok(())
     }

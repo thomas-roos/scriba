@@ -355,6 +355,125 @@ Now analyze the transcript above and return JSON:"#,
     )
 }
 
+/// Build a prompt for identifying speakers in a diarized transcript.
+///
+/// Takes the diarized text with generic labels (Speaker 0, Speaker 1, etc.)
+/// and asks the LLM to infer real names from conversational cues and world context.
+pub fn build_speaker_identification_prompt(
+    diarized_text: &str,
+    world_context: Option<&str>,
+    num_speakers: usize,
+) -> String {
+    let world_section = match world_context {
+        Some(w) if !w.trim().is_empty() => format!(
+            r#"OWNER'S WORLD (people and organizations the owner knows):
+{w}
+
+The owner of this recording system is almost certainly one of the speakers. Use the world context to identify them and other known people."#
+        ),
+        _ => "No world context available. Try to identify speakers from conversational cues only.".to_string(),
+    };
+
+    format!(
+        r#"You are analyzing a meeting transcript where speakers have been identified by number but not by name. Your job is to figure out who each speaker actually is.
+
+{world_section}
+
+DIARIZED TRANSCRIPT:
+---
+{diarized_text}
+---
+
+There are {num_speakers} distinct speakers labeled Speaker 0 through Speaker {max_speaker}.
+
+IDENTIFICATION STRATEGY:
+1. Look for direct address: "Hi Giovanni", "Thanks Sara", "What do you think, Marco?"
+2. Look for self-identification: "I'm Giovanni", "This is Sara speaking"
+3. Look for role/topic clues: if the world says Giovanni is CTO and a speaker discusses technical architecture, that's likely Giovanni
+4. The owner (from the world context) is almost always a participant
+5. Check aliases in the world context — speakers may use nicknames
+
+Return a JSON object mapping each speaker label to their identified name, or null if you cannot determine who they are:
+
+{{
+  "speakers": {{
+    "Speaker 0": "<real name or null>",
+    "Speaker 1": "<real name or null>"
+  }}
+}}
+
+RULES:
+- Only identify a speaker if you have reasonable confidence
+- If unsure, return null for that speaker (do NOT guess)
+- Use the EXACT canonical name from the world context when possible
+- Return ONLY valid JSON, nothing else
+
+Return JSON:"#,
+        world_section = world_section,
+        diarized_text = diarized_text,
+        num_speakers = num_speakers,
+        max_speaker = num_speakers.saturating_sub(1),
+    )
+}
+
+/// Build a prompt for resolving unresolved entities using web search results.
+///
+/// Given entities the LLM couldn't match in the first pass, plus web search
+/// results for each, asks the LLM to cross-reference against known world
+/// entities and correct misspellings.
+pub fn build_search_resolution_prompt(
+    unresolved_with_search: &[(String, String, String, String)], // (name, type, context, search_summary)
+    world_summary: &str,
+) -> String {
+    let mut entities_section = String::new();
+    for (name, entity_type, context, search_results) in unresolved_with_search {
+        entities_section.push_str(&format!(
+            r#"
+- Name: "{name}"
+  Type: {entity_type}
+  Transcript context: "{context}"
+  Web search results:
+{search_results}
+"#,
+            name = name,
+            entity_type = entity_type,
+            context = context,
+            search_results = search_results
+        ));
+    }
+
+    format!(
+        r#"You are verifying entity names from a speech-to-text transcript. Some names may be misspelled due to transcription errors.
+
+KNOWN ENTITIES (from the owner's world):
+{world_summary}
+
+UNRESOLVED ENTITIES (not matched in first pass):
+{entities_section}
+
+For each unresolved entity, I searched the web. Cross-reference the search results with the known entities above.
+
+YOUR TASK: For each unresolved entity, determine if it's a misspelling of a known entity or genuinely new.
+
+RULES:
+- If web search results suggest the entity is actually a known entity (e.g., search for "Gianni Cuozzi" shows results about "Gianni Cuozzo" who matches a known person), resolve it to the EXACT known entity name.
+- If the entity is genuinely new (not a misspelling of any known entity), set the value to null.
+- Only resolve to known entities listed above — do not invent new canonical names.
+
+Return ONLY a JSON object mapping each unresolved name to its resolution:
+
+{{
+  "resolutions": {{
+    "<transcript_name>": "<known_entity_name or null>"
+  }}
+}}
+
+Return ONLY valid JSON, nothing else."#,
+        world_summary = world_summary,
+        entities_section = entities_section
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,5 +528,25 @@ mod tests {
         assert!(prompt.contains("title"));
         // Should NOT contain resolved_to (basic prompt)
         assert!(!prompt.contains("resolved_to"));
+    }
+
+    #[test]
+    fn test_search_resolution_prompt() {
+        let unresolved = vec![
+            (
+                "Gianni Cuozzi".to_string(),
+                "person".to_string(),
+                "discussing budget".to_string(),
+                "    - \"Gianni Cuozzo - LinkedIn\" — Profile of Gianni Cuozzo, CTO".to_string(),
+            ),
+        ];
+        let world_summary = "People: Gianni Cuozzo (aliases: none)\nOrganizations: Exein (aliases: Exane)";
+
+        let prompt = build_search_resolution_prompt(&unresolved, world_summary);
+
+        assert!(prompt.contains("Gianni Cuozzi"));
+        assert!(prompt.contains("Gianni Cuozzo"));
+        assert!(prompt.contains("Exein"));
+        assert!(prompt.contains("resolutions"));
     }
 }
