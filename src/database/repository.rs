@@ -168,7 +168,7 @@ impl Database {
                 let schema = include_str!("../../schema.sql");
                 tx.execute_batch(schema)
                     .context("Failed to initialize database schema")?;
-                tx.execute("PRAGMA user_version = 2", [])
+                tx.execute("PRAGMA user_version = 3", [])
                     .context("Failed to set user_version")?;
                 tx.commit()
                     .context("Failed to commit schema initialization")?;
@@ -213,7 +213,32 @@ impl Database {
                 tx.commit()
                     .context("Failed to commit v2 migration")?;
             } else {
+                // No work for this transaction — drop cleanly
                 tx.commit().ok();
+            }
+        }
+
+        // Migration v2 → v3: add diarization columns (speakers, segments)
+        {
+            let user_version: i64 = self
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap_or(0);
+
+            if user_version == 2 {
+                let tx = self
+                    .conn
+                    .transaction()
+                    .context("Failed to start v3 migration transaction")?;
+                tx.execute_batch(
+                    "ALTER TABLE recordings ADD COLUMN speakers TEXT;
+                     ALTER TABLE transcripts ADD COLUMN segments TEXT;",
+                )
+                .context("Failed to migrate database to v3 (diarization columns)")?;
+                tx.execute("PRAGMA user_version = 3", [])
+                    .context("Failed to set user_version")?;
+                tx.commit()
+                    .context("Failed to commit v3 migration")?;
             }
         }
 
