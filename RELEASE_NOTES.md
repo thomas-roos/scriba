@@ -1,3 +1,12 @@
+Scriba 0.19.1 — Hotfix: Database Migration
+
+Fixes
+
+- **fix: database migration no longer destroys data**: v0.19.0 could wipe the database on upgrade for users who installed v0.18.0 fresh (the migration tried to add columns that already existed, triggering a destructive auto-reset). The migration now checks for existing columns before altering tables, and the auto-reset fallback has been removed entirely.
+- **feat: `scriba db rebuild`**: New CLI command that scans `~/scriba_recordings/` directories and rebuilds the database from audio files and transcripts on disk. Use this to recover if your database was lost.
+
+---
+
 Scriba 0.19.0 — Ask Scriba
 
 Highlights

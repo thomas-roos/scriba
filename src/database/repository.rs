@@ -124,16 +124,8 @@ impl Database {
 
         let mut db = Database { conn };
 
-        if let Err(_e) = db.initialize() {
-            drop(db);
-            Self::reset_database()?;
-            let conn = Connection::open(&db_path)
-                .context("Failed to open database connection after reset")?;
-            let mut db = Database { conn };
-            db.initialize()
-                .context("Failed to initialize fresh database")?;
-            return Ok(db);
-        }
+        db.initialize()
+            .context("Failed to initialize database. Run `scriba db rebuild` to recover.")?;
 
         Ok(db)
     }
@@ -226,15 +218,29 @@ impl Database {
                 .unwrap_or(0);
 
             if user_version == 2 {
+                // Check which columns already exist (fresh v0.18 installs
+                // have them from schema.sql despite user_version being 2)
+                let has_speakers: bool = self
+                    .conn
+                    .prepare("SELECT speakers FROM recordings LIMIT 0")
+                    .is_ok();
+                let has_segments: bool = self
+                    .conn
+                    .prepare("SELECT segments FROM transcripts LIMIT 0")
+                    .is_ok();
+
                 let tx = self
                     .conn
                     .transaction()
                     .context("Failed to start v3 migration transaction")?;
-                tx.execute_batch(
-                    "ALTER TABLE recordings ADD COLUMN speakers TEXT;
-                     ALTER TABLE transcripts ADD COLUMN segments TEXT;",
-                )
-                .context("Failed to migrate database to v3 (diarization columns)")?;
+                if !has_speakers {
+                    tx.execute_batch("ALTER TABLE recordings ADD COLUMN speakers TEXT;")
+                        .context("Failed to add speakers column")?;
+                }
+                if !has_segments {
+                    tx.execute_batch("ALTER TABLE transcripts ADD COLUMN segments TEXT;")
+                        .context("Failed to add segments column")?;
+                }
                 tx.execute("PRAGMA user_version = 3", [])
                     .context("Failed to set user_version")?;
                 tx.commit()

@@ -143,6 +143,17 @@ enum Command {
         #[structopt(subcommand)]
         cmd: WorldCommand,
     },
+    /// Database maintenance commands
+    Db {
+        #[structopt(subcommand)]
+        cmd: DbCommand,
+    },
+}
+
+#[derive(Debug, StructOpt)]
+enum DbCommand {
+    /// Rebuild database from recording directories on disk
+    Rebuild,
 }
 
 #[derive(Debug, StructOpt)]
@@ -669,6 +680,134 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                Command::Db { cmd } => match cmd {
+                    DbCommand::Rebuild => {
+                        use scriba::core::FileManager;
+                        use scriba::utils::BASE_PATH;
+
+                        println!("Rebuilding database from recording directories...\n");
+                        let mut db = Database::new()?;
+                        let base = BASE_PATH.as_path();
+
+                        let mut rebuilt = 0u32;
+                        let mut transcripts_found = 0u32;
+
+                        let mut entries: Vec<_> = std::fs::read_dir(base)?
+                            .filter_map(|e| e.ok())
+                            .filter(|e| e.path().is_dir())
+                            .collect();
+                        entries.sort_by_key(|e| e.file_name());
+
+                        for entry in &entries {
+                            let dir_path = entry.path();
+                            let dir_name = entry.file_name().to_string_lossy().to_string();
+
+                            // Skip if already in DB
+                            if db.get_recording_by_directory(&dir_name)?.is_some() {
+                                continue;
+                            }
+
+                            // Find audio file
+                            let audio_path = match FileManager::find_audio_file(&dir_path) {
+                                Some(p) => p,
+                                None => continue, // not a recording directory
+                            };
+                            let audio_filename = audio_path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string();
+
+                            // Extract metadata
+                            let meta = FileManager::extract_audio_metadata(&audio_path)
+                                .unwrap_or(scriba::core::RecordingMetadata {
+                                    duration_seconds: None,
+                                    file_size_bytes: None,
+                                    audio_format: "wav".to_string(),
+                                    sample_rate: 48000,
+                                    channels: 1,
+                                });
+
+                            // Parse timestamp from dir name (format: YYYY-MM-DD_HH-MM-SS_*)
+                            let created_at = chrono::NaiveDateTime::parse_from_str(
+                                &dir_name[..19],
+                                "%Y-%m-%d_%H-%M-%S",
+                            )
+                            .map(|dt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc))
+                            .unwrap_or_else(|_| chrono::Utc::now());
+
+                            // Display name from dir suffix
+                            let display_name = if dir_name.len() > 20 {
+                                Some(dir_name[20..].replace('_', " "))
+                            } else {
+                                None
+                            };
+
+                            // Check for transcript
+                            let transcript_path = dir_path.join("transcript.txt");
+                            let has_transcript = transcript_path.exists();
+
+                            let recording = scriba::database::Recording {
+                                id: None,
+                                directory_name: dir_name.clone(),
+                                display_name,
+                                created_at,
+                                updated_at: created_at,
+                                duration_seconds: meta.duration_seconds,
+                                file_size_bytes: meta.file_size_bytes,
+                                audio_format: meta.audio_format,
+                                sample_rate: meta.sample_rate,
+                                channels: meta.channels,
+                                has_transcript,
+                                transcript_status: if has_transcript {
+                                    "completed".to_string()
+                                } else {
+                                    "pending".to_string()
+                                },
+                                language_code: "auto".to_string(),
+                                model_used: "whisper-1".to_string(),
+                                tags: None,
+                                summary: None,
+                                key_points: None,
+                                action_items: None,
+                                speakers: None,
+                                sentiment_score: None,
+                                search_index: None,
+                                categories: None,
+                                confidence_score: None,
+                                audio_path: audio_filename,
+                                transcript_path: if has_transcript {
+                                    Some("transcript.txt".to_string())
+                                } else {
+                                    None
+                                },
+                            };
+
+                            let rec_id = db.insert_recording(&recording)?;
+                            rebuilt += 1;
+                            print!("  + {}", dir_name);
+
+                            if has_transcript {
+                                let content = std::fs::read_to_string(&transcript_path)?;
+                                db.upsert_transcript(rec_id, &content)?;
+                                transcripts_found += 1;
+                                println!(" (with transcript)");
+                            } else {
+                                println!();
+                            }
+                        }
+
+                        if rebuilt == 0 {
+                            println!("Database is already up to date — no missing recordings found.");
+                        } else {
+                            println!(
+                                "\nRebuilt {} recording(s), {} with transcript(s).",
+                                rebuilt, transcripts_found
+                            );
+                        }
+                        Ok(())
+                    }
+                },
                 Command::World { cmd } => match cmd {
                     WorldCommand::Show => {
                         let world = WorldContext::load()?;
