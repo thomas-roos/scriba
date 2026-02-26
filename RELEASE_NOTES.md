@@ -1,3 +1,21 @@
+Scriba 0.19.3 — Trail-Eating Owl Animation
+
+Highlights
+
+- **New header animation: "Trail Eating" owl**: The owl's idle fly-out animation is replaced with a playful 25-second sequence. A sand trail of dots materializes after the logo, the owl notices it (eyes shift right), then hovers above the trail vacuuming up dots through its nose with a breathing rhythm. After devouring the trail, the owl celebrates with crazy eye sprites before flapping back to its perch.
+- **Suction visual**: During eating, the owl sits on line 1 above the trail. Dots on line 2 show `'` and `^` suction characters rising into the owl's beak, styled in yellow against the gray trail.
+- **Narrow terminal fallback**: Terminals too narrow for the trail gracefully skip the animation and show static idle.
+
+Changelog
+
+- feat(tui): trail-eating owl header animation with 7 phases (idle → trail appears → notices → eats → celebrates → flies back → idle)
+- feat(tui): owl hovers above trail with breathing rhythm `(o,o)` / `(O,O)` and suction chars `'` / `^`
+- feat(tui): crazy celebration sprites at trail end: `\(@,@)/`, `/(O,O)\`, `\(x,X)/`, `|(O,o)|`
+- feat(tui): ease-in-out quadratic for eating, ease-out for fly-back
+- fix(tui): narrow terminal graceful fallback (trail_len < 10 → static idle)
+
+---
+
 Scriba 0.19.2 — Hotfix: Chat Panel Crash + Input Wrapping
 
 Fixes

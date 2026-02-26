@@ -2836,72 +2836,23 @@ impl Dashboard {
         use ratatui::text::{Line, Span};
 
         let cycle = self.header_anim_frame % 250;
-        let is_flying = cycle >= 150 && cycle < 190;
-        let is_blink = !is_flying && (cycle % 40) < 3;
-
         let yellow_bold = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
         let gray = Style::default().fg(Color::DarkGray);
 
-        let lines = if is_flying {
-            // Flight phase: owl hops right of logo, flies across, bobs up and down
-            let fly_frame = cycle - 150; // 0..39
-            let inner_width = (area.width as usize).saturating_sub(2);
-            let logo_end = 28;
-            let flyable = inner_width.saturating_sub(logo_end + 7);
+        let inner_width = (area.width as usize).saturating_sub(2);
+        let logo_end: usize = 28;
+        let trail_len = inner_width.saturating_sub(logo_end + 2);
+        let skip_anim = trail_len < 10;
 
-            // Horizontal: out and back over 40 frames
-            let progress = if fly_frame < 20 {
-                fly_frame as f64 / 19.0
-            } else {
-                (40 - fly_frame) as f64 / 20.0
-            };
-            let eased = if progress < 0.5 {
-                2.0 * progress * progress
-            } else {
-                1.0 - (-2.0 * progress + 2.0).powi(2) / 2.0
-            };
-            let offset = (eased * flyable as f64) as usize;
+        let logo_lines = [
+            "         ╔═╗╔═╗╦═╗╦╔╗ ╔═╗",
+            "         ╚═╗║  ╠╦╝║╠╩╗╠═╣",
+            "         ╚═╝╚═╝╩╚═╩╚═╝╩ ╩",
+        ];
 
-            // Vertical: bob between line 0 and 1 only
-            let vert = ((fly_frame as f64 / 8.0) * std::f64::consts::PI).sin();
-            let row = if vert > 0.0 { 0 } else { 1 };
-
-            let face = if fly_frame < 3 || fly_frame > 37 { "(o,o)" } else { "(^,^)" };
-            let owl_str = if fly_frame >= 3 && fly_frame <= 37 {
-                format!("~{}~", face)
-            } else {
-                format!(" {} ", face)
-            };
-            let gap = " ".repeat(offset);
-            let owl_span = Span::styled(format!("{}{}", gap, owl_str), yellow_bold);
-            let empty_span = Span::raw("");
-
-            // Build 3 lines: logo is always fixed, owl appears on the row it's bobbing to
-            let logo_lines = [
-                "         ╔═╗╔═╗╦═╗╦╔╗ ╔═╗",
-                "         ╚═╗║  ╠╦╝║╠╩╗╠═╣",
-                "         ╚═╝╚═╝╩╚═╩╚═╝╩ ╩",
-            ];
-
-            vec![
-                Line::from(vec![
-                    Span::styled(logo_lines[0], yellow_bold),
-                    if row == 0 { owl_span.clone() } else { empty_span.clone() },
-                ]),
-                Line::from(vec![
-                    Span::styled(logo_lines[1], yellow_bold),
-                    if row == 1 { owl_span.clone() } else { empty_span.clone() },
-                ]),
-                Line::from(vec![
-                    Span::styled(logo_lines[2], yellow_bold),
-                    Span::styled(
-                        " — hoo remembers everything",
-                        gray,
-                    ),
-                ]),
-            ]
-        } else {
-            // Idle: owl sits next to SCRIBA, blinks occasionally
+        let lines = if skip_anim || cycle < 120 || cycle >= 240 {
+            // Idle A (0-119), Idle B (240-249), or narrow terminal fallback
+            let is_blink = (cycle % 40) < 3;
             let face = if is_blink { "(-,-)" } else { "(o,o)" };
             vec![
                 Line::from(Span::styled(
@@ -2917,6 +2868,130 @@ impl Dashboard {
                         "  -\"-\"-  ╚═╝╚═╝╩╚═╩╚═╝╩ ╩",
                         yellow_bold,
                     ),
+                    Span::styled(
+                        " — hoo remembers everything",
+                        gray,
+                    ),
+                ]),
+            ]
+        } else if cycle < 135 {
+            // Trail appears (120-134): dots materialize left-to-right
+            let is_blink = (cycle % 40) < 3;
+            let face = if is_blink { "(-,-)" } else { "(o,o)" };
+            let reveal = cycle - 120; // 0..14
+            let revealed = ((reveal + 1) as f64 / 15.0 * trail_len as f64) as usize;
+            let trail: String = "·".repeat(revealed.min(trail_len));
+            vec![
+                Line::from(Span::styled(
+                    format!("  {}  ╔═╗╔═╗╦═╗╦╔╗ ╔═╗", face),
+                    yellow_bold,
+                )),
+                Line::from(Span::styled(
+                    "  {`\"'}  ╚═╗║  ╠╦╝║╠╩╗╠═╣",
+                    yellow_bold,
+                )),
+                Line::from(vec![
+                    Span::styled(
+                        "  -\"-\"-  ╚═╝╚═╝╩╚═╩╚═╝╩ ╩",
+                        yellow_bold,
+                    ),
+                    Span::styled(format!(" {}", trail), gray),
+                ]),
+            ]
+        } else if cycle < 145 {
+            // Owl notices trail (135-144): eyes shift right
+            let notice = cycle - 135; // 0..9
+            let face = if notice < 5 { "(o,>)" } else { "(O,>)" };
+            let trail: String = "·".repeat(trail_len);
+            vec![
+                Line::from(Span::styled(
+                    format!("  {}  ╔═╗╔═╗╦═╗╦╔╗ ╔═╗", face),
+                    yellow_bold,
+                )),
+                Line::from(Span::styled(
+                    "  {`\"'}  ╚═╗║  ╠╦╝║╠╩╗╠═╣",
+                    yellow_bold,
+                )),
+                Line::from(vec![
+                    Span::styled(
+                        "  -\"-\"-  ╚═╝╚═╝╩╚═╩╚═╝╩ ╩",
+                        yellow_bold,
+                    ),
+                    Span::styled(format!(" {}", trail), gray),
+                ]),
+            ]
+        } else if cycle < 200 {
+            // Owl eats trail (145-199): owl on line 1 above trail, vacuums dots upward
+            let eat = cycle - 145; // 0..54
+            let progress = eat as f64 / 54.0;
+            let eased = if progress < 0.5 {
+                2.0 * progress * progress
+            } else {
+                1.0 - (-2.0 * progress + 2.0).powi(2) / 2.0
+            };
+            // Eating front: how far into the trail the owl has eaten
+            let max_eat = trail_len.saturating_sub(1);
+            let eat_pos = (eased * max_eat as f64) as usize;
+            // Owl face on line 1, centered above the eating front
+            let owl_face = if eat % 2 == 0 { "(o,o)" } else { "(O,O)" };
+            let owl_col = eat_pos.saturating_sub(2).min(trail_len.saturating_sub(5));
+            let owl_gap = " ".repeat(owl_col);
+            // Trail on line 2: eaten (blank) + suction char + remaining dots
+            let suction = if eat % 2 == 0 { "'" } else { "^" };
+            let eaten_blank = " ".repeat(eat_pos);
+            let remaining = trail_len.saturating_sub(eat_pos + 1);
+            let dots: String = "·".repeat(remaining);
+            vec![
+                Line::from(Span::styled(logo_lines[0], yellow_bold)),
+                Line::from(vec![
+                    Span::styled(logo_lines[1], yellow_bold),
+                    Span::styled(format!(" {}{}", owl_gap, owl_face), yellow_bold),
+                ]),
+                Line::from(vec![
+                    Span::styled(logo_lines[2], yellow_bold),
+                    Span::styled(format!(" {}{}", eaten_blank, suction), yellow_bold),
+                    Span::styled(dots, gray),
+                ]),
+            ]
+        } else if cycle < 215 {
+            // Crazy celebration (200-214): owl at trail end on line 1
+            let celeb = cycle - 200; // 0..14
+            let owl_str = match (celeb / 4) % 4 {
+                0 => "\\(@,@)/",
+                1 => "/(O,O)\\",
+                2 => "\\(x,X)/",
+                _ => "|(O,o)|",
+            };
+            let owl_col = trail_len.saturating_sub(7);
+            let gap = " ".repeat(owl_col);
+            vec![
+                Line::from(Span::styled(logo_lines[0], yellow_bold)),
+                Line::from(vec![
+                    Span::styled(logo_lines[1], yellow_bold),
+                    Span::styled(format!(" {}{}", gap, owl_str), yellow_bold),
+                ]),
+                Line::from(Span::styled(logo_lines[2], yellow_bold)),
+            ]
+        } else {
+            // Fly back (215-239): owl flaps back to rest position
+            let fly = cycle - 215; // 0..24
+            let progress = fly as f64 / 24.0;
+            let eased = 1.0 - (1.0 - progress).powi(2); // ease-out
+            let max_pos = trail_len.saturating_sub(7);
+            let gap_size = ((1.0 - eased) * max_pos as f64) as usize;
+            let gap = " ".repeat(gap_size);
+            let owl_str = if fly % 2 == 0 { "~(o,o)~" } else { " (o,o) " };
+            vec![
+                Line::from(vec![
+                    Span::styled(logo_lines[0], yellow_bold),
+                    Span::styled(
+                        format!(" {}{}", gap, owl_str),
+                        yellow_bold,
+                    ),
+                ]),
+                Line::from(Span::styled(logo_lines[1], yellow_bold)),
+                Line::from(vec![
+                    Span::styled(logo_lines[2], yellow_bold),
                     Span::styled(
                         " — hoo remembers everything",
                         gray,
