@@ -1,3 +1,22 @@
+Scriba 0.19.4 — Wing-Cut & HOOOOOO!!
+
+Highlights
+
+- **Wing-cut phase**: The owl no longer magically materializes the sand trail — it flies right above the ground, scoring the sand with its wing (`\` / `/` alternating sawing motion) to create the trail itself.
+- **Return pass**: After cutting, the owl flies back to the start before vacuuming the trail left-to-right.
+- **HOOOOOO!! shout**: After devouring the trail, the owl screams `HOOOOOOOO!!` — the shout grows right-to-left filling the whole trail area while crazy-eye sprites cycle twice as fast.
+- **30s cycle**: Extended from 25s to 30s (300 frames) to accommodate the new wing-cut and return phases.
+
+Changelog
+
+- feat(tui): wing-cut phase — owl creates the sand trail by scoring ground with its wing
+- feat(tui): return phase — owl flies back to start after cutting, full trail visible
+- feat(tui): growing "HOOOOOO!!" shout during celebration, right-to-left expansion
+- feat(tui): faster celebration sprite cycling (every 2 frames)
+- feat(tui): 300-frame cycle (30s) with 8 distinct animation phases
+
+---
+
 Scriba 0.19.3 — Trail-Eating Owl Animation
 
 Highlights
