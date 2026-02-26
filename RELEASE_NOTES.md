@@ -1,3 +1,13 @@
+Scriba 0.19.2 — Hotfix: Chat Panel Crash + Input Wrapping
+
+Fixes
+
+- **fix: crash on long chat responses**: The app could panic with an index-out-of-bounds error when a streaming LLM response completed. A stale scroll offset caused the render loop to index past the end of the dynamic lines buffer. The scroll offset is now clamped after each content recomputation, with an additional bounds check as a safety net.
+- **fix: input text wraps instead of overflowing**: Long messages typed in the Ask Scriba input now wrap to multiple lines instead of disappearing off the right edge. The chat content area dynamically shrinks to make room for the growing input.
+- **fix: copy-to-clipboard notification in transcript view**: The "Copied to clipboard" notification was invisible in the per-recording Ask Scriba panel because the footer wasn't rendered in that view. A notification overlay is now shown in the transcript popup.
+
+---
+
 Scriba 0.19.1 — Hotfix: Database Migration
 
 Fixes

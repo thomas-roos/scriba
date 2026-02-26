@@ -4359,6 +4359,26 @@ impl Dashboard {
 
         // Unified chat panel
         self.render_chat_panel(f, content_chunks[chunk_idx]);
+
+        // Notification overlay (e.g. "Copied to clipboard")
+        if let Some((ref msg, _)) = self.notification_message {
+            let is_error = msg.contains("failed") || msg.contains("Failed");
+            let style = if is_error {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            };
+            let notif_area = ratatui::layout::Rect {
+                x: popup_area.x,
+                y: popup_area.y + popup_area.height.saturating_sub(1),
+                width: popup_area.width,
+                height: 1,
+            };
+            let para = Paragraph::new(msg.as_str())
+                .style(style)
+                .alignment(Alignment::Center);
+            f.render_widget(para, notif_area);
+        }
     }
 
     fn calculate_enrichment_height(&self) -> u16 {
@@ -5984,10 +6004,20 @@ impl Dashboard {
         // Content height inside the bordered block (minus top/bottom border)
         let inner_height = area.height.saturating_sub(2) as usize;
         let has_conversation = !self.chat.messages.is_empty() || self.chat.is_generating;
-        // Reserve lines at bottom: 1 for input + 1 for separator when conversation active
-        let reserved = if has_conversation { 2 } else { 1 };
-        let chat_height = inner_height.saturating_sub(reserved);
         let content_width = area.width.saturating_sub(4) as usize; // borders + padding
+
+        // Compute how many lines the input will occupy (for accurate height reservation)
+        let input_line_count = if !self.chat.input_buffer.is_empty() {
+            let cursor_ch = if is_focused { "▎" } else { "" };
+            let display = format!("{}{}", self.chat.input_buffer, cursor_ch);
+            let wrap_width = content_width.saturating_sub(4);
+            if wrap_width > 0 { textwrap::wrap(&display, wrap_width).len() } else { 1 }
+        } else {
+            1
+        };
+        // Reserve: input lines + 1 separator when conversation active
+        let reserved = if has_conversation { 1 + input_line_count } else { input_line_count };
+        let chat_height = inner_height.saturating_sub(reserved);
 
         let mut final_lines: Vec<Line> = Vec::with_capacity(inner_height);
 
@@ -6214,6 +6244,12 @@ impl Dashboard {
             let total_content = cached_len + dynamic_lines.len();
             self.chat.total_content_lines = total_content;
 
+            // Clamp stale scroll offset to valid range (prevents OOB after streaming done)
+            let max_offset = total_content.saturating_sub(chat_height);
+            if self.chat.scroll_offset > max_offset {
+                self.chat.scroll_offset = max_offset;
+            }
+
             let mut content_texts = self.chat.cached_msg_texts.clone();
             content_texts.extend(dynamic_texts);
             self.chat.content_texts = content_texts;
@@ -6238,7 +6274,12 @@ impl Dashboard {
                 let line = if i < cached_len {
                     self.chat.cached_msg_lines[i].clone()
                 } else {
-                    dynamic_lines[i - cached_len].clone()
+                    let dyn_idx = i - cached_len;
+                    if dyn_idx < dynamic_lines.len() {
+                        dynamic_lines[dyn_idx].clone()
+                    } else {
+                        Line::from("")
+                    }
                 };
                 let content_idx = i;
                 if let Some(((sel_start_line, sel_start_col), (sel_end_line, sel_end_col))) = selection {
@@ -6268,33 +6309,41 @@ impl Dashboard {
 
         let cursor = if is_focused { "▎" } else { "" };
         let has_pending = self.chat.pending_message.is_some();
-        let input_line = if has_pending && self.chat.input_buffer.is_empty() {
+        if has_pending && self.chat.input_buffer.is_empty() {
             // Message queued while generating
             let queued_msg = self.chat.pending_message.as_deref().unwrap_or("");
-            Line::from(vec![
+            final_lines.push(Line::from(vec![
                 Span::styled("  ▸ ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
                 Span::styled(
                     format!("{} ", queued_msg),
                     Style::default().fg(Color::Yellow),
                 ),
                 Span::styled("(queued)", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
-            ])
+            ]));
         } else if !self.chat.input_buffer.is_empty() {
-            Line::from(vec![
-                Span::styled("  ▸ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::styled(
-                    format!("{}{}", self.chat.input_buffer, cursor),
-                    Style::default().fg(Color::White),
-                ),
-            ])
+            let display = format!("{}{}", self.chat.input_buffer, cursor);
+            let wrap_width = content_width.saturating_sub(4); // account for "  ▸ " prefix
+            let wrapped = textwrap::wrap(&display, wrap_width);
+            for (j, w) in wrapped.iter().enumerate() {
+                if j == 0 {
+                    final_lines.push(Line::from(vec![
+                        Span::styled("  ▸ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                        Span::styled(w.to_string(), Style::default().fg(Color::White)),
+                    ]));
+                } else {
+                    final_lines.push(Line::from(Span::styled(
+                        format!("    {}", w),
+                        Style::default().fg(Color::White),
+                    )));
+                }
+            }
         } else {
             let prompt_color = if is_focused { Color::Cyan } else { Color::DarkGray };
-            Line::from(Span::styled(
+            final_lines.push(Line::from(Span::styled(
                 format!("  ▸ {}", cursor),
                 Style::default().fg(prompt_color),
-            ))
+            )));
         };
-        final_lines.push(input_line);
 
         let para = Paragraph::new(final_lines)
             .block(
