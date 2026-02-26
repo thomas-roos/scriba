@@ -2835,7 +2835,7 @@ impl Dashboard {
     fn render_header(&self, f: &mut Frame, area: ratatui::layout::Rect) {
         use ratatui::text::{Line, Span};
 
-        let cycle = self.header_anim_frame % 250;
+        let cycle = self.header_anim_frame % 300;
         let yellow_bold = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
         let gray = Style::default().fg(Color::DarkGray);
 
@@ -2850,8 +2850,8 @@ impl Dashboard {
             "         ╚═╝╚═╝╩╚═╩╚═╝╩ ╩",
         ];
 
-        let lines = if skip_anim || cycle < 120 || cycle >= 240 {
-            // Idle A (0-119), Idle B (240-249), or narrow terminal fallback
+        let lines = if skip_anim || cycle < 120 || cycle >= 290 {
+            // Idle A (0-119), Idle B (290-299), or narrow terminal fallback
             let is_blink = (cycle % 40) < 3;
             let face = if is_blink { "(-,-)" } else { "(o,o)" };
             vec![
@@ -2874,13 +2874,10 @@ impl Dashboard {
                     ),
                 ]),
             ]
-        } else if cycle < 135 {
-            // Trail appears (120-134): dots materialize left-to-right
-            let is_blink = (cycle % 40) < 3;
-            let face = if is_blink { "(-,-)" } else { "(o,o)" };
-            let reveal = cycle - 120; // 0..14
-            let revealed = ((reveal + 1) as f64 / 15.0 * trail_len as f64) as usize;
-            let trail: String = "·".repeat(revealed.min(trail_len));
+        } else if cycle < 130 {
+            // Owl notices ground (120-129): eyes look right, no trail yet
+            let notice = cycle - 120; // 0..9
+            let face = if notice < 5 { "(o,>)" } else { "(O,>)" };
             vec![
                 Line::from(Span::styled(
                     format!("  {}  ╔═╗╔═╗╦═╗╦╔╗ ╔═╗", face),
@@ -2895,34 +2892,66 @@ impl Dashboard {
                         "  -\"-\"-  ╚═╝╚═╝╩╚═╩╚═╝╩ ╩",
                         yellow_bold,
                     ),
-                    Span::styled(format!(" {}", trail), gray),
+                    Span::styled(
+                        " — hoo remembers everything",
+                        gray,
+                    ),
                 ]),
             ]
-        } else if cycle < 145 {
-            // Owl notices trail (135-144): eyes shift right
-            let notice = cycle - 135; // 0..9
-            let face = if notice < 5 { "(o,>)" } else { "(O,>)" };
+        } else if cycle < 180 {
+            // Wing cut (130-179): owl flies right on line 1, wing scores sand trail
+            let cut = cycle - 130; // 0..49
+            let progress = cut as f64 / 49.0;
+            let eased = if progress < 0.5 {
+                2.0 * progress * progress
+            } else {
+                1.0 - (-2.0 * progress + 2.0).powi(2) / 2.0
+            };
+            let max_cut = trail_len.saturating_sub(1);
+            let cut_pos = (eased * max_cut as f64) as usize;
+            // Owl face on line 1, centered above the wing tip
+            let owl_face = "(o,o)";
+            let owl_col = cut_pos.saturating_sub(2).min(trail_len.saturating_sub(5));
+            let owl_gap = " ".repeat(owl_col);
+            // Trail on line 2: scored dots behind wing + wing tip + blank ahead
+            let wing = if cut % 2 == 0 { "\\" } else { "/" };
+            let scored: String = "·".repeat(cut_pos);
+            vec![
+                Line::from(Span::styled(logo_lines[0], yellow_bold)),
+                Line::from(vec![
+                    Span::styled(logo_lines[1], yellow_bold),
+                    Span::styled(format!(" {}{}", owl_gap, owl_face), yellow_bold),
+                ]),
+                Line::from(vec![
+                    Span::styled(logo_lines[2], yellow_bold),
+                    Span::styled(format!(" {}", scored), gray),
+                    Span::styled(wing, yellow_bold),
+                ]),
+            ]
+        } else if cycle < 195 {
+            // Return (180-194): owl flies back to start, full trail visible
+            let ret = cycle - 180; // 0..14
+            let progress = ret as f64 / 14.0;
+            let eased = 1.0 - (1.0 - progress).powi(2); // ease-out
+            let max_pos = trail_len.saturating_sub(5);
+            let gap_size = ((1.0 - eased) * max_pos as f64) as usize;
+            let gap = " ".repeat(gap_size);
+            let owl_face = if ret % 2 == 0 { "~(o,o)~" } else { " (o,o) " };
             let trail: String = "·".repeat(trail_len);
             vec![
-                Line::from(Span::styled(
-                    format!("  {}  ╔═╗╔═╗╦═╗╦╔╗ ╔═╗", face),
-                    yellow_bold,
-                )),
-                Line::from(Span::styled(
-                    "  {`\"'}  ╚═╗║  ╠╦╝║╠╩╗╠═╣",
-                    yellow_bold,
-                )),
+                Line::from(Span::styled(logo_lines[0], yellow_bold)),
                 Line::from(vec![
-                    Span::styled(
-                        "  -\"-\"-  ╚═╝╚═╝╩╚═╩╚═╝╩ ╩",
-                        yellow_bold,
-                    ),
+                    Span::styled(logo_lines[1], yellow_bold),
+                    Span::styled(format!(" {}{}", gap, owl_face), yellow_bold),
+                ]),
+                Line::from(vec![
+                    Span::styled(logo_lines[2], yellow_bold),
                     Span::styled(format!(" {}", trail), gray),
                 ]),
             ]
-        } else if cycle < 200 {
-            // Owl eats trail (145-199): owl on line 1 above trail, vacuums dots upward
-            let eat = cycle - 145; // 0..54
+        } else if cycle < 250 {
+            // Owl eats trail (195-249): owl on line 1 above trail, vacuums dots upward
+            let eat = cycle - 195; // 0..54
             let progress = eat as f64 / 54.0;
             let eased = if progress < 0.5 {
                 2.0 * progress * progress
@@ -2953,28 +2982,38 @@ impl Dashboard {
                     Span::styled(dots, gray),
                 ]),
             ]
-        } else if cycle < 215 {
-            // Crazy celebration (200-214): owl at trail end on line 1
-            let celeb = cycle - 200; // 0..14
-            let owl_str = match (celeb / 4) % 4 {
+        } else if cycle < 265 {
+            // Crazy celebration (250-264): owl ecstatic, shouts HOOOOOO!!
+            let celeb = cycle - 250; // 0..14
+            // Fast-cycling crazy sprites (every 2 frames)
+            let owl_str = match (celeb / 2) % 4 {
                 0 => "\\(@,@)/",
                 1 => "/(O,O)\\",
                 2 => "\\(x,X)/",
                 _ => "|(O,o)|",
             };
             let owl_col = trail_len.saturating_sub(7);
-            let gap = " ".repeat(owl_col);
+            let owl_gap = " ".repeat(owl_col);
+            // Growing "HOOOOOO!!" shout on line 2, expanding right-to-left
+            let shout_target = ((celeb + 1) as f64 / 15.0 * trail_len as f64) as usize;
+            let shout_len = shout_target.max(4).min(trail_len);
+            let num_os = shout_len.saturating_sub(3).max(1);
+            let shout = format!("H{}!!", "O".repeat(num_os));
+            let shout_gap = " ".repeat(trail_len.saturating_sub(shout.len()));
             vec![
                 Line::from(Span::styled(logo_lines[0], yellow_bold)),
                 Line::from(vec![
                     Span::styled(logo_lines[1], yellow_bold),
-                    Span::styled(format!(" {}{}", gap, owl_str), yellow_bold),
+                    Span::styled(format!(" {}{}", owl_gap, owl_str), yellow_bold),
                 ]),
-                Line::from(Span::styled(logo_lines[2], yellow_bold)),
+                Line::from(vec![
+                    Span::styled(logo_lines[2], yellow_bold),
+                    Span::styled(format!(" {}{}", shout_gap, shout), yellow_bold),
+                ]),
             ]
         } else {
-            // Fly back (215-239): owl flaps back to rest position
-            let fly = cycle - 215; // 0..24
+            // Fly back (265-289): owl flaps back to rest position
+            let fly = cycle - 265; // 0..24
             let progress = fly as f64 / 24.0;
             let eased = 1.0 - (1.0 - progress).powi(2); // ease-out
             let max_pos = trail_len.saturating_sub(7);
