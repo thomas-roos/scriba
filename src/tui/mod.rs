@@ -8,5 +8,6 @@
 //! - Searching transcripts
 
 mod app;
+pub mod chat;
 
 pub use app::Dashboard;

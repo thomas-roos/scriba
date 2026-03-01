@@ -20,7 +20,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
     Frame, Terminal,
 };
 use std::io;
@@ -33,128 +33,10 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command as TokioCommand;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Chat types for "Ask Scriba"
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-enum ChatStreamEvent {
-    Status(String),
-    Chunk(String),
-    Done,
-    Error(String),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum ChatRole {
-    User,
-    Assistant,
-    System,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum ChatContext {
-    Global,
-    Recording { recording_id: i64, recording_name: String },
-}
-
-#[derive(Debug, Clone)]
-struct ChatMessage {
-    role: ChatRole,
-    content: String,
-}
-
-#[derive(Debug, PartialEq, Clone, Copy)]
-enum ChatFocus {
-    Table,
-    ChatInput,
-}
-
-struct ChatState {
-    context: ChatContext,
-    messages: Vec<ChatMessage>,
-    input_buffer: String,
-    scroll_offset: usize,
-
-    // Streaming state
-    stream_rx: Option<mpsc::Receiver<ChatStreamEvent>>,
-    current_status: Option<String>,
-    streaming_content: String,
-    is_generating: bool,
-
-    // Generation task handle
-    generation_task: Option<tokio::task::JoinHandle<()>>,
-
-    // Suggestions
-    suggestions: Vec<String>,
-    show_suggestions: bool,
-    selected_suggestion: usize,
-
-    // Pre-built system prompt
-    system_prompt: String,
-
-    // Focus
-    focus: ChatFocus,
-
-    // Spinner frame
-    spinner_frame: usize,
-
-    // Auto-scroll: stays true until user manually scrolls up
-    auto_scroll: bool,
-
-    // Queued message: submitted while generating, will auto-send when done
-    pending_message: Option<String>,
-
-    // Last rendered chat panel area (for mouse hit-testing)
-    panel_rect: ratatui::layout::Rect,
-
-    // Total content lines (for scroll clamping in mouse handler)
-    total_content_lines: usize,
-
-    // Text selection state (click-drag to select, auto-copy on release)
-    selection_anchor: Option<(usize, usize)>, // (content_line, char_col) where drag started
-    selection_end: Option<(usize, usize)>,    // (content_line, char_col) current drag position
-    content_texts: Vec<String>,               // plain text of each content line for extraction
-
-    // Rendering cache for completed messages
-    cached_msg_lines: Vec<Line<'static>>,
-    cached_msg_texts: Vec<String>,
-    cached_msg_count: usize,
-    cached_width: usize,
-}
-
-impl ChatState {
-    fn new() -> Self {
-        Self {
-            context: ChatContext::Global,
-            messages: Vec::new(),
-            input_buffer: String::new(),
-            scroll_offset: 0,
-            stream_rx: None,
-            current_status: None,
-            streaming_content: String::new(),
-            is_generating: false,
-            generation_task: None,
-            suggestions: Vec::new(),
-            show_suggestions: true,
-            selected_suggestion: 0,
-            system_prompt: String::new(),
-            focus: ChatFocus::Table,
-            spinner_frame: 0,
-            auto_scroll: true,
-            pending_message: None,
-            panel_rect: ratatui::layout::Rect::default(),
-            total_content_lines: 0,
-            selection_anchor: None,
-            selection_end: None,
-            content_texts: Vec::new(),
-            cached_msg_lines: Vec::new(),
-            cached_msg_texts: Vec::new(),
-            cached_msg_count: 0,
-            cached_width: 0,
-        }
-    }
-}
+use super::chat::{
+    ChatContext, ChatFocus, ChatMessage, ChatRole, ChatState, ChatStreamEvent,
+    chat_agent_pipeline, chat_generation_pipeline,
+};
 
 pub struct Dashboard {
     db: Database,
@@ -917,7 +799,12 @@ impl Dashboard {
             }
 
             // Poll chat stream events (non-blocking — every frame for smooth streaming)
-            self.poll_chat_stream();
+            if self.chat.poll_stream() {
+                // A pending message is ready to be resent
+                let msg = self.chat.pending_message.take().unwrap();
+                self.chat.input_buffer = msg;
+                self.send_chat_message();
+            }
 
             // Animation counters (throttled to ~10fps)
             if anim_tick {
@@ -2793,7 +2680,7 @@ impl Dashboard {
 
         // Dynamic chat panel height (unified: suggestions/messages + input in one block)
         let has_chat_content = !self.chat.messages.is_empty()
-            || !self.chat.streaming_content.is_empty()
+            || !self.chat.pending_blocks.is_empty()
             || self.chat.is_generating;
 
         let chat_panel_height: u16 = if has_chat_content {
@@ -2821,7 +2708,7 @@ impl Dashboard {
         self.render_recordings_table(f, main_chunks[1]);
 
         // Unified chat panel
-        self.render_chat_panel(f, main_chunks[2]);
+        self.chat.render(f, main_chunks[2]);
 
         // Compressed footer
         self.render_compressed_footer(f, main_chunks[3]);
@@ -4436,7 +4323,7 @@ impl Dashboard {
 
         // Dynamic chat panel height for transcript view
         let has_chat_content = !self.chat.messages.is_empty()
-            || !self.chat.streaming_content.is_empty()
+            || !self.chat.pending_blocks.is_empty()
             || self.chat.is_generating;
 
         let chat_panel_h: u16 = if has_chat_content {
@@ -4472,7 +4359,7 @@ impl Dashboard {
         chunk_idx += 1;
 
         // Unified chat panel
-        self.render_chat_panel(f, content_chunks[chunk_idx]);
+        self.chat.render(f, content_chunks[chunk_idx]);
 
         // Notification overlay (e.g. "Copied to clipboard")
         if let Some((ref msg, _)) = self.notification_message {
@@ -5482,13 +5369,25 @@ impl Dashboard {
 
         let entities_summary = world.entities_summary();
 
-        self.chat.system_prompt = chat_prompts::build_global_chat_prompt(
-            &owner_name,
-            &world_json,
-            &stats_summary,
-            &recent_recordings,
-            &entities_summary,
+        // Use agent prompt for Anthropic, full context prompt for others
+        let is_anthropic = matches!(
+            &self.config.enrichment.mode,
+            crate::core::config::EnrichmentMode::Cloud {
+                provider: CloudProvider::Anthropic, ..
+            }
         );
+
+        self.chat.system_prompt = if is_anthropic {
+            chat_prompts::build_agent_global_prompt(&owner_name)
+        } else {
+            chat_prompts::build_global_chat_prompt(
+                &owner_name,
+                &world_json,
+                &stats_summary,
+                &recent_recordings,
+                &entities_summary,
+            )
+        };
 
         self.chat.context = ChatContext::Global;
         self.chat.suggestions = self.generate_suggestions();
@@ -5530,17 +5429,34 @@ impl Dashboard {
 
         let world_json = world.to_json().unwrap_or_default();
 
-        self.chat.system_prompt = chat_prompts::build_recording_chat_prompt(
-            &owner_name,
-            &recording_name,
-            &self.transcript_content,
-            summary,
-            &topics_str,
-            &entities_str,
-            &key_points_str,
-            action_items,
-            &world_json,
+        // Use agent prompt for Anthropic, full context prompt for others
+        let is_anthropic = matches!(
+            &self.config.enrichment.mode,
+            crate::core::config::EnrichmentMode::Cloud {
+                provider: CloudProvider::Anthropic, ..
+            }
         );
+
+        self.chat.system_prompt = if is_anthropic {
+            chat_prompts::build_agent_recording_prompt(
+                &owner_name,
+                recording.id.unwrap_or(0),
+                &recording_name,
+                summary,
+            )
+        } else {
+            chat_prompts::build_recording_chat_prompt(
+                &owner_name,
+                &recording_name,
+                &self.transcript_content,
+                summary,
+                &topics_str,
+                &entities_str,
+                &key_points_str,
+                action_items,
+                &world_json,
+            )
+        };
 
         self.chat.context = ChatContext::Recording {
             recording_id: recording.id.unwrap_or(0),
@@ -5548,7 +5464,7 @@ impl Dashboard {
         };
         self.chat.messages.clear();
         self.chat.input_buffer.clear();
-        self.chat.streaming_content.clear();
+        self.chat.pending_blocks.clear();
         self.chat.current_status = None;
         self.chat.is_generating = false;
         self.chat.scroll_offset = 0;
@@ -5562,7 +5478,7 @@ impl Dashboard {
         self.chat.messages = std::mem::take(&mut self.global_chat_messages);
         self.chat.context = ChatContext::Global;
         self.chat.input_buffer.clear();
-        self.chat.streaming_content.clear();
+        self.chat.pending_blocks.clear();
         self.chat.current_status = None;
         self.chat.is_generating = false;
         self.chat.scroll_offset = 0;
@@ -5594,17 +5510,14 @@ impl Dashboard {
         };
 
         // Add user message
-        self.chat.messages.push(ChatMessage {
-            role: ChatRole::User,
-            content: user_msg.clone(),
-        });
+        self.chat.messages.push(ChatMessage::text(ChatRole::User, user_msg.clone()));
 
         // Spawn generation pipeline
         let (event_tx, event_rx) = mpsc::channel::<ChatStreamEvent>(100);
         self.chat.stream_rx = Some(event_rx);
         self.chat.is_generating = true;
         self.chat.auto_scroll = true; // re-engage for new response
-        self.chat.streaming_content.clear();
+        self.chat.pending_blocks.clear();
         self.chat.current_status = Some("Preparing...".to_string());
 
         let config = self.config.enrichment.clone();
@@ -5615,62 +5528,45 @@ impl Dashboard {
                 ChatRole::Assistant => "Assistant",
                 ChatRole::System => "System",
             };
-            (role.to_string(), m.content.clone())
+            (role.to_string(), m.content())
         }).collect();
 
-        // Collect entity names for cross-referencing
-        let entity_names: Vec<(String, i64)> = self.entities.iter()
-            .filter_map(|e| e.id.map(|id| (e.canonical_name.clone(), id)))
-            .collect();
-
-        self.chat.generation_task = Some(tokio::spawn(async move {
-            chat_generation_pipeline(config, system_prompt, messages, user_msg, entity_names, event_tx).await;
-        }));
-    }
-
-    fn poll_chat_stream(&mut self) {
-        if let Some(ref mut rx) = self.chat.stream_rx {
-            while let Ok(event) = rx.try_recv() {
-                match event {
-                    ChatStreamEvent::Status(msg) => {
-                        self.chat.current_status = Some(msg);
-                    }
-                    ChatStreamEvent::Chunk(text) => {
-                        self.chat.current_status = None;
-                        self.chat.streaming_content.push_str(&text);
-                    }
-                    ChatStreamEvent::Done => {
-                        let content = std::mem::take(&mut self.chat.streaming_content);
-                        self.chat.messages.push(ChatMessage {
-                            role: ChatRole::Assistant,
-                            content,
-                        });
-                        self.chat.is_generating = false;
-                        self.chat.stream_rx = None;
-                        self.chat.current_status = None;
-                        // Auto-send queued message if any
-                        if self.chat.pending_message.is_some() {
-                            let msg = self.chat.pending_message.take().unwrap();
-                            self.chat.input_buffer = msg;
-                            self.send_chat_message();
-                        }
-                        return;
-                    }
-                    ChatStreamEvent::Error(msg) => {
-                        self.chat.messages.push(ChatMessage {
-                            role: ChatRole::System,
-                            content: format!("Error: {}", msg),
-                        });
-                        self.chat.is_generating = false;
-                        self.chat.stream_rx = None;
-                        self.chat.current_status = None;
-                        self.chat.streaming_content.clear();
-                        // Drop pending message on error
-                        self.chat.pending_message = None;
-                        return;
-                    }
-                }
+        // Check if we should use the agent loop (Anthropic only)
+        let use_agent = matches!(
+            &config.mode,
+            crate::core::config::EnrichmentMode::Cloud {
+                provider: CloudProvider::Anthropic, ..
             }
+        );
+
+        if use_agent {
+            // Extract API key and model for the agent loop
+            let (api_key, model) = match &config.mode {
+                crate::core::config::EnrichmentMode::Cloud { api_key, model, .. } => {
+                    let key = if api_key.is_empty() {
+                        std::env::var("ANTHROPIC_API_KEY").unwrap_or_default()
+                    } else {
+                        api_key.clone()
+                    };
+                    let m = model.clone().unwrap_or_else(|| "claude-opus-4-6".to_string());
+                    (key, m)
+                }
+                _ => unreachable!(),
+            };
+
+            self.chat.pending_blocks.clear();
+            self.chat.generation_task = Some(tokio::spawn(async move {
+                chat_agent_pipeline(system_prompt, messages, user_msg, api_key, model, event_tx).await;
+            }));
+        } else {
+            // Collect entity names for cross-referencing (fallback pipeline)
+            let entity_names: Vec<(String, i64)> = self.entities.iter()
+                .filter_map(|e| e.id.map(|id| (e.canonical_name.clone(), id)))
+                .collect();
+
+            self.chat.generation_task = Some(tokio::spawn(async move {
+                chat_generation_pipeline(config, system_prompt, messages, user_msg, entity_names, event_tx).await;
+            }));
         }
     }
 
@@ -5827,36 +5723,6 @@ impl Dashboard {
 
     // ── Mouse Handling ────────────────────────────────────────────────────
 
-    /// Map a mouse position to a (content_line, char_col) in the chat content.
-    fn mouse_to_content_pos(&self, mouse_col: u16, mouse_row: u16) -> Option<(usize, usize)> {
-        let rect = self.chat.panel_rect;
-        let click_row = (mouse_row - rect.y).saturating_sub(1) as usize; // subtract top border
-        let char_col = (mouse_col - rect.x).saturating_sub(1) as usize; // subtract left border
-
-        let inner_height = rect.height.saturating_sub(2) as usize;
-        let has_conv = !self.chat.messages.is_empty() || self.chat.is_generating;
-        let reserved = if has_conv { 2 } else { 1 };
-        let chat_height = inner_height.saturating_sub(reserved);
-
-        let scroll_y = if self.chat.auto_scroll || self.chat.total_content_lines <= chat_height {
-            self.chat.total_content_lines.saturating_sub(chat_height)
-        } else {
-            let max_scroll = self.chat.total_content_lines.saturating_sub(chat_height);
-            self.chat.scroll_offset.min(max_scroll)
-        };
-
-        let lines_to_show = self.chat.total_content_lines.saturating_sub(scroll_y);
-        let pad = chat_height.saturating_sub(lines_to_show.min(chat_height));
-        if click_row < pad {
-            return None; // clicked on padding
-        }
-        let content_line = scroll_y + (click_row - pad);
-        if content_line >= self.chat.total_content_lines {
-            return None;
-        }
-        Some((content_line, char_col))
-    }
-
     fn handle_mouse_event(&mut self, mouse: crossterm::event::MouseEvent) {
         let rect = self.chat.panel_rect;
         if rect.width == 0 || rect.height == 0 {
@@ -5891,7 +5757,7 @@ impl Dashboard {
             }
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                 // Start text selection
-                if let Some(pos) = self.mouse_to_content_pos(mouse.column, mouse.row) {
+                if let Some(pos) = self.chat.mouse_to_content_pos(mouse.column, mouse.row) {
                     self.chat.selection_anchor = Some(pos);
                     self.chat.selection_end = None; // reset until drag
                     self.chat.focus = ChatFocus::ChatInput;
@@ -5925,7 +5791,7 @@ impl Dashboard {
                         }
                     }
 
-                    if let Some(pos) = self.mouse_to_content_pos(mouse.column, mouse.row) {
+                    if let Some(pos) = self.chat.mouse_to_content_pos(mouse.column, mouse.row) {
                         self.chat.selection_end = Some(pos);
                     }
                 }
@@ -5933,7 +5799,7 @@ impl Dashboard {
             MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
                 // Finalize selection and copy
                 if let (Some(anchor), Some(end)) = (self.chat.selection_anchor, self.chat.selection_end) {
-                    let selected = self.extract_selected_text(anchor, end);
+                    let selected = self.chat.extract_selected_text(anchor, end);
                     if !selected.trim().is_empty() {
                         use arboard::Clipboard;
                         if let Ok(mut clipboard) = Clipboard::new() {
@@ -5952,551 +5818,7 @@ impl Dashboard {
         }
     }
 
-    /// Extract the plain text between two content positions.
-    fn extract_selected_text(&self, anchor: (usize, usize), end: (usize, usize)) -> String {
-        // Normalize: start is the earlier position
-        let (start, end) = if anchor <= end { (anchor, end) } else { (end, anchor) };
-        let (start_line, start_col) = start;
-        let (end_line, end_col) = end;
-
-        let texts = &self.chat.content_texts;
-        if texts.is_empty() || start_line >= texts.len() {
-            return String::new();
-        }
-
-        let mut result = String::new();
-        for line_idx in start_line..=end_line.min(texts.len() - 1) {
-            let line_text = &texts[line_idx];
-            let chars: Vec<char> = line_text.chars().collect();
-
-            let from = if line_idx == start_line { start_col.min(chars.len()) } else { 0 };
-            let to = if line_idx == end_line { end_col.min(chars.len()) } else { chars.len() };
-
-            if from < to {
-                let slice: String = chars[from..to].iter().collect();
-                result.push_str(&slice);
-            }
-            if line_idx < end_line {
-                result.push('\n');
-            }
-        }
-
-        result
-    }
-
-    // ── Markdown Parsing ─────────────────────────────────────────────────
-
-    /// Parse simple markdown into styled spans: **bold**, *italic*, `code`.
-    /// Returns owned spans to avoid lifetime issues in closures.
-    /// Strip leading `# ` / `## ` etc. prefix spans emitted by tui_markdown for headings.
-    fn strip_heading_prefix(mut line: Line<'static>) -> Line<'static> {
-        if let Some(first) = line.spans.first() {
-            let trimmed = first.content.trim_end();
-            if !trimmed.is_empty() && trimmed.chars().all(|c| c == '#') {
-                line.spans.remove(0);
-            }
-        }
-        line
-    }
-
-    /// Wrap a styled Line to fit within max_width, preserving span styles.
-    fn wrap_styled_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
-        let char_count: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-        if char_count <= max_width || max_width == 0 {
-            return vec![line];
-        }
-
-        let styled_chars: Vec<(char, Style)> = line
-            .spans
-            .iter()
-            .flat_map(|span| span.content.chars().map(move |c| (c, span.style)))
-            .collect();
-
-        let mut result = Vec::new();
-        let mut pos = 0;
-
-        while pos < styled_chars.len() {
-            let end = (pos + max_width).min(styled_chars.len());
-            let actual_end = if end >= styled_chars.len() {
-                end
-            } else {
-                styled_chars[pos..end]
-                    .iter()
-                    .rposition(|(c, _)| *c == ' ')
-                    .map(|p| pos + p + 1)
-                    .unwrap_or(end)
-            };
-
-            let chunk = &styled_chars[pos..actual_end];
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            if let Some(&(first_c, first_style)) = chunk.first() {
-                let mut current_text = String::new();
-                current_text.push(first_c);
-                let mut current_style = first_style;
-                for &(c, style) in &chunk[1..] {
-                    if style != current_style {
-                        spans.push(Span::styled(current_text, current_style));
-                        current_text = String::new();
-                        current_style = style;
-                    }
-                    current_text.push(c);
-                }
-                spans.push(Span::styled(current_text, current_style));
-            }
-            result.push(Line::from(spans));
-
-            pos = actual_end;
-            while pos < styled_chars.len() && styled_chars[pos].0 == ' ' {
-                pos += 1;
-            }
-        }
-
-        result
-    }
-
-    /// Apply a highlight background to a portion of a Line (for text selection).
-    fn apply_selection_highlight(line: Line<'static>, sel_start: usize, sel_end: usize) -> Line<'static> {
-        if sel_start >= sel_end {
-            return line;
-        }
-        let highlight_bg = Color::Indexed(237); // subtle dark gray background
-        let mut result_spans: Vec<Span<'static>> = Vec::new();
-        let mut col: usize = 0;
-
-        for span in line.spans {
-            let span_char_count = span.content.chars().count();
-            let span_start = col;
-            let span_end = col + span_char_count;
-
-            if span_end <= sel_start || span_start >= sel_end {
-                // Entirely outside selection
-                result_spans.push(span);
-            } else {
-                let chars: Vec<char> = span.content.chars().collect();
-
-                // Before selection
-                let hl_start = sel_start.saturating_sub(span_start);
-                if hl_start > 0 {
-                    let before: String = chars[..hl_start].iter().collect();
-                    result_spans.push(Span::styled(before, span.style));
-                }
-
-                // Selected portion
-                let hl_end = (sel_end - span_start).min(chars.len());
-                let selected: String = chars[hl_start..hl_end].iter().collect();
-                result_spans.push(Span::styled(selected, span.style.bg(highlight_bg)));
-
-                // After selection
-                if hl_end < chars.len() {
-                    let after: String = chars[hl_end..].iter().collect();
-                    result_spans.push(Span::styled(after, span.style));
-                }
-            }
-
-            col = span_end;
-        }
-
-        Line::from(result_spans)
-    }
-
-    // ── Chat Rendering ──────────────────────────────────────────────────────
-
-    fn render_chat_panel(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
-        self.chat.panel_rect = area;
-        if area.height < 3 {
-            return;
-        }
-
-        let is_focused = self.chat.focus == ChatFocus::ChatInput;
-        let border_color = if is_focused { Color::Cyan } else { Color::DarkGray };
-
-        let title = match &self.chat.context {
-            ChatContext::Global => "Ask Scriba",
-            ChatContext::Recording { .. } => "Ask about this recording",
-        };
-
-        // Content height inside the bordered block (minus top/bottom border)
-        let inner_height = area.height.saturating_sub(2) as usize;
-        let has_conversation = !self.chat.messages.is_empty() || self.chat.is_generating;
-        let content_width = area.width.saturating_sub(4) as usize; // borders + padding
-
-        // Compute how many lines the input will occupy (for accurate height reservation)
-        let input_line_count = if !self.chat.input_buffer.is_empty() {
-            let cursor_ch = if is_focused { "▎" } else { "" };
-            let display = format!("{}{}", self.chat.input_buffer, cursor_ch);
-            let wrap_width = content_width.saturating_sub(4);
-            if wrap_width > 0 { textwrap::wrap(&display, wrap_width).len() } else { 1 }
-        } else {
-            1
-        };
-        // Reserve: input lines + 1 separator when conversation active
-        let reserved = if has_conversation { 1 + input_line_count } else { input_line_count };
-        let chat_height = inner_height.saturating_sub(reserved);
-
-        let mut final_lines: Vec<Line> = Vec::with_capacity(inner_height);
-
-        // Suggestions mode: no messages yet
-        let show_suggestions = self.chat.show_suggestions
-            && !self.chat.suggestions.is_empty()
-            && self.chat.messages.is_empty()
-            && self.chat.streaming_content.is_empty()
-            && !self.chat.is_generating;
-
-        // Compute selection range (normalized: start <= end)
-        let selection = match (self.chat.selection_anchor, self.chat.selection_end) {
-            (Some(a), Some(e)) => {
-                let (start, end) = if a <= e { (a, e) } else { (e, a) };
-                Some((start, end))
-            }
-            _ => None,
-        };
-
-        if show_suggestions {
-            let mut all_lines: Vec<Line> = Vec::new();
-            let mut content_texts: Vec<String> = Vec::new();
-            let total_options = self.chat.suggestions.len() + 1;
-            for (i, s) in self.chat.suggestions.iter().enumerate() {
-                let text = if i == self.chat.selected_suggestion {
-                    format!("  > {}", s)
-                } else {
-                    format!("    {}", s)
-                };
-                let style = if i == self.chat.selected_suggestion {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
-                content_texts.push(text.clone());
-                all_lines.push(Line::from(Span::styled(text, style)));
-            }
-            let free_form_idx = total_options - 1;
-            let text = if self.chat.selected_suggestion == free_form_idx {
-                "  > Ask Scriba anything..."
-            } else {
-                "    Ask Scriba anything..."
-            };
-            let style = if self.chat.selected_suggestion == free_form_idx {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            content_texts.push(text.to_string());
-            all_lines.push(Line::from(Span::styled(text.to_string(), style)));
-
-            self.chat.content_texts = content_texts;
-            let total_content = all_lines.len();
-            self.chat.total_content_lines = total_content;
-            let scroll_y: u16 = if self.chat.auto_scroll || total_content <= chat_height {
-                total_content.saturating_sub(chat_height) as u16
-            } else {
-                let max_scroll = total_content.saturating_sub(chat_height);
-                self.chat.scroll_offset.min(max_scroll) as u16
-            };
-            let lines_to_show = total_content.saturating_sub(scroll_y as usize);
-            let pad = chat_height.saturating_sub(lines_to_show.min(chat_height));
-            for _ in 0..pad {
-                final_lines.push(Line::from(""));
-            }
-            for (vis_idx, line) in all_lines.into_iter().skip(scroll_y as usize).take(chat_height).enumerate() {
-                let content_idx = scroll_y as usize + vis_idx;
-                if let Some(((sel_start_line, sel_start_col), (sel_end_line, sel_end_col))) = selection {
-                    if content_idx >= sel_start_line && content_idx <= sel_end_line {
-                        let line_start = if content_idx == sel_start_line { sel_start_col } else { 0 };
-                        let line_text_len = self.chat.content_texts.get(content_idx)
-                            .map(|t| t.chars().count()).unwrap_or(0);
-                        let line_end = if content_idx == sel_end_line { sel_end_col } else { line_text_len };
-                        final_lines.push(Self::apply_selection_highlight(line, line_start, line_end));
-                        continue;
-                    }
-                }
-                final_lines.push(line);
-            }
-        } else {
-            // ── Phase 1: Completed messages (cached) ───────────────────────
-            let msg_count = self.chat.messages.len();
-            let cache_valid = msg_count == self.chat.cached_msg_count
-                && content_width == self.chat.cached_width;
-
-            if !cache_valid {
-                let mut cached_lines: Vec<Line<'static>> = Vec::new();
-                let mut cached_texts: Vec<String> = Vec::new();
-                let wrap_width = content_width.saturating_sub(2);
-
-                for msg in &self.chat.messages {
-                    match msg.role {
-                        ChatRole::User => {
-                            let header = "You:".to_string();
-                            cached_texts.push(header.clone());
-                            cached_lines.push(Line::from(Span::styled(
-                                header,
-                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                            )));
-                            let style = Style::default().fg(Color::Cyan);
-                            for line in msg.content.lines() {
-                                let wrapped = textwrap::wrap(line, wrap_width);
-                                if wrapped.is_empty() {
-                                    cached_texts.push("  ".to_string());
-                                    cached_lines.push(Line::from(Span::styled("  ".to_string(), style)));
-                                } else {
-                                    for w in &wrapped {
-                                        let full = format!("  {}", w);
-                                        cached_texts.push(full.clone());
-                                        cached_lines.push(Line::from(Span::styled(full, style)));
-                                    }
-                                }
-                            }
-                            cached_texts.push(String::new());
-                            cached_lines.push(Line::from(""));
-                        }
-                        ChatRole::Assistant => {
-                            let header = "(o,o):".to_string();
-                            cached_texts.push(header.clone());
-                            cached_lines.push(Line::from(Span::styled(
-                                header,
-                                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                            )));
-                            let md_text = tui_markdown::from_str(&msg.content);
-                            for md_line in md_text.lines {
-                                let owned_line = Line::from(
-                                    md_line
-                                        .spans
-                                        .into_iter()
-                                        .map(|span| Span::styled(span.content.to_string(), span.style))
-                                        .collect::<Vec<_>>(),
-                                );
-                                let owned_line = Self::strip_heading_prefix(owned_line);
-                                let wrapped_lines = Self::wrap_styled_line(owned_line, wrap_width);
-                                for wl in wrapped_lines {
-                                    let plain: String =
-                                        wl.spans.iter().map(|s| s.content.as_ref()).collect();
-                                    cached_texts.push(format!("  {}", plain));
-                                    let mut indented = vec![Span::raw("  ".to_string())];
-                                    indented.extend(wl.spans);
-                                    cached_lines.push(Line::from(indented));
-                                }
-                            }
-                            cached_texts.push(String::new());
-                            cached_lines.push(Line::from(""));
-                        }
-                        ChatRole::System => {
-                            let style = Style::default().fg(Color::Red).add_modifier(Modifier::ITALIC);
-                            for line in msg.content.lines() {
-                                let wrapped = textwrap::wrap(line, content_width);
-                                if wrapped.is_empty() {
-                                    cached_texts.push(String::new());
-                                    cached_lines.push(Line::from(Span::styled(String::new(), style)));
-                                } else {
-                                    for w in &wrapped {
-                                        let full = w.to_string();
-                                        cached_texts.push(full.clone());
-                                        cached_lines.push(Line::from(Span::styled(full, style)));
-                                    }
-                                }
-                            }
-                            cached_texts.push(String::new());
-                            cached_lines.push(Line::from(""));
-                        }
-                    }
-                }
-
-                self.chat.cached_msg_lines = cached_lines;
-                self.chat.cached_msg_texts = cached_texts;
-                self.chat.cached_msg_count = msg_count;
-                self.chat.cached_width = content_width;
-            }
-
-            // ── Phase 2: Dynamic content (always rebuilt) ──────────────────
-            let mut dynamic_lines: Vec<Line<'static>> = Vec::new();
-            let mut dynamic_texts: Vec<String> = Vec::new();
-
-            if !self.chat.streaming_content.is_empty() {
-                let header = "(o,o):".to_string();
-                dynamic_texts.push(header.clone());
-                dynamic_lines.push(Line::from(Span::styled(
-                    header,
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                )));
-                let wrap_width = content_width.saturating_sub(2);
-                let md_text = tui_markdown::from_str(&self.chat.streaming_content);
-                for md_line in md_text.lines {
-                    let owned_line = Line::from(
-                        md_line
-                            .spans
-                            .into_iter()
-                            .map(|span| Span::styled(span.content.to_string(), span.style))
-                            .collect::<Vec<_>>(),
-                    );
-                    let owned_line = Self::strip_heading_prefix(owned_line);
-                    let wrapped_lines = Self::wrap_styled_line(owned_line, wrap_width);
-                    for wl in wrapped_lines {
-                        let plain: String =
-                            wl.spans.iter().map(|s| s.content.as_ref()).collect();
-                        dynamic_texts.push(format!("  {}", plain));
-                        let mut indented = vec![Span::raw("  ".to_string())];
-                        indented.extend(wl.spans);
-                        dynamic_lines.push(Line::from(indented));
-                    }
-                }
-            }
-
-            if let Some(status) = &self.chat.current_status {
-                let spinners = ['◐', '◑', '◒', '◓'];
-                let spinner = spinners[self.chat.spinner_frame % spinners.len()];
-                let text = format!(" {} {}", spinner, status);
-                dynamic_texts.push(text);
-                dynamic_lines.push(Line::from(vec![
-                    Span::styled(
-                        format!(" {} ", spinner),
-                        Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(status.clone(), Style::default().fg(Color::Yellow)),
-                ]));
-            }
-
-            // ── Phase 3: Assemble content_texts, compute total ─────────────
-            let cached_len = self.chat.cached_msg_lines.len();
-            let total_content = cached_len + dynamic_lines.len();
-            self.chat.total_content_lines = total_content;
-
-            // Clamp stale scroll offset to valid range (prevents OOB after streaming done)
-            let max_offset = total_content.saturating_sub(chat_height);
-            if self.chat.scroll_offset > max_offset {
-                self.chat.scroll_offset = max_offset;
-            }
-
-            let mut content_texts = self.chat.cached_msg_texts.clone();
-            content_texts.extend(dynamic_texts);
-            self.chat.content_texts = content_texts;
-
-            // ── Scroll calculation ─────────────────────────────────────────
-            let scroll_y: u16 = if self.chat.auto_scroll || total_content <= chat_height {
-                total_content.saturating_sub(chat_height) as u16
-            } else {
-                let max_scroll = total_content.saturating_sub(chat_height);
-                self.chat.scroll_offset.min(max_scroll) as u16
-            };
-            let lines_to_show = total_content.saturating_sub(scroll_y as usize);
-            let pad = chat_height.saturating_sub(lines_to_show.min(chat_height));
-            for _ in 0..pad {
-                final_lines.push(Line::from(""));
-            }
-
-            // ── Phase 4: Build visible window (only visible lines cloned) ──
-            let start = scroll_y as usize;
-            let end = (start + chat_height).min(total_content);
-            for i in start..end {
-                let line = if i < cached_len {
-                    self.chat.cached_msg_lines[i].clone()
-                } else {
-                    let dyn_idx = i - cached_len;
-                    if dyn_idx < dynamic_lines.len() {
-                        dynamic_lines[dyn_idx].clone()
-                    } else {
-                        Line::from("")
-                    }
-                };
-                let content_idx = i;
-                if let Some(((sel_start_line, sel_start_col), (sel_end_line, sel_end_col))) = selection {
-                    if content_idx >= sel_start_line && content_idx <= sel_end_line {
-                        let line_start = if content_idx == sel_start_line { sel_start_col } else { 0 };
-                        let line_text_len = self.chat.content_texts.get(content_idx)
-                            .map(|t| t.chars().count()).unwrap_or(0);
-                        let line_end = if content_idx == sel_end_line { sel_end_col } else { line_text_len };
-                        final_lines.push(Self::apply_selection_highlight(line, line_start, line_end));
-                        continue;
-                    }
-                }
-                final_lines.push(line);
-            }
-        }
-
-        // ── Separator + Input line (always last lines inside the block) ────
-        // Visual breathing room between chat content and input
-        if has_conversation {
-            let sep_width = content_width.min(area.width.saturating_sub(4) as usize);
-            let sep = "─".repeat(sep_width);
-            final_lines.push(Line::from(Span::styled(
-                format!("  {}", sep),
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-
-        let cursor = if is_focused { "▎" } else { "" };
-        let has_pending = self.chat.pending_message.is_some();
-        if has_pending && self.chat.input_buffer.is_empty() {
-            // Message queued while generating
-            let queued_msg = self.chat.pending_message.as_deref().unwrap_or("");
-            final_lines.push(Line::from(vec![
-                Span::styled("  ▸ ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(
-                    format!("{} ", queued_msg),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled("(queued)", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
-            ]));
-        } else if !self.chat.input_buffer.is_empty() {
-            let display = format!("{}{}", self.chat.input_buffer, cursor);
-            let wrap_width = content_width.saturating_sub(4); // account for "  ▸ " prefix
-            let wrapped = textwrap::wrap(&display, wrap_width);
-            for (j, w) in wrapped.iter().enumerate() {
-                if j == 0 {
-                    final_lines.push(Line::from(vec![
-                        Span::styled("  ▸ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                        Span::styled(w.to_string(), Style::default().fg(Color::White)),
-                    ]));
-                } else {
-                    final_lines.push(Line::from(Span::styled(
-                        format!("    {}", w),
-                        Style::default().fg(Color::White),
-                    )));
-                }
-            }
-        } else {
-            let prompt_color = if is_focused { Color::Cyan } else { Color::DarkGray };
-            final_lines.push(Line::from(Span::styled(
-                format!("  ▸ {}", cursor),
-                Style::default().fg(prompt_color),
-            )));
-        };
-
-        let para = Paragraph::new(final_lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(border_color))
-                    .title(title)
-                    .title_style(Style::default().fg(if is_focused { Color::Cyan } else { Color::DarkGray })),
-            );
-        f.render_widget(para, area);
-
-        // ── Scroll position indicator (right border) ────────────────────────
-        let total_content = self.chat.total_content_lines;
-        if total_content > chat_height && chat_height > 0 {
-            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .thumb_symbol("█")
-                .track_symbol(Some("│"))
-                .begin_symbol(None)
-                .end_symbol(None)
-                .thumb_style(Style::default().fg(Color::Cyan))
-                .track_style(Style::default().fg(Color::Indexed(237)));
-            let scroll_y = if self.chat.auto_scroll || total_content <= chat_height {
-                total_content.saturating_sub(chat_height)
-            } else {
-                let max_scroll = total_content.saturating_sub(chat_height);
-                self.chat.scroll_offset.min(max_scroll)
-            };
-            let mut scrollbar_state = ScrollbarState::new(total_content)
-                .position(scroll_y);
-            // Render inside the block border area (shrink by 1 on each side)
-            let scrollbar_area = ratatui::layout::Rect {
-                x: area.x,
-                y: area.y + 1,
-                width: area.width,
-                height: area.height.saturating_sub(2),
-            };
-            f.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
-        }
-    }
+    // ── Rendering ──────────────────────────────────────────────────────────
 
     fn render_compressed_footer(&self, f: &mut Frame, area: ratatui::layout::Rect) {
         // Show notification if present (auto-dismissing)
@@ -7411,60 +6733,3 @@ impl Dashboard {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Chat Generation Pipeline (free function, runs as spawned task)
-// ─────────────────────────────────────────────────────────────────────────────
-
-async fn chat_generation_pipeline(
-    config: crate::core::config::EnrichmentConfig,
-    system_prompt: String,
-    messages: Vec<(String, String)>,
-    user_message: String,
-    entity_names: Vec<(String, i64)>,
-    tx: mpsc::Sender<ChatStreamEvent>,
-) {
-    // Step 1: Entity cross-referencing
-    let _ = tx.send(ChatStreamEvent::Status("Searching for related recordings...".to_string())).await;
-    let mut extra_context = String::new();
-
-    if let Ok(db) = crate::database::Database::new() {
-        for (name, entity_id) in &entity_names {
-            if user_message.to_lowercase().contains(&name.to_lowercase()) {
-                if let Ok(recordings) = db.get_recordings_for_entity(*entity_id) {
-                    if !recordings.is_empty() {
-                        let recording_summaries: Vec<(String, String)> = recordings.iter().take(5).map(|r| {
-                            let rname = r.display_name.as_ref().unwrap_or(&r.directory_name).clone();
-                            let summary = r.summary.as_deref().unwrap_or("(no summary)").to_string();
-                            (rname, summary)
-                        }).collect();
-                        extra_context += &chat_prompts::format_related_recordings(name, &recording_summaries);
-                    }
-                }
-            }
-        }
-    }
-
-    // Step 2: Build prompt
-    let _ = tx.send(ChatStreamEvent::Status("Building context...".to_string())).await;
-    let full_prompt = chat_prompts::build_conversation(&system_prompt, &messages, &user_message, &extra_context);
-
-    // Step 3: Stream response
-    let _ = tx.send(ChatStreamEvent::Status("Thinking...".to_string())).await;
-    let provider = crate::enrichment::create_provider(&config);
-    let (chunk_tx, mut chunk_rx) = mpsc::channel::<String>(100);
-
-    let stream_handle = tokio::spawn(async move {
-        provider.generate_text_stream(&full_prompt, chunk_tx).await
-    });
-
-    // Forward chunks
-    while let Some(chunk) = chunk_rx.recv().await {
-        let _ = tx.send(ChatStreamEvent::Chunk(chunk)).await;
-    }
-
-    match stream_handle.await {
-        Ok(Ok(())) => { let _ = tx.send(ChatStreamEvent::Done).await; }
-        Ok(Err(e)) => { let _ = tx.send(ChatStreamEvent::Error(format!("{}", e))).await; }
-        Err(e) => { let _ = tx.send(ChatStreamEvent::Error(format!("Task error: {}", e))).await; }
-    }
-}
