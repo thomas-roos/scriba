@@ -70,7 +70,7 @@ Changelog
 - feat(enrichment): common `LlmProvider` trait for unified multi-provider access
 - feat(enrichment): DuckDuckGo web search for entity verification during enrichment
 - feat(enrichment): chat system prompts with world context and recording-specific modes
-- feat(tui): strip heading `#` prefix spans from tui_markdown output
+- feat(tui): strip heading `#` prefix spans from markdown output
 - feat(tui): fix scrollbar wiggle by removing begin/end arrow symbols
 - perf(tui): cache completed-message rendering — only visible lines cloned per frame
 - feat(config): `EnrichmentMode` enum (Local/Cloud) with automatic migration from legacy Ollama fields
