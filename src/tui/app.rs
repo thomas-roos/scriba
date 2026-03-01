@@ -2369,30 +2369,63 @@ impl Dashboard {
                             }
                         }
                         2 => {
-                            // Enrichment Provider — cycle through providers
+                            // Enrichment Provider — cycle: Anthropic → OpenAI → Google → Ollama → Anthropic
                             // Close picker if open (prevents stale state)
                             self.close_model_picker();
-                            // Clone current provider+key to avoid borrow issues
-                            let (cur_provider, cur_key) = match &self.config.enrichment.mode {
+                            // Clone current state to avoid borrow issues
+                            let (cur_provider, cur_key, cur_ollama) = match &self.config.enrichment.mode {
                                 EnrichmentMode::Cloud { provider, api_key, .. } => {
-                                    (Some(provider.clone()), api_key.clone())
+                                    (Some(provider.clone()), api_key.clone(), None)
                                 }
-                                EnrichmentMode::Local { .. } => (None, String::new()),
+                                EnrichmentMode::Local { ollama_endpoint, ollama_model } => {
+                                    (None, String::new(), Some((ollama_endpoint.clone(), ollama_model.clone())))
+                                }
                             };
-                            // Save current key before switching
+                            // Save current settings before switching
                             if let Some(ref p) = cur_provider {
                                 self.config.enrichment.save_key_for_provider(p, &cur_key);
                             }
-                            let next = match cur_provider {
-                                Some(CloudProvider::Anthropic) => CloudProvider::OpenAI,
-                                Some(CloudProvider::OpenAI) => CloudProvider::Google,
-                                Some(CloudProvider::Google) | None => CloudProvider::Anthropic,
-                            };
-                            let next_key = self.config.enrichment.load_key_for_provider(&next);
-                            let new_mode = EnrichmentMode::Cloud {
-                                provider: next,
-                                api_key: next_key,
-                                model: None,
+                            if let Some((ref ep, ref mdl)) = cur_ollama {
+                                self.config.enrichment.last_ollama_endpoint = Some(ep.clone());
+                                self.config.enrichment.last_ollama_model = Some(mdl.clone());
+                            }
+                            let new_mode = match cur_provider {
+                                Some(CloudProvider::Anthropic) => {
+                                    let next_key = self.config.enrichment.load_key_for_provider(&CloudProvider::OpenAI);
+                                    EnrichmentMode::Cloud {
+                                        provider: CloudProvider::OpenAI,
+                                        api_key: next_key,
+                                        model: None,
+                                    }
+                                }
+                                Some(CloudProvider::OpenAI) => {
+                                    let next_key = self.config.enrichment.load_key_for_provider(&CloudProvider::Google);
+                                    EnrichmentMode::Cloud {
+                                        provider: CloudProvider::Google,
+                                        api_key: next_key,
+                                        model: None,
+                                    }
+                                }
+                                Some(CloudProvider::Google) => {
+                                    // Google → Ollama (Local) — restore previous settings if available
+                                    let ep = self.config.enrichment.last_ollama_endpoint.clone()
+                                        .unwrap_or_else(|| "http://localhost:11434".to_string());
+                                    let mdl = self.config.enrichment.last_ollama_model.clone()
+                                        .unwrap_or_else(|| "mistral:latest".to_string());
+                                    EnrichmentMode::Local {
+                                        ollama_endpoint: ep,
+                                        ollama_model: mdl,
+                                    }
+                                }
+                                None => {
+                                    // Ollama → Anthropic
+                                    let next_key = self.config.enrichment.load_key_for_provider(&CloudProvider::Anthropic);
+                                    EnrichmentMode::Cloud {
+                                        provider: CloudProvider::Anthropic,
+                                        api_key: next_key,
+                                        model: None,
+                                    }
+                                }
                             };
                             self.config.enrichment.mode = new_mode;
                             if let Err(e) = self.save_enrichment_config() {

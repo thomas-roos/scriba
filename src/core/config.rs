@@ -250,6 +250,13 @@ pub struct EnrichmentConfig {
     #[serde(default)]
     pub cloud_api_keys: HashMap<String, String>,
 
+    /// Preserved Ollama endpoint so cycling away from Local doesn't lose it.
+    #[serde(default)]
+    pub last_ollama_endpoint: Option<String>,
+    /// Preserved Ollama model so cycling away from Local doesn't lose it.
+    #[serde(default)]
+    pub last_ollama_model: Option<String>,
+
     /// Confidence threshold for automatic entity linking (0.0-1.0).
     pub auto_link_threshold: f32,
     /// Whether to evolve the world description after each enrichment.
@@ -283,6 +290,8 @@ impl Default for EnrichmentConfig {
             ollama_endpoint: None,
             ollama_model: None,
             cloud_api_keys: HashMap::new(),
+            last_ollama_endpoint: None,
+            last_ollama_model: None,
             auto_link_threshold: 0.8,
             evolve_world: true,
             search_enabled: true,
