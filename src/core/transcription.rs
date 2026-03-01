@@ -23,6 +23,9 @@ use crate::database::Database;
 use crate::enrichment::{WorldContext, WorldData};
 use crate::utils::BASE_PATH;
 
+/// OpenAI Whisper API maximum upload size (25 MB).
+const OPENAI_MAX_FILE_SIZE: u64 = 25 * 1024 * 1024;
+
 extern "C" {
     fn whisper_log_set(
         callback: Option<unsafe extern "C" fn(i32, *const c_char, *mut c_void)>,
@@ -223,6 +226,154 @@ fn ensure_mono_16k_wav(input: &Path) -> Result<PathBuf> {
     }
 
     Ok(out)
+}
+
+/// Get the duration of an audio file in seconds using ffprobe.
+fn get_audio_duration_secs(audio_path: &Path) -> Result<f64> {
+    let ffmpeg_path = find_ffmpeg()?;
+    // Derive ffprobe path from ffmpeg path
+    let ffprobe_path = ffmpeg_path.replace("ffmpeg", "ffprobe");
+
+    let output = Command::new(&ffprobe_path)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
+            audio_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .with_context(|| format!("Failed to run ffprobe from path: {}", ffprobe_path))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("ffprobe failed: {}", stderr));
+    }
+
+    let duration_str = String::from_utf8_lossy(&output.stdout);
+    duration_str
+        .trim()
+        .parse::<f64>()
+        .context("Failed to parse audio duration from ffprobe output")
+}
+
+/// Split an audio file into chunks that each fit under `OPENAI_MAX_FILE_SIZE`.
+///
+/// Returns a list of temporary chunk file paths, sorted in order.
+fn split_audio_into_chunks(audio_path: &Path) -> Result<Vec<PathBuf>> {
+    let file_size = std::fs::metadata(audio_path)
+        .context("Failed to read audio file metadata")?
+        .len();
+
+    let duration_secs = get_audio_duration_secs(audio_path)?;
+    if duration_secs <= 0.0 {
+        return Err(anyhow::anyhow!("Audio file has zero or negative duration"));
+    }
+
+    // Calculate how many chunks we need, with a 20% safety margin
+    let target_chunk_size = OPENAI_MAX_FILE_SIZE as f64 * 0.80;
+    let num_chunks = (file_size as f64 / target_chunk_size).ceil() as usize;
+    let chunk_duration = duration_secs / num_chunks as f64;
+
+    let ffmpeg_path = find_ffmpeg()?;
+    let tmp_dir = audio_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("_tmp_chunks");
+    std::fs::create_dir_all(&tmp_dir).context("Failed to create temp chunk directory")?;
+
+    let extension = audio_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mp3");
+
+    let mut chunk_paths = Vec::with_capacity(num_chunks);
+
+    for i in 0..num_chunks {
+        let start = i as f64 * chunk_duration;
+        let chunk_path = tmp_dir.join(format!("chunk_{:04}.{}", i, extension));
+
+        let output = Command::new(&ffmpeg_path)
+            .args([
+                "-y",
+                "-i",
+                audio_path.to_string_lossy().as_ref(),
+                "-ss",
+                &format!("{:.3}", start),
+                "-t",
+                &format!("{:.3}", chunk_duration),
+                "-c",
+                "copy",
+                chunk_path.to_string_lossy().as_ref(),
+            ])
+            .output()
+            .with_context(|| format!("Failed to split audio chunk {}", i))?;
+
+        if !output.status.success() {
+            // Clean up on failure
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!("ffmpeg chunk split failed: {}", stderr));
+        }
+
+        chunk_paths.push(chunk_path);
+    }
+
+    Ok(chunk_paths)
+}
+
+/// Transcribe a single audio chunk via the OpenAI API.
+async fn transcribe_single_chunk(audio_path: &Path, api_key: &str) -> Result<String> {
+    let audio_file = std::fs::read(audio_path).context("Unable to read audio chunk")?;
+
+    let filename = audio_path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("audio")
+        .to_string();
+
+    let client = Client::new();
+
+    let part = Part::bytes(audio_file)
+        .file_name(filename)
+        .mime_str("audio/mpeg")
+        .context("Failed to create multipart form data")?;
+
+    let form = Form::new().part("file", part).text("model", "whisper-1");
+
+    let response = client
+        .post("https://api.openai.com/v1/audio/transcriptions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .multipart(form)
+        .send()
+        .await
+        .context("Failed to send transcription request to OpenAI")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        return Err(anyhow::anyhow!(
+            "OpenAI API request failed with status {}: {}",
+            status,
+            error_text
+        ));
+    }
+
+    let response_json: Value = response
+        .json()
+        .await
+        .context("Failed to parse OpenAI response as JSON")?;
+
+    response_json
+        .get("text")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("No 'text' field found in OpenAI response"))
 }
 
 async fn download_model_with_timeout(model_size: LocalModelSize) -> Result<PathBuf> {
@@ -683,54 +834,43 @@ fn run_whisper_transcription_with_segments(
 }
 
 async fn transcribe_with_openai_api(audio_path: &PathBuf, api_key: &str) -> Result<String> {
-    let audio_file = std::fs::read(audio_path).context("Unable to read audio file")?;
+    let file_size = std::fs::metadata(audio_path)
+        .context("Failed to read audio file metadata")?
+        .len();
 
-    let filename = audio_path
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or("audio")
-        .to_string();
-
-    let client = Client::new();
-
-    let part = Part::bytes(audio_file)
-        .file_name(filename.clone())
-        .mime_str("audio/mpeg")
-        .context("Failed to create multipart form data")?;
-
-    let form = Form::new().part("file", part).text("model", "whisper-1");
-
-    let response = client
-        .post("https://api.openai.com/v1/audio/transcriptions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .multipart(form)
-        .send()
-        .await
-        .context("Failed to send transcription request to OpenAI")?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        return Err(anyhow::anyhow!(
-            "OpenAI API request failed with status {}: {}",
-            status,
-            error_text
-        ));
+    if file_size <= OPENAI_MAX_FILE_SIZE {
+        return transcribe_single_chunk(audio_path, api_key).await;
     }
 
-    let response_json: Value = response
-        .json()
-        .await
-        .context("Failed to parse OpenAI response as JSON")?;
+    // File exceeds 25MB — split into chunks, transcribe each, concatenate
+    let chunk_paths = split_audio_into_chunks(audio_path)?;
+    let num_chunks = chunk_paths.len();
+    let mut transcripts = Vec::with_capacity(num_chunks);
 
-    response_json
-        .get("text")
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow::anyhow!("No 'text' field found in OpenAI response"))
+    for (i, chunk_path) in chunk_paths.iter().enumerate() {
+        let chunk_size = std::fs::metadata(chunk_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        eprintln!(
+            "Transcribing chunk {}/{} ({:.1} MB)",
+            i + 1,
+            num_chunks,
+            chunk_size as f64 / (1024.0 * 1024.0)
+        );
+
+        let text = transcribe_single_chunk(chunk_path, api_key)
+            .await
+            .with_context(|| format!("Failed to transcribe chunk {}/{}", i + 1, num_chunks))?;
+
+        transcripts.push(text);
+    }
+
+    // Clean up temp chunk files
+    if let Some(tmp_dir) = chunk_paths.first().and_then(|p| p.parent()) {
+        let _ = std::fs::remove_dir_all(tmp_dir);
+    }
+
+    Ok(transcripts.join(" "))
 }
 
 /// Unified transcription function.
@@ -872,10 +1012,10 @@ pub async fn transcribe_audio(
                     loop {
                         let message = match api_progress.start_time.elapsed().as_secs() {
                             0..=3 => Some("Uploading audio file"),
-                            4..=8 => Some("OpenAI is processing your audio"),
-                            9..=15 => Some("Converting speech to text"),
-                            16..=25 => Some("This is taking longer than usual"),
-                            _ => Some("Almost there, hang tight"),
+                            4..=15 => Some("OpenAI is processing your audio"),
+                            16..=30 => Some("Converting speech to text"),
+                            31..=60 => Some("Transcribing (large files are split into chunks)"),
+                            _ => Some("Still transcribing, hang tight"),
                         };
                         api_progress.show_progress(message).await;
                     }
