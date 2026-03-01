@@ -1149,70 +1149,18 @@ fn parse_inline_markdown(text: &str, spans: &mut Vec<Span<'static>>) {
 // Async pipeline functions
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn chat_generation_pipeline(
+pub async fn chat_agent_pipeline(
     config: crate::core::config::EnrichmentConfig,
     system_prompt: String,
     messages: Vec<(String, String)>,
     user_message: String,
-    entity_names: Vec<(String, i64)>,
-    tx: mpsc::Sender<ChatStreamEvent>,
-) {
-    // Step 1: Entity cross-referencing
-    let _ = tx.send(ChatStreamEvent::Status("Searching for related recordings...".to_string())).await;
-    let mut extra_context = String::new();
-
-    if let Ok(db) = crate::database::Database::new() {
-        for (name, entity_id) in &entity_names {
-            if user_message.to_lowercase().contains(&name.to_lowercase()) {
-                if let Ok(recordings) = db.get_recordings_for_entity(*entity_id) {
-                    if !recordings.is_empty() {
-                        let recording_summaries: Vec<(String, String)> = recordings.iter().take(5).map(|r| {
-                            let rname = r.display_name.as_ref().unwrap_or(&r.directory_name).clone();
-                            let summary = r.summary.as_deref().unwrap_or("(no summary)").to_string();
-                            (rname, summary)
-                        }).collect();
-                        extra_context += &chat_prompts::format_related_recordings(name, &recording_summaries);
-                    }
-                }
-            }
-        }
-    }
-
-    // Step 2: Build prompt
-    let _ = tx.send(ChatStreamEvent::Status("Building context...".to_string())).await;
-    let full_prompt = chat_prompts::build_conversation(&system_prompt, &messages, &user_message, &extra_context);
-
-    // Step 3: Stream response
-    let _ = tx.send(ChatStreamEvent::Status("Thinking...".to_string())).await;
-    let provider = crate::enrichment::create_provider(&config);
-    let (chunk_tx, mut chunk_rx) = mpsc::channel::<String>(100);
-
-    let stream_handle = tokio::spawn(async move {
-        provider.generate_text_stream(&full_prompt, chunk_tx).await
-    });
-
-    // Forward chunks
-    while let Some(chunk) = chunk_rx.recv().await {
-        let _ = tx.send(ChatStreamEvent::Chunk(chunk)).await;
-    }
-
-    match stream_handle.await {
-        Ok(Ok(())) => { let _ = tx.send(ChatStreamEvent::Done).await; }
-        Ok(Err(e)) => { let _ = tx.send(ChatStreamEvent::Error(format!("{}", e))).await; }
-        Err(e) => { let _ = tx.send(ChatStreamEvent::Error(format!("Task error: {}", e))).await; }
-    }
-}
-
-pub async fn chat_agent_pipeline(
-    system_prompt: String,
-    messages: Vec<(String, String)>,
-    user_message: String,
-    api_key: String,
-    model: String,
     needs_compaction: bool,
     tx: mpsc::Sender<ChatStreamEvent>,
 ) {
     use crate::agent::loop_runner::{AgentEvent, run_agent_loop};
+    use crate::agent::providers::create_agent_provider;
+
+    let provider = create_agent_provider(&config);
 
     let mut effective_system_prompt = system_prompt;
     let mut effective_messages = messages;
@@ -1228,7 +1176,8 @@ pub async fn chat_agent_pipeline(
         let to_compact: Vec<(String, String)> = effective_messages[..compact_end].to_vec();
         let remaining: Vec<(String, String)> = effective_messages[compact_end..].to_vec();
 
-        match compact_history(&to_compact, &api_key, &model).await {
+        let prompt = chat_prompts::build_compaction_prompt(&to_compact);
+        match provider.compact_history(&prompt).await {
             Ok(summary) => {
                 let removed_count = compact_end;
                 let _ = tx.send(ChatStreamEvent::Compacted {
@@ -1247,11 +1196,10 @@ pub async fn chat_agent_pipeline(
                 effective_messages = remaining;
             }
             Err(e) => {
-                // Persistent error — Status gets overwritten by "Thinking..." so use Error
                 let _ = tx.send(ChatStreamEvent::Error(
                     format!("Compaction failed: {}", e),
                 )).await;
-                return; // Don't continue with full history if compaction was needed but failed
+                return;
             }
         }
     }
@@ -1260,7 +1208,7 @@ pub async fn chat_agent_pipeline(
 
     // Spawn the agent loop
     let agent_handle = tokio::spawn(async move {
-        run_agent_loop(effective_system_prompt, effective_messages, user_message, api_key, model, agent_tx).await;
+        run_agent_loop(provider, effective_system_prompt, effective_messages, user_message, agent_tx).await;
     });
 
     // Bridge AgentEvent -> ChatStreamEvent
@@ -1289,58 +1237,4 @@ pub async fn chat_agent_pipeline(
     if let Err(e) = agent_handle.await {
         let _ = tx.send(ChatStreamEvent::Error(format!("Agent error: {}", e))).await;
     }
-}
-
-/// Make a non-streaming API call to Anthropic to summarize older messages for compaction.
-async fn compact_history(
-    messages: &[(String, String)],
-    api_key: &str,
-    model: &str,
-) -> Result<String, String> {
-    let prompt = chat_prompts::build_compaction_prompt(messages);
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-
-    let body = serde_json::json!({
-        "model": model,
-        "max_tokens": 1024,
-        "messages": [
-            { "role": "user", "content": prompt }
-        ],
-    });
-
-    let response = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {}", e))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-        return Err(format!("API error ({}): {}", status, body_text));
-    }
-
-    let json: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("JSON parse error: {}", e))?;
-
-    // Extract the text from the first content block
-    let text = json.get("content")
-        .and_then(|c| c.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|block| block.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("(summary unavailable)")
-        .to_string();
-
-    Ok(text)
 }
