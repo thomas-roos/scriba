@@ -1,3 +1,21 @@
+Scriba 0.21.1 — Unified Tools & Multi-Provider Agent
+
+Highlights
+
+- **Unified tool layer**: Agent chat and MCP server now share a single set of 14 tools (9 read + 5 write), eliminating ~370 lines of duplication. Write tools (update, alias, merge, delete entities) are now available from the in-app agent chat too.
+- **Multi-provider agent**: The agent loop now works across all LLM providers (Anthropic, OpenAI, Google, Ollama) — no longer Anthropic-only. Each provider handles its own streaming format and tool-use protocol.
+
+Changelog
+
+- refactor: extract shared `src/tools/` module with `ToolSchema`, `ToolResult`, and `execute_tool` dispatcher for all 14 tools
+- refactor: slim `agent/tools.rs` (465 → 158 lines) and `mcp/mod.rs` (1022 → 247 lines) to thin wrappers
+- feat: all 5 entity write tools now available in agent chat (update, add/remove alias, merge, delete)
+- feat: legacy MCP tool names (`list_transcripts`, `get_recording_info`, `search_by_entity`) preserved via aliases
+- feat: generalize agent loop across Anthropic, OpenAI, Google, and Ollama providers
+- refactor: extract provider-specific streaming/tool logic into `agent/providers/` module
+
+---
+
 Scriba 0.19.4 — Wing-Cut & HOOOOOO!!
 
 Highlights
