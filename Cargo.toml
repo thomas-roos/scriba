@@ -1,6 +1,6 @@
 [package]
 name = "scriba"
-version = "0.19.4"
+version = "0.20.0"
 edition = "2021"
 description = "A CLI tool for recording and transcribing audio locally using Whisper (whisper-rs)"
 authors = ["Giovanni Alberto Falcione"]
@@ -40,5 +40,4 @@ async-trait = "0.1"
 pyannote-rs = "0.3"
 ort = "=2.0.0-rc.10"
 scraper = "0.22"
-tui-markdown = "=0.2.4"
 textwrap = "0.16"

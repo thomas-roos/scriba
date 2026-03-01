@@ -149,7 +149,7 @@ impl CloudProvider {
     /// Default model for this provider.
     pub fn default_model(&self) -> &str {
         match self {
-            CloudProvider::Anthropic => "claude-sonnet-4-5-20250929",
+            CloudProvider::Anthropic => "claude-opus-4-6",
             CloudProvider::OpenAI => "gpt-4o",
             CloudProvider::Google => "gemini-2.0-flash",
         }
