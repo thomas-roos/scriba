@@ -70,7 +70,7 @@ impl OpenAIClient {
         Self {
             client,
             api_key: api_key.to_string(),
-            model: model.unwrap_or("gpt-4o").to_string(),
+            model: model.unwrap_or("gpt-5.2").to_string(),
         }
     }
 

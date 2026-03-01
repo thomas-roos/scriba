@@ -50,9 +50,9 @@ impl ProviderKind {
     /// Default model for this provider.
     pub fn default_model(&self) -> &str {
         match self {
-            ProviderKind::Anthropic => "claude-opus-4-6",
-            ProviderKind::OpenAI => "gpt-4o",
-            ProviderKind::Google => "gemini-2.0-flash",
+            ProviderKind::Anthropic => "claude-sonnet-4-6",
+            ProviderKind::OpenAI => "gpt-5.2",
+            ProviderKind::Google => "gemini-2.5-flash",
             ProviderKind::Ollama => "mistral:latest",
         }
     }
