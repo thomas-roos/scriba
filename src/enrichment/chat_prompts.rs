@@ -231,6 +231,32 @@ pub fn format_related_recordings(entity_name: &str, recordings: &[(String, Strin
     result
 }
 
+/// Build a prompt that asks the LLM to summarize older conversation messages.
+/// Used for context window compaction when approaching the token limit.
+pub fn build_compaction_prompt(messages: &[(String, String)]) -> String {
+    let mut conversation = String::new();
+    for (role, content) in messages {
+        conversation.push_str(&format!("{}: {}\n\n", role, content));
+    }
+
+    format!(
+        r#"Summarize the following conversation into a concise paragraph that preserves:
+- Key facts, decisions, and conclusions reached
+- Specific recordings, entities, or data referenced (with IDs if mentioned)
+- Outstanding questions or action items
+- The general topic flow
+
+Do NOT include greetings or filler. Write a dense, factual summary that lets a future assistant continue the conversation seamlessly.
+
+## Conversation to summarize
+
+{conversation}
+
+## Summary"#,
+        conversation = conversation.trim(),
+    )
+}
+
 /// Truncate text to approximately `max_words` words.
 fn truncate_to_words(text: &str, max_words: usize) -> &str {
     let mut word_count = 0;

@@ -21,6 +21,8 @@ pub enum ChatStreamEvent {
     Chunk(String),
     ToolCall { name: String, input_summary: String },
     ToolResult { name: String, output_summary: String },
+    Usage { input_tokens: u32, output_tokens: u32 },
+    Compacted { summary: String, removed_count: usize },
     Done,
     Error(String),
 }
@@ -50,6 +52,7 @@ pub struct ToolCallDisplay {
 pub enum ChatBlock {
     Text(String),
     ToolCall(ToolCallDisplay),
+    CompactionMarker,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +137,12 @@ pub struct ChatState {
     pub selection_end: Option<(usize, usize)>,    // (content_line, char_col) current drag position
     pub content_texts: Vec<String>,               // plain text of each content line for extraction
 
+    // Context window tracking (Anthropic only)
+    pub context_window_max: u32,
+    pub context_input_tokens: u32,
+    pub context_output_tokens: u32,
+    usage_baseline_set: bool, // true after first Usage event per generation
+
     // Rendering cache for completed messages
     cached_msg_lines: Vec<Line<'static>>,
     cached_msg_texts: Vec<String>,
@@ -166,11 +175,27 @@ impl ChatState {
             selection_anchor: None,
             selection_end: None,
             content_texts: Vec::new(),
+            context_window_max: std::env::var("SCRIBA_CTX_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(200_000),
+            context_input_tokens: 0,
+            context_output_tokens: 0,
+            usage_baseline_set: false,
             cached_msg_lines: Vec::new(),
             cached_msg_texts: Vec::new(),
             cached_msg_count: 0,
             cached_width: 0,
         }
+    }
+
+    pub fn context_usage_fraction(&self) -> f64 {
+        let total = self.context_input_tokens + self.context_output_tokens;
+        total as f64 / self.context_window_max as f64
+    }
+
+    pub fn needs_compaction(&self) -> bool {
+        self.context_usage_fraction() > 0.80
     }
 
     // ── Stream Polling ──────────────────────────────────────────────────────
@@ -217,6 +242,48 @@ impl ChatState {
                         }
                         self.current_status = Some("Thinking...".to_string());
                     }
+                    ChatStreamEvent::Usage { input_tokens, output_tokens } => {
+                        // Only update input_tokens from the FIRST API call of each
+                        // generation. That call reflects the true conversation baseline.
+                        // Subsequent calls within the same turn include transient tool-use
+                        // overhead that would inflate the bar and cause apparent "resets"
+                        // when the next turn starts with a smaller baseline.
+                        if !self.usage_baseline_set {
+                            self.context_input_tokens = input_tokens;
+                            self.usage_baseline_set = true;
+                        }
+                        // Always update output_tokens (current response contribution)
+                        self.context_output_tokens = output_tokens;
+                    }
+                    ChatStreamEvent::Compacted { summary, removed_count } => {
+                        let total_msgs = self.messages.len();
+                        if removed_count <= total_msgs {
+                            let remaining: Vec<ChatMessage> = self.messages.drain(removed_count..).collect();
+                            self.messages.clear();
+                            self.messages.push(ChatMessage::text(
+                                ChatRole::System,
+                                format!("Context compacted: {} messages summarized, {} kept",
+                                    removed_count, remaining.len()),
+                            ));
+                            self.messages.push(ChatMessage {
+                                role: ChatRole::System,
+                                blocks: vec![ChatBlock::CompactionMarker],
+                            });
+                            self.messages.push(ChatMessage::text(ChatRole::System, summary));
+                            self.messages.extend(remaining);
+                        } else {
+                            // Mismatch — just insert the summary without restructuring
+                            self.messages.push(ChatMessage {
+                                role: ChatRole::System,
+                                blocks: vec![ChatBlock::CompactionMarker],
+                            });
+                            self.messages.push(ChatMessage::text(ChatRole::System, summary));
+                        }
+                        self.cached_msg_count = 0;
+                        self.context_input_tokens = 0;
+                        self.context_output_tokens = 0;
+                        self.usage_baseline_set = false;
+                    }
                     ChatStreamEvent::Done => {
                         let blocks = std::mem::take(&mut self.pending_blocks);
                         self.messages.push(ChatMessage {
@@ -226,6 +293,7 @@ impl ChatState {
                         self.is_generating = false;
                         self.stream_rx = None;
                         self.current_status = None;
+                        self.usage_baseline_set = false;
                         if self.pending_message.is_some() {
                             should_resend = true;
                         }
@@ -240,6 +308,7 @@ impl ChatState {
                         self.is_generating = false;
                         self.stream_rx = None;
                         self.current_status = None;
+                        self.usage_baseline_set = false;
                         self.pending_message = None;
                         return false;
                     }
@@ -483,24 +552,63 @@ impl ChatState {
                                             cached_lines.push(Line::from(indented));
                                         }
                                     }
+                                    ChatBlock::CompactionMarker => {
+                                        let dashes = "─".repeat((content_width.saturating_sub(22)) / 2);
+                                        let marker = format!("  {} context compacted {}", dashes, dashes);
+                                        cached_texts.push(marker.clone());
+                                        cached_lines.push(Line::from(Span::styled(
+                                            marker,
+                                            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                                        )));
+                                    }
                                 }
                             }
                             cached_texts.push(String::new());
                             cached_lines.push(Line::from(""));
                         }
                         ChatRole::System => {
-                            let content = msg.content();
-                            let style = Style::default().fg(Color::Red).add_modifier(Modifier::ITALIC);
-                            for line in content.lines() {
-                                let wrapped = textwrap::wrap(line, content_width);
-                                if wrapped.is_empty() {
-                                    cached_texts.push(String::new());
-                                    cached_lines.push(Line::from(Span::styled(String::new(), style)));
-                                } else {
-                                    for w in &wrapped {
-                                        let full = w.to_string();
-                                        cached_texts.push(full.clone());
-                                        cached_lines.push(Line::from(Span::styled(full, style)));
+                            // Check for CompactionMarker blocks first
+                            let has_marker = msg.blocks.iter().any(|b| matches!(b, ChatBlock::CompactionMarker));
+                            if has_marker {
+                                for block in &msg.blocks {
+                                    match block {
+                                        ChatBlock::CompactionMarker => {
+                                            let dashes = "─".repeat((content_width.saturating_sub(22)) / 2);
+                                            let marker = format!("  {} context compacted {}", dashes, dashes);
+                                            cached_texts.push(marker.clone());
+                                            cached_lines.push(Line::from(Span::styled(
+                                                marker,
+                                                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                                            )));
+                                        }
+                                        ChatBlock::Text(text) if !text.is_empty() => {
+                                            let style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
+                                            for line in text.lines() {
+                                                let wrapped = textwrap::wrap(line, content_width);
+                                                for w in &wrapped {
+                                                    let full = w.to_string();
+                                                    cached_texts.push(full.clone());
+                                                    cached_lines.push(Line::from(Span::styled(full, style)));
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            } else {
+                                let content = msg.content();
+                                let style = Style::default().fg(Color::Red).add_modifier(Modifier::ITALIC);
+                                for line in content.lines() {
+                                    let wrapped = textwrap::wrap(line, content_width);
+                                    if wrapped.is_empty() {
+                                        cached_texts.push(String::new());
+                                        cached_lines.push(Line::from(Span::styled(String::new(), style)));
+                                    } else {
+                                        for w in &wrapped {
+                                            let full = w.to_string();
+                                            cached_texts.push(full.clone());
+                                            cached_lines.push(Line::from(Span::styled(full, style)));
+                                        }
                                     }
                                 }
                             }
@@ -567,6 +675,15 @@ impl ChatState {
                         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
                         dynamic_texts.push(text);
                         dynamic_lines.push(Line::from(spans));
+                    }
+                    ChatBlock::CompactionMarker => {
+                        let dashes = "─".repeat((content_width.saturating_sub(22)) / 2);
+                        let marker = format!("  {} context compacted {}", dashes, dashes);
+                        dynamic_texts.push(marker.clone());
+                        dynamic_lines.push(Line::from(Span::styled(
+                            marker,
+                            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                        )));
                     }
                 }
             }
@@ -642,7 +759,7 @@ impl ChatState {
             }
         }
 
-        // ── Separator + Input line ──────────────────────────────────────────
+        // ── Separator + Usage bar + Input line ─────────────────────────────
         if has_conversation {
             let sep_width = content_width.min(area.width.saturating_sub(4) as usize);
             let sep = "─".repeat(sep_width);
@@ -689,14 +806,38 @@ impl ChatState {
             )));
         };
 
-        let para = Paragraph::new(final_lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(border_color))
-                    .title(title)
-                    .title_style(Style::default().fg(if is_focused { Color::Cyan } else { Color::DarkGray })),
+        let mut chat_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .title(title)
+            .title_style(Style::default().fg(if is_focused { Color::Cyan } else { Color::DarkGray }));
+
+        if self.context_input_tokens > 0 {
+            let fraction = self.context_usage_fraction().min(1.0);
+            let pct = (fraction * 100.0) as u32;
+            let bar_len: usize = 10;
+            let filled = ((bar_len as f64) * fraction) as usize;
+            let empty = bar_len.saturating_sub(filled);
+
+            let bar_color = if fraction <= 0.60 {
+                Color::Green
+            } else if fraction <= 0.80 {
+                Color::Yellow
+            } else {
+                Color::Red
+            };
+
+            chat_block = chat_block.title_bottom(
+                Line::from(vec![
+                    Span::styled(" ctx [", Style::default().fg(Color::DarkGray)),
+                    Span::styled("█".repeat(filled), Style::default().fg(bar_color)),
+                    Span::styled("░".repeat(empty), Style::default().fg(Color::Indexed(237))),
+                    Span::styled(format!("] {}% ", pct), Style::default().fg(Color::DarkGray)),
+                ]).right_aligned()
             );
+        }
+
+        let para = Paragraph::new(final_lines).block(chat_block);
         f.render_widget(para, area);
 
         // ── Scroll position indicator ───────────────────────────────────────
@@ -725,6 +866,7 @@ impl ChatState {
             };
             f.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
         }
+
     }
 }
 
@@ -1067,15 +1209,58 @@ pub async fn chat_agent_pipeline(
     user_message: String,
     api_key: String,
     model: String,
+    needs_compaction: bool,
     tx: mpsc::Sender<ChatStreamEvent>,
 ) {
     use crate::agent::loop_runner::{AgentEvent, run_agent_loop};
+
+    let mut effective_system_prompt = system_prompt;
+    let mut effective_messages = messages;
+
+    // Auto-compact if context is above 80% and there are enough messages
+    if needs_compaction && effective_messages.len() >= 4 {
+        let _ = tx.send(ChatStreamEvent::Status(
+            format!("Compacting context ({} messages)...", effective_messages.len()),
+        )).await;
+
+        let keep_count = 4; // keep last 4 messages
+        let compact_end = effective_messages.len() - keep_count;
+        let to_compact: Vec<(String, String)> = effective_messages[..compact_end].to_vec();
+        let remaining: Vec<(String, String)> = effective_messages[compact_end..].to_vec();
+
+        match compact_history(&to_compact, &api_key, &model).await {
+            Ok(summary) => {
+                let removed_count = compact_end;
+                let _ = tx.send(ChatStreamEvent::Compacted {
+                    summary: summary.clone(),
+                    removed_count,
+                }).await;
+                let _ = tx.send(ChatStreamEvent::Status(
+                    format!("Compacted {} messages into summary, {} kept", removed_count, remaining.len()),
+                )).await;
+
+                // Augment system prompt with the summary
+                effective_system_prompt = format!(
+                    "{}\n\n## Previous Conversation Summary\n{}",
+                    effective_system_prompt, summary
+                );
+                effective_messages = remaining;
+            }
+            Err(e) => {
+                // Persistent error — Status gets overwritten by "Thinking..." so use Error
+                let _ = tx.send(ChatStreamEvent::Error(
+                    format!("Compaction failed: {}", e),
+                )).await;
+                return; // Don't continue with full history if compaction was needed but failed
+            }
+        }
+    }
 
     let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(100);
 
     // Spawn the agent loop
     let agent_handle = tokio::spawn(async move {
-        run_agent_loop(system_prompt, messages, user_message, api_key, model, agent_tx).await;
+        run_agent_loop(effective_system_prompt, effective_messages, user_message, api_key, model, agent_tx).await;
     });
 
     // Bridge AgentEvent -> ChatStreamEvent
@@ -1089,6 +1274,9 @@ pub async fn chat_agent_pipeline(
             AgentEvent::ToolResult { name, output_summary } => {
                 ChatStreamEvent::ToolResult { name, output_summary }
             }
+            AgentEvent::Usage { input_tokens, output_tokens } => {
+                ChatStreamEvent::Usage { input_tokens, output_tokens }
+            }
             AgentEvent::Done => ChatStreamEvent::Done,
             AgentEvent::Error(msg) => ChatStreamEvent::Error(msg),
         };
@@ -1101,4 +1289,58 @@ pub async fn chat_agent_pipeline(
     if let Err(e) = agent_handle.await {
         let _ = tx.send(ChatStreamEvent::Error(format!("Agent error: {}", e))).await;
     }
+}
+
+/// Make a non-streaming API call to Anthropic to summarize older messages for compaction.
+async fn compact_history(
+    messages: &[(String, String)],
+    api_key: &str,
+    model: &str,
+) -> Result<String, String> {
+    let prompt = chat_prompts::build_compaction_prompt(messages);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": 1024,
+        "messages": [
+            { "role": "user", "content": prompt }
+        ],
+    });
+
+    let response = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+        return Err(format!("API error ({}): {}", status, body_text));
+    }
+
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("JSON parse error: {}", e))?;
+
+    // Extract the text from the first content block
+    let text = json.get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|block| block.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("(summary unavailable)")
+        .to_string();
+
+    Ok(text)
 }
