@@ -74,8 +74,11 @@ pub struct Dashboard {
     settings_selection: usize,             // Current setting selection
     editing_api_key: bool,                 // Whether we're editing API key
     api_key_input: String,                 // API key input buffer
-    editing_enrichment_model: bool,         // Whether we're editing enrichment model
-    enrichment_model_input: String,        // Enrichment model input buffer
+    model_picker_state: ModelPickerState,
+    model_picker_items: Vec<ModelPickerItem>,
+    model_picker_selection: usize,
+    model_picker_custom_input: String,
+    ollama_models_rx: Option<mpsc::Receiver<Result<Vec<String>, String>>>,
     editing_enrichment_endpoint: bool,     // Whether we're editing Ollama endpoint (local mode)
     enrichment_endpoint_input: String,     // Ollama endpoint input buffer (local mode)
     editing_enrichment_api_key: bool,      // Whether we're editing enrichment API key
@@ -312,6 +315,20 @@ enum RecordingMode {
     RecordAndTranscribe,
 }
 
+#[derive(Debug, PartialEq, Clone)]
+enum ModelPickerState {
+    Closed,
+    Open,
+    EditingCustom,
+}
+
+#[derive(Debug, Clone)]
+struct ModelPickerItem {
+    display_name: String,
+    /// None means this is the "Custom..." sentinel.
+    model_id: Option<String>,
+}
+
 #[derive(Debug, PartialEq)]
 enum EntityMode {
     Browse,
@@ -390,8 +407,11 @@ impl Dashboard {
             settings_selection: 0,
             editing_api_key: false,
             api_key_input: String::new(),
-            editing_enrichment_model: false,
-            enrichment_model_input: String::new(),
+            model_picker_state: ModelPickerState::Closed,
+            model_picker_items: Vec::new(),
+            model_picker_selection: 0,
+            model_picker_custom_input: String::new(),
+            ollama_models_rx: None,
             editing_enrichment_endpoint: false,
             enrichment_endpoint_input: String::new(),
             editing_enrichment_api_key: false,
@@ -622,6 +642,43 @@ impl Dashboard {
                             self.handle_voice_stop_command().await;
                         }
                     }
+                }
+            }
+
+            // Check for Ollama model list completion
+            if let Some(ref mut rx) = self.ollama_models_rx {
+                if let Ok(result) = rx.try_recv() {
+                    let current_model = self.config.enrichment.model_name().to_string();
+                    match result {
+                        Ok(names) if !names.is_empty() => {
+                            let mut items: Vec<ModelPickerItem> = names
+                                .iter()
+                                .map(|n| ModelPickerItem {
+                                    display_name: n.clone(),
+                                    model_id: Some(n.clone()),
+                                })
+                                .collect();
+                            items.push(ModelPickerItem {
+                                display_name: "Custom...".into(),
+                                model_id: None,
+                            });
+                            let sel = names
+                                .iter()
+                                .position(|n| *n == current_model)
+                                .unwrap_or(items.len() - 1);
+                            self.model_picker_items = items;
+                            self.model_picker_selection = sel;
+                        }
+                        _ => {
+                            // Error or empty — show only Custom...
+                            self.model_picker_items = vec![ModelPickerItem {
+                                display_name: "Custom...".into(),
+                                model_id: None,
+                            }];
+                            self.model_picker_selection = 0;
+                        }
+                    }
+                    self.ollama_models_rx = None;
                 }
             }
 
@@ -2044,13 +2101,72 @@ impl Dashboard {
     }
 
     fn is_editing_settings_field(&self) -> bool {
-        self.editing_api_key || self.editing_enrichment_model || self.editing_enrichment_endpoint || self.editing_enrichment_api_key
+        self.editing_api_key || self.model_picker_state != ModelPickerState::Closed || self.editing_enrichment_endpoint || self.editing_enrichment_api_key
     }
 
     fn save_enrichment_config(&mut self) -> Result<()> {
         self.config.save()?;
         self.config = ScribaConfig::load()?;
         Ok(())
+    }
+
+    fn close_model_picker(&mut self) {
+        self.model_picker_state = ModelPickerState::Closed;
+        self.model_picker_items.clear();
+        self.model_picker_selection = 0;
+        self.model_picker_custom_input.clear();
+        self.ollama_models_rx = None;
+    }
+
+    fn open_model_picker(&mut self) {
+        let current_model = self.config.enrichment.model_name().to_string();
+
+        match &self.config.enrichment.mode {
+            EnrichmentMode::Cloud { provider, .. } => {
+                let curated = provider.available_models();
+                let mut items: Vec<ModelPickerItem> = curated
+                    .iter()
+                    .map(|m| ModelPickerItem {
+                        display_name: m.display_name.clone(),
+                        model_id: Some(m.model_id.clone()),
+                    })
+                    .collect();
+                items.push(ModelPickerItem {
+                    display_name: "Custom...".into(),
+                    model_id: None,
+                });
+
+                // Pre-select current model, or "Custom..." if not in the list
+                let sel = curated
+                    .iter()
+                    .position(|m| m.model_id == current_model)
+                    .unwrap_or(items.len() - 1);
+
+                self.model_picker_items = items;
+                self.model_picker_selection = sel;
+                self.model_picker_state = ModelPickerState::Open;
+            }
+            EnrichmentMode::Local { ollama_endpoint, .. } => {
+                // Show a loading placeholder while we fetch
+                self.model_picker_items = vec![ModelPickerItem {
+                    display_name: "Loading...".into(),
+                    model_id: None,
+                }];
+                self.model_picker_selection = 0;
+                self.model_picker_state = ModelPickerState::Open;
+
+                let endpoint = ollama_endpoint.clone();
+                let (tx, rx) = mpsc::channel(1);
+                self.ollama_models_rx = Some(rx);
+
+                tokio::spawn(async move {
+                    let result = OllamaClient::fetch_models(&endpoint)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(result).await;
+                });
+            }
+        }
     }
 
     async fn handle_settings_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
@@ -2063,9 +2179,10 @@ impl Dashboard {
 
         match key_code {
             KeyCode::Esc => {
-                if self.is_editing_settings_field() {
+                if self.model_picker_state != ModelPickerState::Closed {
+                    self.close_model_picker();
+                } else if self.is_editing_settings_field() {
                     self.editing_api_key = false;
-                    self.editing_enrichment_model = false;
                     self.editing_enrichment_endpoint = false;
                     self.editing_enrichment_api_key = false;
                 } else {
@@ -2074,13 +2191,22 @@ impl Dashboard {
                 Ok(DashboardAction::Continue)
             }
             KeyCode::Up => {
-                if !self.is_editing_settings_field() {
+                if self.model_picker_state == ModelPickerState::Open {
+                    self.model_picker_selection = self.model_picker_selection.saturating_sub(1);
+                } else if !self.is_editing_settings_field() {
                     self.settings_selection = self.settings_selection.saturating_sub(1);
                 }
                 Ok(DashboardAction::Continue)
             }
             KeyCode::Down => {
-                if !self.is_editing_settings_field() {
+                if self.model_picker_state == ModelPickerState::Open {
+                    if !self.model_picker_items.is_empty() {
+                        self.model_picker_selection = std::cmp::min(
+                            self.model_picker_selection + 1,
+                            self.model_picker_items.len() - 1,
+                        );
+                    }
+                } else if !self.is_editing_settings_field() {
                     self.settings_selection = std::cmp::min(self.settings_selection + 1, max_index);
                 }
                 Ok(DashboardAction::Continue)
@@ -2103,8 +2229,35 @@ impl Dashboard {
                     }
                     self.editing_api_key = false;
                     self.api_key_input.clear();
-                } else if self.editing_enrichment_model {
-                    let new_model = self.enrichment_model_input.trim().to_string();
+                } else if self.model_picker_state == ModelPickerState::Open {
+                    if let Some(item) = self.model_picker_items.get(self.model_picker_selection) {
+                        if item.display_name == "Loading..." {
+                            // no-op while loading
+                        } else if let Some(ref id) = item.model_id {
+                            // Selected a concrete model — save it
+                            let new_model = id.clone();
+                            match &mut self.config.enrichment.mode {
+                                EnrichmentMode::Cloud { model, .. } => {
+                                    *model = Some(new_model);
+                                }
+                                EnrichmentMode::Local { ollama_model, .. } => {
+                                    *ollama_model = new_model;
+                                }
+                            }
+                            if let Err(e) = self.save_enrichment_config() {
+                                self.message = format!("Failed to save enrichment model: {}", e);
+                                self.show_message = true;
+                                self.return_to_view = Some(DashboardView::Settings);
+                            }
+                            self.close_model_picker();
+                        } else {
+                            // "Custom..." sentinel — switch to custom text entry
+                            self.model_picker_state = ModelPickerState::EditingCustom;
+                            self.model_picker_custom_input = self.config.enrichment.model_name().to_string();
+                        }
+                    }
+                } else if self.model_picker_state == ModelPickerState::EditingCustom {
+                    let new_model = self.model_picker_custom_input.trim().to_string();
                     if !new_model.is_empty() {
                         match &mut self.config.enrichment.mode {
                             EnrichmentMode::Cloud { model, .. } => {
@@ -2120,8 +2273,7 @@ impl Dashboard {
                             self.return_to_view = Some(DashboardView::Settings);
                         }
                     }
-                    self.editing_enrichment_model = false;
-                    self.enrichment_model_input.clear();
+                    self.close_model_picker();
                 } else if self.editing_enrichment_endpoint {
                     let new_endpoint = self.enrichment_endpoint_input.trim().to_string();
                     if !new_endpoint.is_empty() {
@@ -2136,8 +2288,13 @@ impl Dashboard {
                     self.enrichment_endpoint_input.clear();
                 } else if self.editing_enrichment_api_key {
                     let new_key = self.enrichment_api_key_input.trim().to_string();
+                    // Clone the provider before mutating
+                    let provider_clone = self.config.enrichment.cloud_provider().cloned();
                     if let EnrichmentMode::Cloud { api_key, .. } = &mut self.config.enrichment.mode {
-                        *api_key = new_key;
+                        *api_key = new_key.clone();
+                    }
+                    if let Some(ref p) = provider_clone {
+                        self.config.enrichment.save_key_for_provider(p, &new_key);
                     }
                     if let Err(e) = self.save_enrichment_config() {
                         self.message = format!("Failed to save API key: {}", e);
@@ -2213,26 +2370,29 @@ impl Dashboard {
                         }
                         2 => {
                             // Enrichment Provider — cycle through providers
-                            let new_mode = match &self.config.enrichment.mode {
+                            // Close picker if open (prevents stale state)
+                            self.close_model_picker();
+                            // Clone current provider+key to avoid borrow issues
+                            let (cur_provider, cur_key) = match &self.config.enrichment.mode {
                                 EnrichmentMode::Cloud { provider, api_key, .. } => {
-                                    let next = match provider {
-                                        CloudProvider::Anthropic => CloudProvider::OpenAI,
-                                        CloudProvider::OpenAI => CloudProvider::Google,
-                                        CloudProvider::Google => CloudProvider::Anthropic,
-                                    };
-                                    EnrichmentMode::Cloud {
-                                        provider: next,
-                                        api_key: api_key.clone(),
-                                        model: None,
-                                    }
+                                    (Some(provider.clone()), api_key.clone())
                                 }
-                                EnrichmentMode::Local { .. } => {
-                                    EnrichmentMode::Cloud {
-                                        provider: CloudProvider::Anthropic,
-                                        api_key: String::new(),
-                                        model: None,
-                                    }
-                                }
+                                EnrichmentMode::Local { .. } => (None, String::new()),
+                            };
+                            // Save current key before switching
+                            if let Some(ref p) = cur_provider {
+                                self.config.enrichment.save_key_for_provider(p, &cur_key);
+                            }
+                            let next = match cur_provider {
+                                Some(CloudProvider::Anthropic) => CloudProvider::OpenAI,
+                                Some(CloudProvider::OpenAI) => CloudProvider::Google,
+                                Some(CloudProvider::Google) | None => CloudProvider::Anthropic,
+                            };
+                            let next_key = self.config.enrichment.load_key_for_provider(&next);
+                            let new_mode = EnrichmentMode::Cloud {
+                                provider: next,
+                                api_key: next_key,
+                                model: None,
                             };
                             self.config.enrichment.mode = new_mode;
                             if let Err(e) = self.save_enrichment_config() {
@@ -2242,9 +2402,8 @@ impl Dashboard {
                             }
                         }
                         3 => {
-                            // Enrichment Model
-                            self.editing_enrichment_model = true;
-                            self.enrichment_model_input = self.config.enrichment.model_name().to_string();
+                            // Enrichment Model — open picker
+                            self.open_model_picker();
                         }
                         4 => {
                             // Enrichment API Key (cloud) or Ollama Endpoint (local)
@@ -2350,8 +2509,8 @@ impl Dashboard {
             KeyCode::Char(c) => {
                 if self.editing_api_key {
                     self.api_key_input.push(c);
-                } else if self.editing_enrichment_model {
-                    self.enrichment_model_input.push(c);
+                } else if self.model_picker_state == ModelPickerState::EditingCustom {
+                    self.model_picker_custom_input.push(c);
                 } else if self.editing_enrichment_endpoint {
                     self.enrichment_endpoint_input.push(c);
                 } else if self.editing_enrichment_api_key {
@@ -2362,8 +2521,8 @@ impl Dashboard {
             KeyCode::Backspace => {
                 if self.editing_api_key {
                     self.api_key_input.pop();
-                } else if self.editing_enrichment_model {
-                    self.enrichment_model_input.pop();
+                } else if self.model_picker_state == ModelPickerState::EditingCustom {
+                    self.model_picker_custom_input.pop();
                 } else if self.editing_enrichment_endpoint {
                     self.enrichment_endpoint_input.pop();
                 } else if self.editing_enrichment_api_key {
@@ -3307,32 +3466,65 @@ impl Dashboard {
             Span::styled(provider_display, provider_style),
         ]));
 
-        // Model (index 3)
-        let model_display = if self.editing_enrichment_model {
-            format!("{}_", self.enrichment_model_input)
-        } else {
-            format!(
-                "{} <- Press Enter to edit",
+        // Model (index 3) — picker or closed
+        if self.model_picker_state == ModelPickerState::Closed {
+            let model_display = format!(
+                "{} <- Press Enter to choose",
                 self.config.enrichment.model_name()
-            )
-        };
-        let model_style = if self.settings_selection == 3 {
-            if self.editing_enrichment_model {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
-            } else {
+            );
+            let model_style = if self.settings_selection == 3 {
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
-            }
+            } else {
+                Style::default().fg(Color::White)
+            };
+            settings_text.push(Line::from(vec![
+                Span::styled("Model: ", Style::default().fg(Color::Green)),
+                Span::styled(model_display, model_style),
+            ]));
         } else {
-            Style::default().fg(Color::White)
-        };
-        settings_text.push(Line::from(vec![
-            Span::styled("Model: ", Style::default().fg(Color::Green)),
-            Span::styled(model_display, model_style),
-        ]));
+            // Picker is open or editing custom
+            settings_text.push(Line::from(vec![
+                Span::styled("Model: ", Style::default().fg(Color::Green)),
+                Span::styled("(select below)", Style::default().fg(Color::DarkGray)),
+            ]));
+
+            let current_model = self.config.enrichment.model_name().to_string();
+
+            for (i, item) in self.model_picker_items.iter().enumerate() {
+                let is_cursor = i == self.model_picker_selection;
+                let is_current = item.model_id.as_deref() == Some(current_model.as_str());
+                let is_custom_sentinel = item.model_id.is_none() && item.display_name == "Custom...";
+
+                let arrow = if is_cursor { "  > " } else { "    " };
+
+                let style = if is_cursor {
+                    if self.model_picker_state == ModelPickerState::EditingCustom && is_custom_sentinel {
+                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    }
+                } else if is_current {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+
+                if is_custom_sentinel && self.model_picker_state == ModelPickerState::EditingCustom {
+                    settings_text.push(Line::from(vec![
+                        Span::styled(arrow, style),
+                        Span::styled(format!("Custom: {}_", self.model_picker_custom_input), style),
+                    ]));
+                } else {
+                    let suffix = if is_current && !is_cursor { " (current)" } else { "" };
+                    settings_text.push(Line::from(vec![
+                        Span::styled(arrow, style),
+                        Span::styled(format!("{}{}", item.display_name, suffix), style),
+                    ]));
+                }
+            }
+        }
 
         // API Key or Ollama Endpoint (index 4)
         if self.config.enrichment.is_local() {
@@ -3362,6 +3554,14 @@ impl Dashboard {
                 Span::styled(endpoint_display, endpoint_style),
             ]));
         } else {
+            // Provider-specific label and env var hint
+            let (key_label, env_hint) = match self.config.enrichment.cloud_provider() {
+                Some(p) => (
+                    format!("{} API Key: ", p.display_name()),
+                    format!(" (or set {})", p.env_var_name()),
+                ),
+                None => ("API Key: ".to_string(), String::new()),
+            };
             let key_display = if self.editing_enrichment_api_key {
                 format!("{}_", self.enrichment_api_key_input)
             } else {
@@ -3370,7 +3570,7 @@ impl Dashboard {
                         format!("{}****** <- Press Enter to edit", &key[..4])
                     }
                     Some(_) => "****** <- Press Enter to edit".to_string(),
-                    None => "[Not Set] <- Press Enter to edit".to_string(),
+                    None => format!("[Not Set]{} <- Press Enter to edit", env_hint),
                 }
             };
             let key_style = if self.settings_selection == 4 {
@@ -3387,7 +3587,7 @@ impl Dashboard {
                 Style::default().fg(Color::White)
             };
             settings_text.push(Line::from(vec![
-                Span::styled("API Key: ", Style::default().fg(Color::Green)),
+                Span::styled(key_label, Style::default().fg(Color::Green)),
                 Span::styled(key_display, key_style),
             ]));
         }
@@ -5548,7 +5748,7 @@ impl Dashboard {
                     } else {
                         api_key.clone()
                     };
-                    let m = model.clone().unwrap_or_else(|| "claude-opus-4-6".to_string());
+                    let m = model.clone().unwrap_or_else(|| "claude-sonnet-4-6".to_string());
                     (key, m)
                 }
                 _ => unreachable!(),

@@ -58,7 +58,7 @@ impl AnthropicClient {
             client,
             api_key: api_key.to_string(),
             model: model
-                .unwrap_or("claude-opus-4-6")
+                .unwrap_or("claude-sonnet-4-6")
                 .to_string(),
         }
     }

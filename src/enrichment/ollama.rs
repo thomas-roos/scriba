@@ -319,6 +319,33 @@ impl OllamaClient {
         Ok(result.response)
     }
 
+    /// Fetch available model names from an Ollama endpoint.
+    /// Creates a temporary client with a 5-second timeout.
+    pub async fn fetch_models(endpoint: &str) -> Result<Vec<String>, OllamaError> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| OllamaError::RequestFailed { message: e.to_string() })?;
+
+        let url = format!("{}/api/tags", endpoint.trim_end_matches('/'));
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|_| OllamaError::NotRunning { endpoint: endpoint.to_string() })?;
+
+        if !response.status().is_success() {
+            return Err(OllamaError::NotRunning { endpoint: endpoint.to_string() });
+        }
+
+        let tags: TagsResponse = response.json().await.map_err(|e| OllamaError::ParseError {
+            message: e.to_string(),
+        })?;
+
+        let names: Vec<String> = tags.models.into_iter().map(|m| m.name).collect();
+        Ok(names)
+    }
+
     /// Get the configured model name.
     pub fn model(&self) -> &str {
         &self.model
