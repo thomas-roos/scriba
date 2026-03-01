@@ -14,6 +14,7 @@ pub mod enrichment;
 pub mod entities;
 pub mod errors;
 pub mod mcp;
+pub mod tools;
 pub mod tui;
 pub mod utils;
 

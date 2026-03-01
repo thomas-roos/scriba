@@ -45,7 +45,7 @@ pub async fn run_agent_loop(
     user_message: String,
     tx: mpsc::Sender<AgentEvent>,
 ) {
-    let db = match Database::new() {
+    let mut db = match Database::new() {
         Ok(db) => db,
         Err(e) => {
             let _ = tx.send(AgentEvent::Error(format!("Database error: {}", e))).await;
@@ -118,13 +118,13 @@ pub async fn run_agent_loop(
         // Execute each tool and collect results
         let mut tool_results: Vec<(String, String, String)> = Vec::new();
         for (tool_id, tool_name, tool_input) in &tool_uses {
-            let input_summary = summarize_input(tool_name, tool_input);
+            let input_summary = tools::summarize_input(tool_name, tool_input);
             let _ = tx.send(AgentEvent::ToolCall {
                 name: tool_name.clone(),
                 input_summary: input_summary.clone(),
             }).await;
 
-            let result = tools::execute_tool(tool_name, tool_input, &db);
+            let result = tools::execute_tool(tool_name, tool_input, &mut db);
             let output_summary = tools::summarize_tool_result(tool_name, &result);
 
             let _ = tx.send(AgentEvent::ToolResult {
@@ -137,53 +137,5 @@ pub async fn run_agent_loop(
 
         // Append tool results using the provider's format
         provider.append_tool_results(&mut messages, &tool_results);
-    }
-}
-
-/// Summarize tool input for display.
-fn summarize_input(name: &str, input: &Value) -> String {
-    match name {
-        "search_transcripts" => {
-            let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("?");
-            format!("\"{}\"", query)
-        }
-        "get_recording" | "get_transcript" => {
-            let id = input.get("id")
-                .or_else(|| input.get("recording_id"))
-                .and_then(|v| v.as_i64())
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "?".to_string());
-            format!("id={}", id)
-        }
-        "get_entity" => {
-            let id = input.get("id").and_then(|v| v.as_i64())
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "?".to_string());
-            format!("id={}", id)
-        }
-        "get_recordings_for_entity" => {
-            let id = input.get("entity_id").and_then(|v| v.as_i64())
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "?".to_string());
-            format!("entity_id={}", id)
-        }
-        "list_recordings" => {
-            if let Some(limit) = input.get("limit").and_then(|v| v.as_i64()) {
-                format!("limit={}", limit)
-            } else {
-                "all".to_string()
-            }
-        }
-        "list_entities" => {
-            let mut parts = Vec::new();
-            if let Some(t) = input.get("entity_type").and_then(|v| v.as_str()) {
-                parts.push(format!("type={}", t));
-            }
-            if let Some(l) = input.get("limit").and_then(|v| v.as_i64()) {
-                parts.push(format!("limit={}", l));
-            }
-            if parts.is_empty() { "all".to_string() } else { parts.join(", ") }
-        }
-        _ => String::new(),
     }
 }
