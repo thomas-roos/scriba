@@ -23,6 +23,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
     Frame, Terminal,
 };
+use std::collections::VecDeque;
 use std::io;
 use tokio::sync::mpsc;
 
@@ -61,8 +62,8 @@ pub struct Dashboard {
     last_transcribe_warning: Option<usize>, // Track which recording showed overwrite warning
     progress_animation: Option<String>,     // Base message for progress animation
     progress_frame: usize,                  // Animation frame counter
-    transcription_task: Option<tokio::task::JoinHandle<Result<(), anyhow::Error>>>, // Background transcription task
-    transcribing_recording_name: Option<String>, // directory_name of recording being transcribed
+    active_transcription: Option<ActiveTranscription>, // Currently running transcription
+    transcription_queue: VecDeque<PendingTranscription>, // FIFO queue of pending transcriptions
     notification_message: Option<(String, usize)>, // (message, frames_remaining) — auto-dismiss
     header_anim_frame: usize, // Main header owl animation counter
     recording_task: Option<tokio::task::JoinHandle<Result<RecordingResult, anyhow::Error>>>,
@@ -312,6 +313,32 @@ enum RecordingMode {
     RecordAndTranscribe,
 }
 
+struct ActiveTranscription {
+    task: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    recording_name: String,
+}
+
+enum PendingTranscription {
+    Retranscribe {
+        recording_name: String,
+        transcription_mode: TranscriptionMode,
+    },
+    Import {
+        source_path: PathBuf,
+        display_name: String,
+        transcription_mode: TranscriptionMode,
+    },
+}
+
+impl PendingTranscription {
+    fn recording_name(&self) -> &str {
+        match self {
+            PendingTranscription::Retranscribe { recording_name, .. } => recording_name,
+            PendingTranscription::Import { display_name, .. } => display_name,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum EntityMode {
     Browse,
@@ -377,8 +404,8 @@ impl Dashboard {
             last_transcribe_warning: None,
             progress_animation: None,
             progress_frame: 0,
-            transcription_task: None,
-            transcribing_recording_name: None,
+            active_transcription: None,
+            transcription_queue: VecDeque::new(),
             notification_message: None,
             header_anim_frame: 0,
             recording_task: None,
@@ -532,23 +559,15 @@ impl Dashboard {
                                 self.stop_progress_animation();
                                 self.show_message = false;
                                 self.message.clear();
-                                self.transcribing_recording_name = Some(recording_name.clone());
                                 let _ = self.load_recordings();
                                 let _ = self.load_stats();
 
-                                // Start auto-transcription in background
+                                // Enqueue auto-transcription
                                 let transcription_mode = self.config.transcription.clone();
-                                let recording_name_clone = recording_name.clone();
-
-                                self.transcription_task = Some(tokio::spawn(async move {
-                                    let mut workflow = WorkflowManager::new().unwrap();
-                                    workflow
-                                        .retranscribe_recording_silent(
-                                            &recording_name_clone,
-                                            transcription_mode,
-                                        )
-                                        .await
-                                }));
+                                self.enqueue_transcription(PendingTranscription::Retranscribe {
+                                    recording_name: recording_name.clone(),
+                                    transcription_mode,
+                                });
                             } else {
                                 // Recording only mode - complete
                                 self.stop_progress_animation();
@@ -573,26 +592,35 @@ impl Dashboard {
                 }
             }
 
-            // Check if transcription task completed
-            if let Some(task) = &mut self.transcription_task {
-                if task.is_finished() {
-                    let completed_task = self.transcription_task.take().unwrap();
-                    match completed_task.await {
+            // Check if active transcription completed
+            if let Some(ref active) = self.active_transcription {
+                if active.task.is_finished() {
+                    let completed = self.active_transcription.take().unwrap();
+                    let name = completed.recording_name;
+                    match completed.task.await {
                         Ok(Ok(())) => {
-                            self.transcribing_recording_name = None;
-                            self.notification_message = Some(("Transcription complete!".to_string(), 30));
+                            self.notification_message = Some((
+                                format!("Transcription complete: {}", name),
+                                30,
+                            ));
                             let _ = self.load_recordings();
                             let _ = self.load_stats();
                         }
                         Ok(Err(err)) => {
-                            self.transcribing_recording_name = None;
-                            self.notification_message = Some((format!("Transcription failed: {}", err), 50));
+                            self.notification_message = Some((
+                                format!("Transcription failed ({}): {}", name, err),
+                                50,
+                            ));
                         }
                         Err(_) => {
-                            self.transcribing_recording_name = None;
-                            self.notification_message = Some(("Transcription task failed".to_string(), 50));
+                            self.notification_message = Some((
+                                format!("Transcription task failed: {}", name),
+                                50,
+                            ));
                         }
                     }
+                    // Start next queued transcription
+                    self.drain_transcription_queue();
                 }
             }
 
@@ -631,7 +659,7 @@ impl Dashboard {
             }
 
             // Tick progress frame for inline transcription animation (throttled)
-            if anim_tick && self.transcribing_recording_name.is_some() {
+            if anim_tick && (self.active_transcription.is_some() || !self.transcription_queue.is_empty()) {
                 self.progress_frame = self.progress_frame.wrapping_add(1);
             }
 
@@ -1053,6 +1081,72 @@ impl Dashboard {
             _ => {}
         }
         Ok(())
+    }
+
+    // ── Transcription queue helpers ──────────────────────────────────────
+
+    fn has_active_transcription(&self) -> bool {
+        self.active_transcription.is_some()
+    }
+
+    fn is_transcription_pending_or_active(&self, dir_name: &str) -> bool {
+        if let Some(ref active) = self.active_transcription {
+            if active.recording_name == dir_name {
+                return true;
+            }
+        }
+        self.transcription_queue
+            .iter()
+            .any(|p| p.recording_name() == dir_name)
+    }
+
+    fn drain_transcription_queue(&mut self) {
+        if self.active_transcription.is_some() {
+            return;
+        }
+        if let Some(pending) = self.transcription_queue.pop_front() {
+            let name = pending.recording_name().to_string();
+            let task = match pending {
+                PendingTranscription::Retranscribe {
+                    recording_name,
+                    transcription_mode,
+                } => tokio::spawn(async move {
+                    let mut workflow = WorkflowManager::new().unwrap();
+                    workflow
+                        .retranscribe_recording_silent(&recording_name, transcription_mode)
+                        .await
+                }),
+                PendingTranscription::Import {
+                    source_path,
+                    display_name,
+                    transcription_mode,
+                } => tokio::spawn(async move {
+                    let mut workflow = WorkflowManager::new().unwrap();
+                    workflow
+                        .complete_import_workflow_silent(
+                            &source_path,
+                            Some(display_name),
+                            Some(transcription_mode),
+                        )
+                        .await
+                        .map(|_| ())
+                }),
+            };
+            self.active_transcription = Some(ActiveTranscription {
+                task,
+                recording_name: name,
+            });
+            self.progress_frame = 0;
+        }
+    }
+
+    fn enqueue_transcription(&mut self, pending: PendingTranscription) {
+        let name = pending.recording_name().to_string();
+        if self.is_transcription_pending_or_active(&name) {
+            return;
+        }
+        self.transcription_queue.push_back(pending);
+        self.drain_transcription_queue();
     }
 
     fn load_recordings(&mut self) -> Result<()> {
@@ -1999,7 +2093,7 @@ impl Dashboard {
             KeyCode::Char('t') | KeyCode::Char('T') => {
                 // Re-transcribe the current recording
                 if let Some(recording) = self.get_current_recording() {
-                    if self.transcription_task.is_some() {
+                    if self.has_active_transcription() {
                         self.message = "Transcription already in progress".to_string();
                         self.show_message = true;
                         return Ok(DashboardAction::Continue);
@@ -2010,20 +2104,14 @@ impl Dashboard {
                     self.transcript_content.clear();
                     self.transcript_scroll_offset = 0;
 
-                    // Start re-transcription using unified workflow
+                    // Enqueue re-transcription
                     let transcription_mode = self.config.transcription.clone();
                     let directory_name = recording.directory_name.clone();
-                    // Track transcription inline — no blocking popup
-                    self.transcribing_recording_name = Some(directory_name.clone());
-                    self.progress_frame = 0;
 
-                    // Start re-transcription in background
-                    self.transcription_task = Some(tokio::spawn(async move {
-                        let mut workflow = WorkflowManager::new().unwrap();
-                        workflow
-                            .retranscribe_recording_silent(&directory_name, transcription_mode)
-                            .await
-                    }));
+                    self.enqueue_transcription(PendingTranscription::Retranscribe {
+                        recording_name: directory_name,
+                        transcription_mode,
+                    });
                 }
                 Ok(DashboardAction::Continue)
             }
@@ -2967,15 +3055,19 @@ impl Dashboard {
                     .map(|d| self.format_duration(d))
                     .unwrap_or_else(|| "Unknown".to_string());
 
-                let is_transcribing = self.transcribing_recording_name.as_deref()
-                    == Some(&recording.directory_name);
-                let status = if is_transcribing {
+                let is_active = self.active_transcription.as_ref()
+                    .is_some_and(|a| a.recording_name == recording.directory_name);
+                let is_queued = !is_active
+                    && self.transcription_queue.iter().any(|p| p.recording_name() == recording.directory_name);
+                let status = if is_active {
                     match self.progress_frame % 4 {
                         0 => "[|]",
                         1 => "[/]",
                         2 => "[-]",
                         _ => "[\\]",
                     }
+                } else if is_queued {
+                    "[Q]"
                 } else if recording.has_transcript {
                     "[T]"
                 } else {
@@ -3020,7 +3112,7 @@ impl Dashboard {
 
                 let cells = vec![
                     Cell::from(global_index.to_string()),
-                    Cell::from(status).style(if is_transcribing {
+                    Cell::from(status).style(if is_active || is_queued {
                         Style::default().fg(Color::Yellow)
                     } else if recording.has_transcript {
                         Style::default().fg(Color::Green)
@@ -4615,9 +4707,9 @@ impl Dashboard {
     }
 
     async fn execute_record_and_transcribe(&mut self) -> Result<()> {
-        // Check if already recording or transcribing
-        if self.recording_task.is_some() || self.transcription_task.is_some() {
-            self.message = "Recording or transcription already in progress".to_string();
+        // Check if already recording (transcription can run concurrently)
+        if self.recording_task.is_some() {
+            self.message = "Recording already in progress".to_string();
             self.show_message = true;
             return Ok(());
         }
@@ -4636,9 +4728,9 @@ impl Dashboard {
     }
 
     async fn execute_add_external_file(&mut self) -> Result<()> {
-        // Check if already recording or transcribing
-        if self.recording_task.is_some() || self.transcription_task.is_some() {
-            self.message = "Recording or transcription already in progress".to_string();
+        // Check if already recording (transcription can run concurrently)
+        if self.recording_task.is_some() {
+            self.message = "Recording already in progress".to_string();
             self.show_message = true;
             return Ok(());
         }
@@ -4653,25 +4745,14 @@ impl Dashboard {
     }
 
     async fn start_file_import(&mut self, file_path: String, display_name: String) -> Result<()> {
-        // Track import+transcription inline — no blocking popup
-        self.transcribing_recording_name = Some(display_name.clone());
-        self.progress_frame = 0;
-
         let source_path = PathBuf::from(file_path.trim());
         let transcription_mode = self.config.transcription.clone();
-        let display_name_clone = display_name.clone();
 
-        self.transcription_task = Some(tokio::spawn(async move {
-            let mut workflow = WorkflowManager::new().unwrap();
-            workflow
-                .complete_import_workflow_silent(
-                    &source_path,
-                    Some(display_name_clone),
-                    Some(transcription_mode),
-                )
-                .await
-                .map(|_| ())
-        }));
+        self.enqueue_transcription(PendingTranscription::Import {
+            source_path,
+            display_name,
+            transcription_mode,
+        });
 
         Ok(())
     }
@@ -4680,7 +4761,7 @@ impl Dashboard {
 
     async fn execute_transcribe_selected(&mut self) -> Result<()> {
         // Check if transcription is already running
-        if self.transcription_task.is_some() {
+        if self.has_active_transcription() {
             self.message = "Transcription already in progress. Please wait...".to_string();
             self.show_message = true;
             return Ok(());
@@ -4732,20 +4813,14 @@ impl Dashboard {
             self.last_transcribe_warning = None;
         }
 
-        // Track transcription inline — no blocking popup
+        // Enqueue transcription
         let directory_name = selected_recording.directory_name.clone();
-        self.transcribing_recording_name = Some(directory_name.clone());
-        self.progress_frame = 0;
-
-        // Start transcription in background
         let transcription_mode = self.config.transcription.clone();
 
-        self.transcription_task = Some(tokio::spawn(async move {
-            let mut workflow = WorkflowManager::new().unwrap();
-            workflow
-                .retranscribe_recording_silent(&directory_name, transcription_mode)
-                .await
-        }));
+        self.enqueue_transcription(PendingTranscription::Retranscribe {
+            recording_name: directory_name,
+            transcription_mode,
+        });
 
         Ok(())
     }
@@ -5165,19 +5240,15 @@ impl Dashboard {
                     }
                 }
 
-                // Start transcription pipeline
+                // Enqueue transcription pipeline
                 let transcription_mode = self.config.transcription.clone();
-                self.transcribing_recording_name = Some(dir_name_clone.clone());
-                self.progress_frame = 0;
                 let _ = self.load_recordings();
                 let _ = self.load_stats();
 
-                self.transcription_task = Some(tokio::spawn(async move {
-                    let mut workflow = WorkflowManager::new().unwrap();
-                    workflow
-                        .retranscribe_recording_silent(&dir_name_clone, transcription_mode)
-                        .await
-                }));
+                self.enqueue_transcription(PendingTranscription::Retranscribe {
+                    recording_name: dir_name_clone,
+                    transcription_mode,
+                });
             }
             Ok(None) => {
                 self.notification_message = Some(("Voice: No recording to stop.".to_string(), 30));
@@ -5837,7 +5908,16 @@ impl Dashboard {
         }
 
         let voice_status = if self.voice_mode_active { " | Voice" } else { "" };
-        let transcribing = if self.transcribing_recording_name.is_some() { " | Transcribing..." } else { "" };
+        let queue_len = self.transcription_queue.len();
+        let transcribing = if self.active_transcription.is_some() {
+            if queue_len > 0 {
+                format!(" | Transcribing... (+{} queued)", queue_len)
+            } else {
+                " | Transcribing...".to_string()
+            }
+        } else {
+            String::new()
+        };
         let controls = format!(
             "TAB: Focus | ↑↓: Nav | /: Search | R: Record | A: Add | W: World | S: Settings | H: Help | Q: Quit{}{}",
             transcribing, voice_status
