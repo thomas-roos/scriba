@@ -36,7 +36,7 @@ use tokio::process::Command as TokioCommand;
 
 use super::chat::{
     ChatContext, ChatFocus, ChatMessage, ChatRole, ChatState, ChatStreamEvent,
-    chat_agent_pipeline, chat_generation_pipeline,
+    chat_agent_pipeline,
 };
 
 pub struct Dashboard {
@@ -5639,7 +5639,7 @@ impl Dashboard {
     }
 
     fn init_global_chat(&mut self) {
-        // Load world context
+        // Load world context for owner name
         let world = WorldContext::load().ok()
             .and_then(|wc| WorldData::from_json(&wc.content).ok())
             .unwrap_or_default();
@@ -5650,48 +5650,8 @@ impl Dashboard {
             world.owner.name.clone()
         };
 
-        let world_json = world.to_json().unwrap_or_default();
-
-        // Stats summary
-        let stats_summary = if let Some(stats) = &self.stats {
-            format!(
-                "{} recordings, {} total duration, {} transcribed",
-                stats.total_recordings,
-                stats.format_duration(),
-                stats.transcribed_count
-            )
-        } else {
-            "No stats available".to_string()
-        };
-
-        // Recent recordings summary
-        let recent_recordings: String = self.recordings.iter().take(10).map(|r| {
-            let name = r.display_name.as_ref().unwrap_or(&r.directory_name);
-            let summary = r.summary.as_deref().unwrap_or("(no summary)");
-            format!("- {} [{}]: {}\n", name, r.created_at.format("%m/%d"), summary)
-        }).collect();
-
-        let entities_summary = world.entities_summary();
-
-        // Use agent prompt for Anthropic, full context prompt for others
-        let is_anthropic = matches!(
-            &self.config.enrichment.mode,
-            crate::core::config::EnrichmentMode::Cloud {
-                provider: CloudProvider::Anthropic, ..
-            }
-        );
-
-        self.chat.system_prompt = if is_anthropic {
-            chat_prompts::build_agent_global_prompt(&owner_name)
-        } else {
-            chat_prompts::build_global_chat_prompt(
-                &owner_name,
-                &world_json,
-                &stats_summary,
-                &recent_recordings,
-                &entities_summary,
-            )
-        };
+        // All providers use agent prompt (tools handle data fetching)
+        self.chat.system_prompt = chat_prompts::build_agent_global_prompt(&owner_name);
 
         self.chat.context = ChatContext::Global;
         self.chat.suggestions = self.generate_suggestions();
@@ -5717,50 +5677,14 @@ impl Dashboard {
             .clone();
 
         let summary = recording.summary.as_deref().unwrap_or("");
-        let action_items = recording.action_items.as_deref().unwrap_or("");
-        let key_points_str = recording.key_points.as_ref()
-            .and_then(|kp| serde_json::from_str::<Vec<String>>(kp).ok())
-            .map(|v| v.join("\n- "))
-            .unwrap_or_default();
 
-        let topics_str = self.transcript_topics.as_ref()
-            .map(|t| t.join(", "))
-            .unwrap_or_default();
-
-        let entities_str = self.transcript_entities.as_ref()
-            .map(|e| e.iter().map(|(n, t)| format!("{} ({})", n, t)).collect::<Vec<_>>().join(", "))
-            .unwrap_or_default();
-
-        let world_json = world.to_json().unwrap_or_default();
-
-        // Use agent prompt for Anthropic, full context prompt for others
-        let is_anthropic = matches!(
-            &self.config.enrichment.mode,
-            crate::core::config::EnrichmentMode::Cloud {
-                provider: CloudProvider::Anthropic, ..
-            }
+        // All providers use agent prompt (tools handle data fetching)
+        self.chat.system_prompt = chat_prompts::build_agent_recording_prompt(
+            &owner_name,
+            recording.id.unwrap_or(0),
+            &recording_name,
+            summary,
         );
-
-        self.chat.system_prompt = if is_anthropic {
-            chat_prompts::build_agent_recording_prompt(
-                &owner_name,
-                recording.id.unwrap_or(0),
-                &recording_name,
-                summary,
-            )
-        } else {
-            chat_prompts::build_recording_chat_prompt(
-                &owner_name,
-                &recording_name,
-                &self.transcript_content,
-                summary,
-                &topics_str,
-                &entities_str,
-                &key_points_str,
-                action_items,
-                &world_json,
-            )
-        };
 
         self.chat.context = ChatContext::Recording {
             recording_id: recording.id.unwrap_or(0),
@@ -5835,44 +5759,11 @@ impl Dashboard {
             (role.to_string(), m.content())
         }).collect();
 
-        // Check if we should use the agent loop (Anthropic only)
-        let use_agent = matches!(
-            &config.mode,
-            crate::core::config::EnrichmentMode::Cloud {
-                provider: CloudProvider::Anthropic, ..
-            }
-        );
-
-        if use_agent {
-            // Extract API key and model for the agent loop
-            let (api_key, model) = match &config.mode {
-                crate::core::config::EnrichmentMode::Cloud { api_key, model, .. } => {
-                    let key = if api_key.is_empty() {
-                        std::env::var("ANTHROPIC_API_KEY").unwrap_or_default()
-                    } else {
-                        api_key.clone()
-                    };
-                    let m = model.clone().unwrap_or_else(|| "claude-sonnet-4-6".to_string());
-                    (key, m)
-                }
-                _ => unreachable!(),
-            };
-
-            let needs_compaction = self.chat.needs_compaction();
-            self.chat.pending_blocks.clear();
-            self.chat.generation_task = Some(tokio::spawn(async move {
-                chat_agent_pipeline(system_prompt, messages, user_msg, api_key, model, needs_compaction, event_tx).await;
-            }));
-        } else {
-            // Collect entity names for cross-referencing (fallback pipeline)
-            let entity_names: Vec<(String, i64)> = self.entities.iter()
-                .filter_map(|e| e.id.map(|id| (e.canonical_name.clone(), id)))
-                .collect();
-
-            self.chat.generation_task = Some(tokio::spawn(async move {
-                chat_generation_pipeline(config, system_prompt, messages, user_msg, entity_names, event_tx).await;
-            }));
-        }
+        let needs_compaction = self.chat.needs_compaction();
+        self.chat.pending_blocks.clear();
+        self.chat.generation_task = Some(tokio::spawn(async move {
+            chat_agent_pipeline(config, system_prompt, messages, user_msg, needs_compaction, event_tx).await;
+        }));
     }
 
     fn handle_chat_key(&mut self, key_code: KeyCode) -> bool {
