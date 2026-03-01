@@ -20,6 +20,8 @@ pub enum AgentEvent {
     ToolCall { name: String, input_summary: String },
     /// Tool returned a result
     ToolResult { name: String, output_summary: String },
+    /// Token usage from the API response
+    Usage { input_tokens: u32, output_tokens: u32 },
     /// Agent finished
     Done,
     /// Error occurred
@@ -160,13 +162,16 @@ pub async fn run_agent_loop(
 
         // Parse the streaming response
         let parse_result = parse_streaming_response(response, &tx).await;
-        let (content_blocks, stop_reason) = match parse_result {
+        let (content_blocks, stop_reason, input_tokens, output_tokens) = match parse_result {
             Ok(r) => r,
             Err(e) => {
                 let _ = tx.send(AgentEvent::Error(format!("Parse error: {}", e))).await;
                 return;
             }
         };
+
+        // Emit usage so the TUI can update the context window bar
+        let _ = tx.send(AgentEvent::Usage { input_tokens, output_tokens }).await;
 
         // Track whether this iteration produced any text
         let iteration_had_text = content_blocks.iter().any(|b| matches!(b, ParsedBlock::Text(t) if !t.is_empty()));
@@ -303,13 +308,15 @@ enum ParsedBlock {
 async fn parse_streaming_response(
     response: reqwest::Response,
     tx: &mpsc::Sender<AgentEvent>,
-) -> Result<(Vec<ParsedBlock>, String), String> {
+) -> Result<(Vec<ParsedBlock>, String, u32, u32), String> {
     use futures_util::StreamExt;
 
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
     let mut blocks: Vec<ParsedBlock> = Vec::new();
     let mut stop_reason = String::from("end_turn");
+    let mut input_tokens: u32 = 0;
+    let mut output_tokens: u32 = 0;
 
     // Track current content blocks being built
     let mut current_text = String::new();
@@ -340,6 +347,15 @@ async fn parse_streaming_response(
             let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
             match event_type {
+                "message_start" => {
+                    if let Some(tokens) = event.get("message")
+                        .and_then(|m| m.get("usage"))
+                        .and_then(|u| u.get("input_tokens"))
+                        .and_then(|t| t.as_u64())
+                    {
+                        input_tokens = tokens as u32;
+                    }
+                }
                 "content_block_start" => {
                     let content_block = event.get("content_block").unwrap_or(&Value::Null);
                     let block_type = content_block.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -386,6 +402,12 @@ async fn parse_streaming_response(
                     {
                         stop_reason = reason.to_string();
                     }
+                    if let Some(tokens) = event.get("usage")
+                        .and_then(|u| u.get("output_tokens"))
+                        .and_then(|t| t.as_u64())
+                    {
+                        output_tokens = tokens as u32;
+                    }
                 }
                 "error" => {
                     let msg = event.get("error")
@@ -404,5 +426,5 @@ async fn parse_streaming_response(
         blocks.push(ParsedBlock::Text(current_text));
     }
 
-    Ok((blocks, stop_reason))
+    Ok((blocks, stop_reason, input_tokens, output_tokens))
 }

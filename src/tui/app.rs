@@ -5554,9 +5554,10 @@ impl Dashboard {
                 _ => unreachable!(),
             };
 
+            let needs_compaction = self.chat.needs_compaction();
             self.chat.pending_blocks.clear();
             self.chat.generation_task = Some(tokio::spawn(async move {
-                chat_agent_pipeline(system_prompt, messages, user_msg, api_key, model, event_tx).await;
+                chat_agent_pipeline(system_prompt, messages, user_msg, api_key, model, needs_compaction, event_tx).await;
             }));
         } else {
             // Collect entity names for cross-referencing (fallback pipeline)
