@@ -175,7 +175,10 @@ impl ChatState {
             selection_anchor: None,
             selection_end: None,
             content_texts: Vec::new(),
-            context_window_max: 200_000,
+            context_window_max: std::env::var("SCRIBA_CTX_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(200_000),
             context_input_tokens: 0,
             context_output_tokens: 0,
             usage_baseline_set: false,
@@ -253,17 +256,33 @@ impl ChatState {
                         self.context_output_tokens = output_tokens;
                     }
                     ChatStreamEvent::Compacted { summary, removed_count } => {
-                        let remaining: Vec<ChatMessage> = self.messages.drain(removed_count..).collect();
-                        self.messages.clear();
-                        self.messages.push(ChatMessage::text(ChatRole::System, summary));
-                        self.messages.push(ChatMessage {
-                            role: ChatRole::System,
-                            blocks: vec![ChatBlock::CompactionMarker],
-                        });
-                        self.messages.extend(remaining);
-                        self.cached_msg_count = 0; // invalidate render cache
+                        let total_msgs = self.messages.len();
+                        if removed_count <= total_msgs {
+                            let remaining: Vec<ChatMessage> = self.messages.drain(removed_count..).collect();
+                            self.messages.clear();
+                            self.messages.push(ChatMessage::text(
+                                ChatRole::System,
+                                format!("Context compacted: {} messages summarized, {} kept",
+                                    removed_count, remaining.len()),
+                            ));
+                            self.messages.push(ChatMessage {
+                                role: ChatRole::System,
+                                blocks: vec![ChatBlock::CompactionMarker],
+                            });
+                            self.messages.push(ChatMessage::text(ChatRole::System, summary));
+                            self.messages.extend(remaining);
+                        } else {
+                            // Mismatch — just insert the summary without restructuring
+                            self.messages.push(ChatMessage {
+                                role: ChatRole::System,
+                                blocks: vec![ChatBlock::CompactionMarker],
+                            });
+                            self.messages.push(ChatMessage::text(ChatRole::System, summary));
+                        }
+                        self.cached_msg_count = 0;
                         self.context_input_tokens = 0;
                         self.context_output_tokens = 0;
+                        self.usage_baseline_set = false;
                     }
                     ChatStreamEvent::Done => {
                         let blocks = std::mem::take(&mut self.pending_blocks);
@@ -1200,7 +1219,9 @@ pub async fn chat_agent_pipeline(
 
     // Auto-compact if context is above 80% and there are enough messages
     if needs_compaction && effective_messages.len() >= 4 {
-        let _ = tx.send(ChatStreamEvent::Status("Compacting context...".to_string())).await;
+        let _ = tx.send(ChatStreamEvent::Status(
+            format!("Compacting context ({} messages)...", effective_messages.len()),
+        )).await;
 
         let keep_count = 4; // keep last 4 messages
         let compact_end = effective_messages.len() - keep_count;
@@ -1214,6 +1235,9 @@ pub async fn chat_agent_pipeline(
                     summary: summary.clone(),
                     removed_count,
                 }).await;
+                let _ = tx.send(ChatStreamEvent::Status(
+                    format!("Compacted {} messages into summary, {} kept", removed_count, remaining.len()),
+                )).await;
 
                 // Augment system prompt with the summary
                 effective_system_prompt = format!(
@@ -1223,10 +1247,11 @@ pub async fn chat_agent_pipeline(
                 effective_messages = remaining;
             }
             Err(e) => {
-                // Graceful degradation — log and continue with full history
-                let _ = tx.send(ChatStreamEvent::Status(
-                    format!("Compaction failed ({}), continuing with full history", e),
+                // Persistent error — Status gets overwritten by "Thinking..." so use Error
+                let _ = tx.send(ChatStreamEvent::Error(
+                    format!("Compaction failed: {}", e),
                 )).await;
+                return; // Don't continue with full history if compaction was needed but failed
             }
         }
     }
