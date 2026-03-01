@@ -848,16 +848,6 @@ async fn transcribe_with_openai_api(audio_path: &PathBuf, api_key: &str) -> Resu
     let mut transcripts = Vec::with_capacity(num_chunks);
 
     for (i, chunk_path) in chunk_paths.iter().enumerate() {
-        let chunk_size = std::fs::metadata(chunk_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        eprintln!(
-            "Transcribing chunk {}/{} ({:.1} MB)",
-            i + 1,
-            num_chunks,
-            chunk_size as f64 / (1024.0 * 1024.0)
-        );
-
         let text = transcribe_single_chunk(chunk_path, api_key)
             .await
             .with_context(|| format!("Failed to transcribe chunk {}/{}", i + 1, num_chunks))?;
