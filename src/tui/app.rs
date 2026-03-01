@@ -23,6 +23,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
     Frame, Terminal,
 };
+use std::collections::VecDeque;
 use std::io;
 use tokio::sync::mpsc;
 
@@ -61,8 +62,8 @@ pub struct Dashboard {
     last_transcribe_warning: Option<usize>, // Track which recording showed overwrite warning
     progress_animation: Option<String>,     // Base message for progress animation
     progress_frame: usize,                  // Animation frame counter
-    transcription_task: Option<tokio::task::JoinHandle<Result<(), anyhow::Error>>>, // Background transcription task
-    transcribing_recording_name: Option<String>, // directory_name of recording being transcribed
+    active_transcription: Option<ActiveTranscription>, // Currently running transcription
+    transcription_queue: VecDeque<PendingTranscription>, // FIFO queue of pending transcriptions
     notification_message: Option<(String, usize)>, // (message, frames_remaining) — auto-dismiss
     header_anim_frame: usize, // Main header owl animation counter
     recording_task: Option<tokio::task::JoinHandle<Result<RecordingResult, anyhow::Error>>>,
@@ -74,8 +75,11 @@ pub struct Dashboard {
     settings_selection: usize,             // Current setting selection
     editing_api_key: bool,                 // Whether we're editing API key
     api_key_input: String,                 // API key input buffer
-    editing_enrichment_model: bool,         // Whether we're editing enrichment model
-    enrichment_model_input: String,        // Enrichment model input buffer
+    model_picker_state: ModelPickerState,
+    model_picker_items: Vec<ModelPickerItem>,
+    model_picker_selection: usize,
+    model_picker_custom_input: String,
+    ollama_models_rx: Option<mpsc::Receiver<Result<Vec<String>, String>>>,
     editing_enrichment_endpoint: bool,     // Whether we're editing Ollama endpoint (local mode)
     enrichment_endpoint_input: String,     // Ollama endpoint input buffer (local mode)
     editing_enrichment_api_key: bool,      // Whether we're editing enrichment API key
@@ -312,6 +316,46 @@ enum RecordingMode {
     RecordAndTranscribe,
 }
 
+#[derive(Debug, PartialEq, Clone)]
+enum ModelPickerState {
+    Closed,
+    Open,
+    EditingCustom,
+}
+
+#[derive(Debug, Clone)]
+struct ModelPickerItem {
+    display_name: String,
+    /// None means this is the "Custom..." sentinel.
+    model_id: Option<String>,
+}
+
+struct ActiveTranscription {
+    task: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    recording_name: String,
+}
+
+enum PendingTranscription {
+    Retranscribe {
+        recording_name: String,
+        transcription_mode: TranscriptionMode,
+    },
+    Import {
+        source_path: PathBuf,
+        display_name: String,
+        transcription_mode: TranscriptionMode,
+    },
+}
+
+impl PendingTranscription {
+    fn recording_name(&self) -> &str {
+        match self {
+            PendingTranscription::Retranscribe { recording_name, .. } => recording_name,
+            PendingTranscription::Import { display_name, .. } => display_name,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum EntityMode {
     Browse,
@@ -377,8 +421,8 @@ impl Dashboard {
             last_transcribe_warning: None,
             progress_animation: None,
             progress_frame: 0,
-            transcription_task: None,
-            transcribing_recording_name: None,
+            active_transcription: None,
+            transcription_queue: VecDeque::new(),
             notification_message: None,
             header_anim_frame: 0,
             recording_task: None,
@@ -390,8 +434,11 @@ impl Dashboard {
             settings_selection: 0,
             editing_api_key: false,
             api_key_input: String::new(),
-            editing_enrichment_model: false,
-            enrichment_model_input: String::new(),
+            model_picker_state: ModelPickerState::Closed,
+            model_picker_items: Vec::new(),
+            model_picker_selection: 0,
+            model_picker_custom_input: String::new(),
+            ollama_models_rx: None,
             editing_enrichment_endpoint: false,
             enrichment_endpoint_input: String::new(),
             editing_enrichment_api_key: false,
@@ -532,23 +579,15 @@ impl Dashboard {
                                 self.stop_progress_animation();
                                 self.show_message = false;
                                 self.message.clear();
-                                self.transcribing_recording_name = Some(recording_name.clone());
                                 let _ = self.load_recordings();
                                 let _ = self.load_stats();
 
-                                // Start auto-transcription in background
+                                // Enqueue auto-transcription
                                 let transcription_mode = self.config.transcription.clone();
-                                let recording_name_clone = recording_name.clone();
-
-                                self.transcription_task = Some(tokio::spawn(async move {
-                                    let mut workflow = WorkflowManager::new().unwrap();
-                                    workflow
-                                        .retranscribe_recording_silent(
-                                            &recording_name_clone,
-                                            transcription_mode,
-                                        )
-                                        .await
-                                }));
+                                self.enqueue_transcription(PendingTranscription::Retranscribe {
+                                    recording_name: recording_name.clone(),
+                                    transcription_mode,
+                                });
                             } else {
                                 // Recording only mode - complete
                                 self.stop_progress_animation();
@@ -573,26 +612,35 @@ impl Dashboard {
                 }
             }
 
-            // Check if transcription task completed
-            if let Some(task) = &mut self.transcription_task {
-                if task.is_finished() {
-                    let completed_task = self.transcription_task.take().unwrap();
-                    match completed_task.await {
+            // Check if active transcription completed
+            if let Some(ref active) = self.active_transcription {
+                if active.task.is_finished() {
+                    let completed = self.active_transcription.take().unwrap();
+                    let name = completed.recording_name;
+                    match completed.task.await {
                         Ok(Ok(())) => {
-                            self.transcribing_recording_name = None;
-                            self.notification_message = Some(("Transcription complete!".to_string(), 30));
+                            self.notification_message = Some((
+                                format!("Transcription complete: {}", name),
+                                30,
+                            ));
                             let _ = self.load_recordings();
                             let _ = self.load_stats();
                         }
                         Ok(Err(err)) => {
-                            self.transcribing_recording_name = None;
-                            self.notification_message = Some((format!("Transcription failed: {}", err), 50));
+                            self.notification_message = Some((
+                                format!("Transcription failed ({}): {}", name, err),
+                                50,
+                            ));
                         }
                         Err(_) => {
-                            self.transcribing_recording_name = None;
-                            self.notification_message = Some(("Transcription task failed".to_string(), 50));
+                            self.notification_message = Some((
+                                format!("Transcription task failed: {}", name),
+                                50,
+                            ));
                         }
                     }
+                    // Start next queued transcription
+                    self.drain_transcription_queue();
                 }
             }
 
@@ -625,13 +673,50 @@ impl Dashboard {
                 }
             }
 
+            // Check for Ollama model list completion
+            if let Some(ref mut rx) = self.ollama_models_rx {
+                if let Ok(result) = rx.try_recv() {
+                    let current_model = self.config.enrichment.model_name().to_string();
+                    match result {
+                        Ok(names) if !names.is_empty() => {
+                            let mut items: Vec<ModelPickerItem> = names
+                                .iter()
+                                .map(|n| ModelPickerItem {
+                                    display_name: n.clone(),
+                                    model_id: Some(n.clone()),
+                                })
+                                .collect();
+                            items.push(ModelPickerItem {
+                                display_name: "Custom...".into(),
+                                model_id: None,
+                            });
+                            let sel = names
+                                .iter()
+                                .position(|n| *n == current_model)
+                                .unwrap_or(items.len() - 1);
+                            self.model_picker_items = items;
+                            self.model_picker_selection = sel;
+                        }
+                        _ => {
+                            // Error or empty — show only Custom...
+                            self.model_picker_items = vec![ModelPickerItem {
+                                display_name: "Custom...".into(),
+                                model_id: None,
+                            }];
+                            self.model_picker_selection = 0;
+                        }
+                    }
+                    self.ollama_models_rx = None;
+                }
+            }
+
             // Update progress animation if active (throttled)
             if anim_tick && self.progress_animation.is_some() {
                 self.update_progress_message();
             }
 
             // Tick progress frame for inline transcription animation (throttled)
-            if anim_tick && self.transcribing_recording_name.is_some() {
+            if anim_tick && (self.active_transcription.is_some() || !self.transcription_queue.is_empty()) {
                 self.progress_frame = self.progress_frame.wrapping_add(1);
             }
 
@@ -1053,6 +1138,72 @@ impl Dashboard {
             _ => {}
         }
         Ok(())
+    }
+
+    // ── Transcription queue helpers ──────────────────────────────────────
+
+    fn has_active_transcription(&self) -> bool {
+        self.active_transcription.is_some()
+    }
+
+    fn is_transcription_pending_or_active(&self, dir_name: &str) -> bool {
+        if let Some(ref active) = self.active_transcription {
+            if active.recording_name == dir_name {
+                return true;
+            }
+        }
+        self.transcription_queue
+            .iter()
+            .any(|p| p.recording_name() == dir_name)
+    }
+
+    fn drain_transcription_queue(&mut self) {
+        if self.active_transcription.is_some() {
+            return;
+        }
+        if let Some(pending) = self.transcription_queue.pop_front() {
+            let name = pending.recording_name().to_string();
+            let task = match pending {
+                PendingTranscription::Retranscribe {
+                    recording_name,
+                    transcription_mode,
+                } => tokio::spawn(async move {
+                    let mut workflow = WorkflowManager::new().unwrap();
+                    workflow
+                        .retranscribe_recording_silent(&recording_name, transcription_mode)
+                        .await
+                }),
+                PendingTranscription::Import {
+                    source_path,
+                    display_name,
+                    transcription_mode,
+                } => tokio::spawn(async move {
+                    let mut workflow = WorkflowManager::new().unwrap();
+                    workflow
+                        .complete_import_workflow_silent(
+                            &source_path,
+                            Some(display_name),
+                            Some(transcription_mode),
+                        )
+                        .await
+                        .map(|_| ())
+                }),
+            };
+            self.active_transcription = Some(ActiveTranscription {
+                task,
+                recording_name: name,
+            });
+            self.progress_frame = 0;
+        }
+    }
+
+    fn enqueue_transcription(&mut self, pending: PendingTranscription) {
+        let name = pending.recording_name().to_string();
+        if self.is_transcription_pending_or_active(&name) {
+            return;
+        }
+        self.transcription_queue.push_back(pending);
+        self.drain_transcription_queue();
     }
 
     fn load_recordings(&mut self) -> Result<()> {
@@ -1999,7 +2150,7 @@ impl Dashboard {
             KeyCode::Char('t') | KeyCode::Char('T') => {
                 // Re-transcribe the current recording
                 if let Some(recording) = self.get_current_recording() {
-                    if self.transcription_task.is_some() {
+                    if self.has_active_transcription() {
                         self.message = "Transcription already in progress".to_string();
                         self.show_message = true;
                         return Ok(DashboardAction::Continue);
@@ -2010,20 +2161,14 @@ impl Dashboard {
                     self.transcript_content.clear();
                     self.transcript_scroll_offset = 0;
 
-                    // Start re-transcription using unified workflow
+                    // Enqueue re-transcription
                     let transcription_mode = self.config.transcription.clone();
                     let directory_name = recording.directory_name.clone();
-                    // Track transcription inline — no blocking popup
-                    self.transcribing_recording_name = Some(directory_name.clone());
-                    self.progress_frame = 0;
 
-                    // Start re-transcription in background
-                    self.transcription_task = Some(tokio::spawn(async move {
-                        let mut workflow = WorkflowManager::new().unwrap();
-                        workflow
-                            .retranscribe_recording_silent(&directory_name, transcription_mode)
-                            .await
-                    }));
+                    self.enqueue_transcription(PendingTranscription::Retranscribe {
+                        recording_name: directory_name,
+                        transcription_mode,
+                    });
                 }
                 Ok(DashboardAction::Continue)
             }
@@ -2044,13 +2189,72 @@ impl Dashboard {
     }
 
     fn is_editing_settings_field(&self) -> bool {
-        self.editing_api_key || self.editing_enrichment_model || self.editing_enrichment_endpoint || self.editing_enrichment_api_key
+        self.editing_api_key || self.model_picker_state != ModelPickerState::Closed || self.editing_enrichment_endpoint || self.editing_enrichment_api_key
     }
 
     fn save_enrichment_config(&mut self) -> Result<()> {
         self.config.save()?;
         self.config = ScribaConfig::load()?;
         Ok(())
+    }
+
+    fn close_model_picker(&mut self) {
+        self.model_picker_state = ModelPickerState::Closed;
+        self.model_picker_items.clear();
+        self.model_picker_selection = 0;
+        self.model_picker_custom_input.clear();
+        self.ollama_models_rx = None;
+    }
+
+    fn open_model_picker(&mut self) {
+        let current_model = self.config.enrichment.model_name().to_string();
+
+        match &self.config.enrichment.mode {
+            EnrichmentMode::Cloud { provider, .. } => {
+                let curated = provider.available_models();
+                let mut items: Vec<ModelPickerItem> = curated
+                    .iter()
+                    .map(|m| ModelPickerItem {
+                        display_name: m.display_name.clone(),
+                        model_id: Some(m.model_id.clone()),
+                    })
+                    .collect();
+                items.push(ModelPickerItem {
+                    display_name: "Custom...".into(),
+                    model_id: None,
+                });
+
+                // Pre-select current model, or "Custom..." if not in the list
+                let sel = curated
+                    .iter()
+                    .position(|m| m.model_id == current_model)
+                    .unwrap_or(items.len() - 1);
+
+                self.model_picker_items = items;
+                self.model_picker_selection = sel;
+                self.model_picker_state = ModelPickerState::Open;
+            }
+            EnrichmentMode::Local { ollama_endpoint, .. } => {
+                // Show a loading placeholder while we fetch
+                self.model_picker_items = vec![ModelPickerItem {
+                    display_name: "Loading...".into(),
+                    model_id: None,
+                }];
+                self.model_picker_selection = 0;
+                self.model_picker_state = ModelPickerState::Open;
+
+                let endpoint = ollama_endpoint.clone();
+                let (tx, rx) = mpsc::channel(1);
+                self.ollama_models_rx = Some(rx);
+
+                tokio::spawn(async move {
+                    let result = OllamaClient::fetch_models(&endpoint)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(result).await;
+                });
+            }
+        }
     }
 
     async fn handle_settings_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
@@ -2063,9 +2267,10 @@ impl Dashboard {
 
         match key_code {
             KeyCode::Esc => {
-                if self.is_editing_settings_field() {
+                if self.model_picker_state != ModelPickerState::Closed {
+                    self.close_model_picker();
+                } else if self.is_editing_settings_field() {
                     self.editing_api_key = false;
-                    self.editing_enrichment_model = false;
                     self.editing_enrichment_endpoint = false;
                     self.editing_enrichment_api_key = false;
                 } else {
@@ -2074,13 +2279,22 @@ impl Dashboard {
                 Ok(DashboardAction::Continue)
             }
             KeyCode::Up => {
-                if !self.is_editing_settings_field() {
+                if self.model_picker_state == ModelPickerState::Open {
+                    self.model_picker_selection = self.model_picker_selection.saturating_sub(1);
+                } else if !self.is_editing_settings_field() {
                     self.settings_selection = self.settings_selection.saturating_sub(1);
                 }
                 Ok(DashboardAction::Continue)
             }
             KeyCode::Down => {
-                if !self.is_editing_settings_field() {
+                if self.model_picker_state == ModelPickerState::Open {
+                    if !self.model_picker_items.is_empty() {
+                        self.model_picker_selection = std::cmp::min(
+                            self.model_picker_selection + 1,
+                            self.model_picker_items.len() - 1,
+                        );
+                    }
+                } else if !self.is_editing_settings_field() {
                     self.settings_selection = std::cmp::min(self.settings_selection + 1, max_index);
                 }
                 Ok(DashboardAction::Continue)
@@ -2103,8 +2317,35 @@ impl Dashboard {
                     }
                     self.editing_api_key = false;
                     self.api_key_input.clear();
-                } else if self.editing_enrichment_model {
-                    let new_model = self.enrichment_model_input.trim().to_string();
+                } else if self.model_picker_state == ModelPickerState::Open {
+                    if let Some(item) = self.model_picker_items.get(self.model_picker_selection) {
+                        if item.display_name == "Loading..." {
+                            // no-op while loading
+                        } else if let Some(ref id) = item.model_id {
+                            // Selected a concrete model — save it
+                            let new_model = id.clone();
+                            match &mut self.config.enrichment.mode {
+                                EnrichmentMode::Cloud { model, .. } => {
+                                    *model = Some(new_model);
+                                }
+                                EnrichmentMode::Local { ollama_model, .. } => {
+                                    *ollama_model = new_model;
+                                }
+                            }
+                            if let Err(e) = self.save_enrichment_config() {
+                                self.message = format!("Failed to save enrichment model: {}", e);
+                                self.show_message = true;
+                                self.return_to_view = Some(DashboardView::Settings);
+                            }
+                            self.close_model_picker();
+                        } else {
+                            // "Custom..." sentinel — switch to custom text entry
+                            self.model_picker_state = ModelPickerState::EditingCustom;
+                            self.model_picker_custom_input = self.config.enrichment.model_name().to_string();
+                        }
+                    }
+                } else if self.model_picker_state == ModelPickerState::EditingCustom {
+                    let new_model = self.model_picker_custom_input.trim().to_string();
                     if !new_model.is_empty() {
                         match &mut self.config.enrichment.mode {
                             EnrichmentMode::Cloud { model, .. } => {
@@ -2120,8 +2361,7 @@ impl Dashboard {
                             self.return_to_view = Some(DashboardView::Settings);
                         }
                     }
-                    self.editing_enrichment_model = false;
-                    self.enrichment_model_input.clear();
+                    self.close_model_picker();
                 } else if self.editing_enrichment_endpoint {
                     let new_endpoint = self.enrichment_endpoint_input.trim().to_string();
                     if !new_endpoint.is_empty() {
@@ -2136,8 +2376,13 @@ impl Dashboard {
                     self.enrichment_endpoint_input.clear();
                 } else if self.editing_enrichment_api_key {
                     let new_key = self.enrichment_api_key_input.trim().to_string();
+                    // Clone the provider before mutating
+                    let provider_clone = self.config.enrichment.cloud_provider().cloned();
                     if let EnrichmentMode::Cloud { api_key, .. } = &mut self.config.enrichment.mode {
-                        *api_key = new_key;
+                        *api_key = new_key.clone();
+                    }
+                    if let Some(ref p) = provider_clone {
+                        self.config.enrichment.save_key_for_provider(p, &new_key);
                     }
                     if let Err(e) = self.save_enrichment_config() {
                         self.message = format!("Failed to save API key: {}", e);
@@ -2212,24 +2457,60 @@ impl Dashboard {
                             }
                         }
                         2 => {
-                            // Enrichment Provider — cycle through providers
-                            let new_mode = match &self.config.enrichment.mode {
+                            // Enrichment Provider — cycle: Anthropic → OpenAI → Google → Ollama → Anthropic
+                            // Close picker if open (prevents stale state)
+                            self.close_model_picker();
+                            // Clone current state to avoid borrow issues
+                            let (cur_provider, cur_key, cur_ollama) = match &self.config.enrichment.mode {
                                 EnrichmentMode::Cloud { provider, api_key, .. } => {
-                                    let next = match provider {
-                                        CloudProvider::Anthropic => CloudProvider::OpenAI,
-                                        CloudProvider::OpenAI => CloudProvider::Google,
-                                        CloudProvider::Google => CloudProvider::Anthropic,
-                                    };
+                                    (Some(provider.clone()), api_key.clone(), None)
+                                }
+                                EnrichmentMode::Local { ollama_endpoint, ollama_model } => {
+                                    (None, String::new(), Some((ollama_endpoint.clone(), ollama_model.clone())))
+                                }
+                            };
+                            // Save current settings before switching
+                            if let Some(ref p) = cur_provider {
+                                self.config.enrichment.save_key_for_provider(p, &cur_key);
+                            }
+                            if let Some((ref ep, ref mdl)) = cur_ollama {
+                                self.config.enrichment.last_ollama_endpoint = Some(ep.clone());
+                                self.config.enrichment.last_ollama_model = Some(mdl.clone());
+                            }
+                            let new_mode = match cur_provider {
+                                Some(CloudProvider::Anthropic) => {
+                                    let next_key = self.config.enrichment.load_key_for_provider(&CloudProvider::OpenAI);
                                     EnrichmentMode::Cloud {
-                                        provider: next,
-                                        api_key: api_key.clone(),
+                                        provider: CloudProvider::OpenAI,
+                                        api_key: next_key,
                                         model: None,
                                     }
                                 }
-                                EnrichmentMode::Local { .. } => {
+                                Some(CloudProvider::OpenAI) => {
+                                    let next_key = self.config.enrichment.load_key_for_provider(&CloudProvider::Google);
+                                    EnrichmentMode::Cloud {
+                                        provider: CloudProvider::Google,
+                                        api_key: next_key,
+                                        model: None,
+                                    }
+                                }
+                                Some(CloudProvider::Google) => {
+                                    // Google → Ollama (Local) — restore previous settings if available
+                                    let ep = self.config.enrichment.last_ollama_endpoint.clone()
+                                        .unwrap_or_else(|| "http://localhost:11434".to_string());
+                                    let mdl = self.config.enrichment.last_ollama_model.clone()
+                                        .unwrap_or_else(|| "mistral:latest".to_string());
+                                    EnrichmentMode::Local {
+                                        ollama_endpoint: ep,
+                                        ollama_model: mdl,
+                                    }
+                                }
+                                None => {
+                                    // Ollama → Anthropic
+                                    let next_key = self.config.enrichment.load_key_for_provider(&CloudProvider::Anthropic);
                                     EnrichmentMode::Cloud {
                                         provider: CloudProvider::Anthropic,
-                                        api_key: String::new(),
+                                        api_key: next_key,
                                         model: None,
                                     }
                                 }
@@ -2242,9 +2523,8 @@ impl Dashboard {
                             }
                         }
                         3 => {
-                            // Enrichment Model
-                            self.editing_enrichment_model = true;
-                            self.enrichment_model_input = self.config.enrichment.model_name().to_string();
+                            // Enrichment Model — open picker
+                            self.open_model_picker();
                         }
                         4 => {
                             // Enrichment API Key (cloud) or Ollama Endpoint (local)
@@ -2350,8 +2630,8 @@ impl Dashboard {
             KeyCode::Char(c) => {
                 if self.editing_api_key {
                     self.api_key_input.push(c);
-                } else if self.editing_enrichment_model {
-                    self.enrichment_model_input.push(c);
+                } else if self.model_picker_state == ModelPickerState::EditingCustom {
+                    self.model_picker_custom_input.push(c);
                 } else if self.editing_enrichment_endpoint {
                     self.enrichment_endpoint_input.push(c);
                 } else if self.editing_enrichment_api_key {
@@ -2362,8 +2642,8 @@ impl Dashboard {
             KeyCode::Backspace => {
                 if self.editing_api_key {
                     self.api_key_input.pop();
-                } else if self.editing_enrichment_model {
-                    self.enrichment_model_input.pop();
+                } else if self.model_picker_state == ModelPickerState::EditingCustom {
+                    self.model_picker_custom_input.pop();
                 } else if self.editing_enrichment_endpoint {
                     self.enrichment_endpoint_input.pop();
                 } else if self.editing_enrichment_api_key {
@@ -2967,15 +3247,19 @@ impl Dashboard {
                     .map(|d| self.format_duration(d))
                     .unwrap_or_else(|| "Unknown".to_string());
 
-                let is_transcribing = self.transcribing_recording_name.as_deref()
-                    == Some(&recording.directory_name);
-                let status = if is_transcribing {
+                let is_active = self.active_transcription.as_ref()
+                    .is_some_and(|a| a.recording_name == recording.directory_name);
+                let is_queued = !is_active
+                    && self.transcription_queue.iter().any(|p| p.recording_name() == recording.directory_name);
+                let status = if is_active {
                     match self.progress_frame % 4 {
                         0 => "[|]",
                         1 => "[/]",
                         2 => "[-]",
                         _ => "[\\]",
                     }
+                } else if is_queued {
+                    "[Q]"
                 } else if recording.has_transcript {
                     "[T]"
                 } else {
@@ -3020,7 +3304,7 @@ impl Dashboard {
 
                 let cells = vec![
                     Cell::from(global_index.to_string()),
-                    Cell::from(status).style(if is_transcribing {
+                    Cell::from(status).style(if is_active || is_queued {
                         Style::default().fg(Color::Yellow)
                     } else if recording.has_transcript {
                         Style::default().fg(Color::Green)
@@ -3307,32 +3591,65 @@ impl Dashboard {
             Span::styled(provider_display, provider_style),
         ]));
 
-        // Model (index 3)
-        let model_display = if self.editing_enrichment_model {
-            format!("{}_", self.enrichment_model_input)
-        } else {
-            format!(
-                "{} <- Press Enter to edit",
+        // Model (index 3) — picker or closed
+        if self.model_picker_state == ModelPickerState::Closed {
+            let model_display = format!(
+                "{} <- Press Enter to choose",
                 self.config.enrichment.model_name()
-            )
-        };
-        let model_style = if self.settings_selection == 3 {
-            if self.editing_enrichment_model {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
-            } else {
+            );
+            let model_style = if self.settings_selection == 3 {
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
-            }
+            } else {
+                Style::default().fg(Color::White)
+            };
+            settings_text.push(Line::from(vec![
+                Span::styled("Model: ", Style::default().fg(Color::Green)),
+                Span::styled(model_display, model_style),
+            ]));
         } else {
-            Style::default().fg(Color::White)
-        };
-        settings_text.push(Line::from(vec![
-            Span::styled("Model: ", Style::default().fg(Color::Green)),
-            Span::styled(model_display, model_style),
-        ]));
+            // Picker is open or editing custom
+            settings_text.push(Line::from(vec![
+                Span::styled("Model: ", Style::default().fg(Color::Green)),
+                Span::styled("(select below)", Style::default().fg(Color::DarkGray)),
+            ]));
+
+            let current_model = self.config.enrichment.model_name().to_string();
+
+            for (i, item) in self.model_picker_items.iter().enumerate() {
+                let is_cursor = i == self.model_picker_selection;
+                let is_current = item.model_id.as_deref() == Some(current_model.as_str());
+                let is_custom_sentinel = item.model_id.is_none() && item.display_name == "Custom...";
+
+                let arrow = if is_cursor { "  > " } else { "    " };
+
+                let style = if is_cursor {
+                    if self.model_picker_state == ModelPickerState::EditingCustom && is_custom_sentinel {
+                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    }
+                } else if is_current {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+
+                if is_custom_sentinel && self.model_picker_state == ModelPickerState::EditingCustom {
+                    settings_text.push(Line::from(vec![
+                        Span::styled(arrow, style),
+                        Span::styled(format!("Custom: {}_", self.model_picker_custom_input), style),
+                    ]));
+                } else {
+                    let suffix = if is_current && !is_cursor { " (current)" } else { "" };
+                    settings_text.push(Line::from(vec![
+                        Span::styled(arrow, style),
+                        Span::styled(format!("{}{}", item.display_name, suffix), style),
+                    ]));
+                }
+            }
+        }
 
         // API Key or Ollama Endpoint (index 4)
         if self.config.enrichment.is_local() {
@@ -3362,6 +3679,14 @@ impl Dashboard {
                 Span::styled(endpoint_display, endpoint_style),
             ]));
         } else {
+            // Provider-specific label and env var hint
+            let (key_label, env_hint) = match self.config.enrichment.cloud_provider() {
+                Some(p) => (
+                    format!("{} API Key: ", p.display_name()),
+                    format!(" (or set {})", p.env_var_name()),
+                ),
+                None => ("API Key: ".to_string(), String::new()),
+            };
             let key_display = if self.editing_enrichment_api_key {
                 format!("{}_", self.enrichment_api_key_input)
             } else {
@@ -3370,7 +3695,7 @@ impl Dashboard {
                         format!("{}****** <- Press Enter to edit", &key[..4])
                     }
                     Some(_) => "****** <- Press Enter to edit".to_string(),
-                    None => "[Not Set] <- Press Enter to edit".to_string(),
+                    None => format!("[Not Set]{} <- Press Enter to edit", env_hint),
                 }
             };
             let key_style = if self.settings_selection == 4 {
@@ -3387,7 +3712,7 @@ impl Dashboard {
                 Style::default().fg(Color::White)
             };
             settings_text.push(Line::from(vec![
-                Span::styled("API Key: ", Style::default().fg(Color::Green)),
+                Span::styled(key_label, Style::default().fg(Color::Green)),
                 Span::styled(key_display, key_style),
             ]));
         }
@@ -4615,9 +4940,9 @@ impl Dashboard {
     }
 
     async fn execute_record_and_transcribe(&mut self) -> Result<()> {
-        // Check if already recording or transcribing
-        if self.recording_task.is_some() || self.transcription_task.is_some() {
-            self.message = "Recording or transcription already in progress".to_string();
+        // Check if already recording (transcription can run concurrently)
+        if self.recording_task.is_some() {
+            self.message = "Recording already in progress".to_string();
             self.show_message = true;
             return Ok(());
         }
@@ -4636,9 +4961,9 @@ impl Dashboard {
     }
 
     async fn execute_add_external_file(&mut self) -> Result<()> {
-        // Check if already recording or transcribing
-        if self.recording_task.is_some() || self.transcription_task.is_some() {
-            self.message = "Recording or transcription already in progress".to_string();
+        // Check if already recording (transcription can run concurrently)
+        if self.recording_task.is_some() {
+            self.message = "Recording already in progress".to_string();
             self.show_message = true;
             return Ok(());
         }
@@ -4653,25 +4978,14 @@ impl Dashboard {
     }
 
     async fn start_file_import(&mut self, file_path: String, display_name: String) -> Result<()> {
-        // Track import+transcription inline — no blocking popup
-        self.transcribing_recording_name = Some(display_name.clone());
-        self.progress_frame = 0;
-
         let source_path = PathBuf::from(file_path.trim());
         let transcription_mode = self.config.transcription.clone();
-        let display_name_clone = display_name.clone();
 
-        self.transcription_task = Some(tokio::spawn(async move {
-            let mut workflow = WorkflowManager::new().unwrap();
-            workflow
-                .complete_import_workflow_silent(
-                    &source_path,
-                    Some(display_name_clone),
-                    Some(transcription_mode),
-                )
-                .await
-                .map(|_| ())
-        }));
+        self.enqueue_transcription(PendingTranscription::Import {
+            source_path,
+            display_name,
+            transcription_mode,
+        });
 
         Ok(())
     }
@@ -4680,7 +4994,7 @@ impl Dashboard {
 
     async fn execute_transcribe_selected(&mut self) -> Result<()> {
         // Check if transcription is already running
-        if self.transcription_task.is_some() {
+        if self.has_active_transcription() {
             self.message = "Transcription already in progress. Please wait...".to_string();
             self.show_message = true;
             return Ok(());
@@ -4732,20 +5046,14 @@ impl Dashboard {
             self.last_transcribe_warning = None;
         }
 
-        // Track transcription inline — no blocking popup
+        // Enqueue transcription
         let directory_name = selected_recording.directory_name.clone();
-        self.transcribing_recording_name = Some(directory_name.clone());
-        self.progress_frame = 0;
-
-        // Start transcription in background
         let transcription_mode = self.config.transcription.clone();
 
-        self.transcription_task = Some(tokio::spawn(async move {
-            let mut workflow = WorkflowManager::new().unwrap();
-            workflow
-                .retranscribe_recording_silent(&directory_name, transcription_mode)
-                .await
-        }));
+        self.enqueue_transcription(PendingTranscription::Retranscribe {
+            recording_name: directory_name,
+            transcription_mode,
+        });
 
         Ok(())
     }
@@ -5165,19 +5473,15 @@ impl Dashboard {
                     }
                 }
 
-                // Start transcription pipeline
+                // Enqueue transcription pipeline
                 let transcription_mode = self.config.transcription.clone();
-                self.transcribing_recording_name = Some(dir_name_clone.clone());
-                self.progress_frame = 0;
                 let _ = self.load_recordings();
                 let _ = self.load_stats();
 
-                self.transcription_task = Some(tokio::spawn(async move {
-                    let mut workflow = WorkflowManager::new().unwrap();
-                    workflow
-                        .retranscribe_recording_silent(&dir_name_clone, transcription_mode)
-                        .await
-                }));
+                self.enqueue_transcription(PendingTranscription::Retranscribe {
+                    recording_name: dir_name_clone,
+                    transcription_mode,
+                });
             }
             Ok(None) => {
                 self.notification_message = Some(("Voice: No recording to stop.".to_string(), 30));
@@ -5548,7 +5852,7 @@ impl Dashboard {
                     } else {
                         api_key.clone()
                     };
-                    let m = model.clone().unwrap_or_else(|| "claude-opus-4-6".to_string());
+                    let m = model.clone().unwrap_or_else(|| "claude-sonnet-4-6".to_string());
                     (key, m)
                 }
                 _ => unreachable!(),
@@ -5838,7 +6142,16 @@ impl Dashboard {
         }
 
         let voice_status = if self.voice_mode_active { " | Voice" } else { "" };
-        let transcribing = if self.transcribing_recording_name.is_some() { " | Transcribing..." } else { "" };
+        let queue_len = self.transcription_queue.len();
+        let transcribing = if self.active_transcription.is_some() {
+            if queue_len > 0 {
+                format!(" | Transcribing... (+{} queued)", queue_len)
+            } else {
+                " | Transcribing...".to_string()
+            }
+        } else {
+            String::new()
+        };
         let controls = format!(
             "TAB: Focus | ↑↓: Nav | /: Search | R: Record | A: Add | W: World | S: Settings | H: Help | Q: Quit{}{}",
             transcribing, voice_status

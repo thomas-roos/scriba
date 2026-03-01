@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use dirs::home_dir;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -149,9 +150,9 @@ impl CloudProvider {
     /// Default model for this provider.
     pub fn default_model(&self) -> &str {
         match self {
-            CloudProvider::Anthropic => "claude-opus-4-6",
-            CloudProvider::OpenAI => "gpt-4o",
-            CloudProvider::Google => "gemini-2.0-flash",
+            CloudProvider::Anthropic => "claude-sonnet-4-6",
+            CloudProvider::OpenAI => "gpt-5.2",
+            CloudProvider::Google => "gemini-2.5-flash",
         }
     }
 
@@ -172,6 +173,35 @@ impl CloudProvider {
             CloudProvider::Google => "GOOGLE_API_KEY",
         }
     }
+
+    /// Curated list of models for this provider.
+    pub fn available_models(&self) -> Vec<ModelDef> {
+        match self {
+            CloudProvider::Anthropic => vec![
+                ModelDef { display_name: "Claude Opus 4.6".into(), model_id: "claude-opus-4-6".into() },
+                ModelDef { display_name: "Claude Sonnet 4.6".into(), model_id: "claude-sonnet-4-6".into() },
+                ModelDef { display_name: "Claude Haiku 4.5".into(), model_id: "claude-haiku-4-5-20251001".into() },
+            ],
+            CloudProvider::OpenAI => vec![
+                ModelDef { display_name: "GPT-5.2".into(), model_id: "gpt-5.2".into() },
+                ModelDef { display_name: "GPT-5.1 Mini".into(), model_id: "gpt-5.1-mini".into() },
+                ModelDef { display_name: "o3".into(), model_id: "o3".into() },
+                ModelDef { display_name: "o4-mini".into(), model_id: "o4-mini".into() },
+            ],
+            CloudProvider::Google => vec![
+                ModelDef { display_name: "Gemini 2.5 Pro".into(), model_id: "gemini-2.5-pro".into() },
+                ModelDef { display_name: "Gemini 2.5 Flash".into(), model_id: "gemini-2.5-flash".into() },
+                ModelDef { display_name: "Gemini 2.5 Flash-Lite".into(), model_id: "gemini-2.5-flash-lite".into() },
+                ModelDef { display_name: "Gemini 3.1 Pro Preview".into(), model_id: "gemini-3.1-pro-preview".into() },
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelDef {
+    pub display_name: String,
+    pub model_id: String,
 }
 
 /// Enrichment mode configuration.
@@ -216,6 +246,17 @@ pub struct EnrichmentConfig {
     #[serde(default, skip_serializing)]
     ollama_model: Option<String>,
 
+    /// Per-provider API keys so switching providers doesn't lose keys.
+    #[serde(default)]
+    pub cloud_api_keys: HashMap<String, String>,
+
+    /// Preserved Ollama endpoint so cycling away from Local doesn't lose it.
+    #[serde(default)]
+    pub last_ollama_endpoint: Option<String>,
+    /// Preserved Ollama model so cycling away from Local doesn't lose it.
+    #[serde(default)]
+    pub last_ollama_model: Option<String>,
+
     /// Confidence threshold for automatic entity linking (0.0-1.0).
     pub auto_link_threshold: f32,
     /// Whether to evolve the world description after each enrichment.
@@ -248,6 +289,9 @@ impl Default for EnrichmentConfig {
             mode: EnrichmentMode::default(),
             ollama_endpoint: None,
             ollama_model: None,
+            cloud_api_keys: HashMap::new(),
+            last_ollama_endpoint: None,
+            last_ollama_model: None,
             auto_link_threshold: 0.8,
             evolve_world: true,
             search_enabled: true,
@@ -271,6 +315,43 @@ impl EnrichmentConfig {
                     ollama_model: model,
                 };
             }
+        }
+
+        // Seed cloud_api_keys from the existing api_key field if the map is
+        // empty (first run after upgrade).  This ensures the key is attributed
+        // to the correct provider instead of being carried to the wrong one on
+        // the first provider cycle.
+        if self.cloud_api_keys.is_empty() {
+            if let EnrichmentMode::Cloud { provider, api_key, .. } = &self.mode {
+                if !api_key.is_empty() {
+                    self.cloud_api_keys.insert(provider.to_string(), api_key.clone());
+                }
+            }
+        }
+    }
+
+    /// Save an API key for a specific provider into the per-provider map.
+    pub fn save_key_for_provider(&mut self, provider: &CloudProvider, key: &str) {
+        if key.is_empty() {
+            self.cloud_api_keys.remove(&provider.to_string());
+        } else {
+            self.cloud_api_keys.insert(provider.to_string(), key.to_string());
+        }
+    }
+
+    /// Load a previously-stored API key for a specific provider.
+    pub fn load_key_for_provider(&self, provider: &CloudProvider) -> String {
+        self.cloud_api_keys
+            .get(&provider.to_string())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Get the current cloud provider, if in cloud mode.
+    pub fn cloud_provider(&self) -> Option<&CloudProvider> {
+        match &self.mode {
+            EnrichmentMode::Cloud { provider, .. } => Some(provider),
+            _ => None,
         }
     }
 
