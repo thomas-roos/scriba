@@ -1,6 +1,6 @@
 //! Tool executor — dispatches tool calls to database/world queries.
 //!
-//! All 14 tools are implemented here. Consumers (agent, MCP) call
+//! All 15 tools are implemented here. Consumers (agent, MCP) call
 //! `execute_tool()` and wrap the result into their own wire format.
 
 use crate::database::Database;
@@ -40,6 +40,7 @@ pub fn execute_tool(name: &str, input: &Value, db: &mut Database) -> ToolResult 
         "get_recordings_for_entity" => exec_get_recordings_for_entity(input, db),
         "get_world_context" => exec_get_world_context(),
         "get_stats" => exec_get_stats(db),
+        "create_entity" => exec_create_entity(input, db),
         "update_entity" => exec_update_entity(input, db),
         "add_entity_alias" => exec_add_entity_alias(input, db),
         "remove_entity_alias" => exec_remove_entity_alias(input, db),
@@ -303,6 +304,70 @@ fn exec_get_stats(db: &Database) -> ToolResult {
 }
 
 // ─── Write Tools ─────────────────────────────────────────────────────────────
+
+fn exec_create_entity(input: &Value, db: &mut Database) -> ToolResult {
+    let params: CreateEntityParams = match serde_json::from_value(input.clone()) {
+        Ok(p) => p,
+        Err(e) => return ToolResult::err(format!("Invalid params: {}", e)),
+    };
+
+    // Validate entity_type
+    if params.entity_type != "person" && params.entity_type != "organization" {
+        return ToolResult::err(format!(
+            "Invalid entity_type '{}'. Must be 'person' or 'organization'.",
+            params.entity_type
+        ));
+    }
+
+    let mut registry = EntityRegistry::new(db);
+
+    // Check for duplicates by name or alias
+    if let Ok(Some(existing)) = registry.get_entity_by_name_or_alias(&params.name) {
+        return ToolResult::err(format!(
+            "Entity '{}' already exists (id: {}, canonical name: '{}')",
+            params.name,
+            existing.id.unwrap_or_default(),
+            existing.canonical_name
+        ));
+    }
+
+    let entity = match registry.create_entity(
+        &params.entity_type,
+        &params.name,
+        params.context.as_deref(),
+    ) {
+        Ok(e) => e,
+        Err(e) => return ToolResult::err(format!("Error creating entity: {}", e)),
+    };
+
+    let entity_id = entity.id.unwrap_or_default();
+
+    // Add aliases if provided
+    if let Some(aliases) = &params.aliases {
+        for alias in aliases {
+            if let Err(e) = registry.add_entity_alias(entity_id, alias) {
+                return ToolResult::err(format!("Entity created but failed to add alias '{}': {}", alias, e));
+            }
+        }
+    }
+
+    // Re-fetch to include aliases
+    let final_entity = registry.get_entity(entity_id).ok().flatten().unwrap_or(entity);
+
+    let result = json!({
+        "success": true,
+        "message": format!("Created {} '{}'", params.entity_type, params.name),
+        "entity": {
+            "id": final_entity.id,
+            "type": final_entity.entity_type,
+            "name": final_entity.canonical_name,
+            "aliases": final_entity.aliases_list(),
+            "context": final_entity.context,
+            "mention_count": final_entity.mention_count,
+        }
+    });
+    ToolResult::ok(serde_json::to_string_pretty(&result).unwrap_or_default())
+}
 
 fn exec_update_entity(input: &Value, db: &mut Database) -> ToolResult {
     let params: UpdateEntityParams = match serde_json::from_value(input.clone()) {

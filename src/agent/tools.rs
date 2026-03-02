@@ -74,7 +74,7 @@ pub fn summarize_tool_result(name: &str, result: &str) -> String {
         }
         "get_stats" => "ok".to_string(),
         // Write tools
-        "update_entity" | "add_entity_alias" | "remove_entity_alias"
+        "create_entity" | "update_entity" | "add_entity_alias" | "remove_entity_alias"
         | "merge_entities" | "delete_entity" => {
             if result.contains("\"success\": true") {
                 "ok".to_string()
@@ -140,6 +140,11 @@ pub fn summarize_input(name: &str, input: &Value) -> String {
             }
         }
         // Write tools
+        "create_entity" => {
+            let name = input.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let etype = input.get("entity_type").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("{} ({})", name, etype)
+        }
         "update_entity" | "add_entity_alias" | "remove_entity_alias" | "delete_entity" => {
             let id = input
                 .get("entity_id")
