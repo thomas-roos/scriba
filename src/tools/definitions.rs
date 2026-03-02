@@ -1,4 +1,4 @@
-//! Tool schema definitions for all 14 Scriba tools.
+//! Tool schema definitions for all 15 Scriba tools.
 //!
 //! Each tool has a param struct (used for deserialization in the executor)
 //! and a schema generated via `schemars`. The `ToolSchema` type is
@@ -72,6 +72,18 @@ pub struct GetRecordingsForEntityParams {
 }
 
 // ─── Write-tool param structs ────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateEntityParams {
+    /// Entity type: "person" or "organization".
+    pub entity_type: String,
+    /// Canonical name for the entity.
+    pub name: String,
+    /// Optional aliases (e.g. nicknames, misspellings).
+    pub aliases: Option<Vec<String>>,
+    /// Optional context description.
+    pub context: Option<String>,
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct UpdateEntityParams {
@@ -164,6 +176,11 @@ pub fn all_tool_schemas() -> Vec<ToolSchema> {
             input_schema: serde_json::json!({"type": "object", "properties": {}, "required": []}),
         },
         // ─── Write tools ─────────────────────────────────────────────
+        ToolSchema {
+            name: "create_entity",
+            description: "Create a new entity (person or organization) in the knowledge base. Returns an error if an entity with the same name already exists.",
+            input_schema: serde_json::to_value(schemars::schema_for!(CreateEntityParams)).unwrap(),
+        },
         ToolSchema {
             name: "update_entity",
             description: "Update an entity's name or context. When renaming, the old name is automatically added as an alias for smart matching in future transcripts.",
