@@ -132,6 +132,8 @@ pub struct Dashboard {
     global_chat_messages: Vec<ChatMessage>,
     // Track the currently-viewed recording for chat context
     current_transcript_recording: Option<Recording>,
+    // Keep clipboard alive so X11 background thread can serve paste requests
+    clipboard: Option<arboard::Clipboard>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -490,6 +492,7 @@ impl Dashboard {
             chat: ChatState::new(),
             global_chat_messages: Vec::new(),
             current_transcript_recording: None,
+            clipboard: None,
         })
     }
 
@@ -2913,16 +2916,71 @@ impl Dashboard {
         result
     }
 
-    fn copy_transcript_to_clipboard(&self) -> Result<()> {
+    /// Copy text to the system clipboard.
+    /// Tries wl-copy (Wayland), then xclip/xsel (X11), then arboard as a last resort.
+    fn set_clipboard_text(&mut self, text: &str) -> Result<()> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        // Wayland: use wl-copy
+        if std::env::var("WAYLAND_DISPLAY").is_ok() {
+            if let Ok(mut child) = Command::new("wl-copy")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                // child dropped here — process keeps running on Linux, serving paste requests
+                return Ok(());
+            }
+        }
+
+        // X11: try xclip
+        if std::env::var("DISPLAY").is_ok() {
+            if let Ok(mut child) = Command::new("xclip")
+                .args(["-selection", "clipboard"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                return Ok(());
+            }
+
+            // X11: try xsel
+            if let Ok(mut child) = Command::new("xsel")
+                .args(["--clipboard", "--input"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                return Ok(());
+            }
+        }
+
+        // Last resort: arboard (kept alive in self.clipboard so X11 thread can serve pastes)
         use arboard::Clipboard;
-
-        let mut clipboard = Clipboard::new().context("Failed to access clipboard")?;
-
-        clipboard
-            .set_text(&self.transcript_content)
-            .context("Failed to copy text to clipboard")?;
+        let mut cb = Clipboard::new()
+            .context("clipboard unavailable (install wl-clipboard, xclip, or xsel)")?;
+        cb.set_text(text).context("Failed to set clipboard text")?;
+        self.clipboard = Some(cb);
 
         Ok(())
+    }
+
+    fn copy_transcript_to_clipboard(&mut self) -> Result<()> {
+        let content = self.transcript_content.clone();
+        self.set_clipboard_text(&content)
     }
 
     fn ui(&mut self, f: &mut Frame) {
@@ -5997,10 +6055,13 @@ impl Dashboard {
                 if let (Some(anchor), Some(end)) = (self.chat.selection_anchor, self.chat.selection_end) {
                     let selected = self.chat.extract_selected_text(anchor, end);
                     if !selected.trim().is_empty() {
-                        use arboard::Clipboard;
-                        if let Ok(mut clipboard) = Clipboard::new() {
-                            let _ = clipboard.set_text(&selected);
-                            self.notification_message = Some(("Copied to clipboard".to_string(), 15));
+                        match self.set_clipboard_text(&selected) {
+                            Ok(()) => {
+                                self.notification_message = Some(("Copied to clipboard".to_string(), 15));
+                            }
+                            Err(e) => {
+                                self.notification_message = Some((format!("Copy failed: {e}"), 30));
+                            }
                         }
                     }
                     // Keep selection visible (don't clear anchor/end) — cleared on next click
