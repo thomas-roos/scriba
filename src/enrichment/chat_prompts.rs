@@ -187,13 +187,20 @@ You have access to tools to search and read recordings, transcripts, entities, a
 }
 
 /// Build the system prompt for the agent (recording-specific context).
-/// Pre-loads the current recording's summary so the agent doesn't need to fetch it.
+/// Embeds the full transcript directly so the agent always has access to it.
 pub fn build_agent_recording_prompt(
     owner_name: &str,
     recording_id: i64,
     recording_name: &str,
     summary: &str,
+    transcript: &str,
 ) -> String {
+    let transcript_section = if transcript.is_empty() {
+        "*(no transcript available)*".to_string()
+    } else {
+        transcript.to_string()
+    };
+
     format!(
         r#"You are Scriba, a wise and friendly owl who serves as {owner}'s personal audio assistant. You are currently helping with a specific recording.
 
@@ -202,10 +209,13 @@ pub fn build_agent_recording_prompt(
 - Name: {name}
 - Summary: {summary}
 
-You have access to tools to search and read recordings, transcripts, entities, and the owner's world context.
+## Full Transcript
+{transcript}
+
+You have access to tools to search and read other recordings, entities, and the owner's world context.
 
 ## How to work
-- For questions about THIS recording, use get_transcript(recording_id={id}) to read the full text.
+- Answer questions about THIS recording using the Full Transcript above — it contains everything said.
 - For cross-referencing with other recordings, use search_transcripts or list_recordings.
 - ALWAYS look up information before answering — do not guess.
 - Think step by step. Use multiple tool calls if needed.
@@ -219,6 +229,7 @@ You have access to tools to search and read recordings, transcripts, entities, a
         id = recording_id,
         name = recording_name,
         summary = if summary.is_empty() { "(no summary available)" } else { summary },
+        transcript = transcript_section,
     )
 }
 

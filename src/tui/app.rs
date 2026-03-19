@@ -5736,12 +5736,13 @@ impl Dashboard {
 
         let summary = recording.summary.as_deref().unwrap_or("");
 
-        // All providers use agent prompt (tools handle data fetching)
+        // Embed transcript directly so the agent always has access to it
         self.chat.system_prompt = chat_prompts::build_agent_recording_prompt(
             &owner_name,
             recording.id.unwrap_or(0),
             &recording_name,
             summary,
+            &self.transcript_content,
         );
 
         self.chat.context = ChatContext::Recording {
